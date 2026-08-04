@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $# -eq 1 ]] || {
+  echo "usage: autoresearch-rsi-keepalive-run INSTANCE" >&2
+  exit 2
+}
+
+INSTANCE="$1"
+ROOT="${RSI_CLUSTER_ROOT:-/root/shared/.clusters}"
+CB="${RSI_CB_COMMAND:-$ROOT/.tools/clusterbridge.sh}"
+OWNER="${AUTORESEARCH_LEASE_OWNER:-${RSI_EXPECTED_CLAIM_OWNER:-}}"
+PURPOSE="${AUTORESEARCH_LEASE_PURPOSE:-${RSI_EXPECTED_CLAIM_PURPOSE:-AutoResearch RSI 32-GPU execution pool}}"
+NODES_CSV="${AUTORESEARCH_LEASE_NODES:-${RSI_NODES:-28.83.2.169,28.83.50.39,28.85.33.47,28.85.50.103}}"
+TTL_MIN="${AUTORESEARCH_LEASE_TTL_MIN:-180}"
+INTERVAL_SEC="${AUTORESEARCH_LEASE_RENEW_INTERVAL_SEC:-1800}"
+HEARTBEAT="${RSI_LEASE_HEARTBEAT:-$ROOT/.tmp/autoresearch-rsi/lease-keepalive-heartbeat.json}"
+STATE_DIR="${STATE_DIRECTORY:-/var/lib/autoresearch-rsi/$INSTANCE/keepalive}"
+RUNTIME_DIR="${RUNTIME_DIRECTORY:-/run/autoresearch-rsi/$INSTANCE/keepalive}"
+LOG_DIR="${LOGS_DIRECTORY:-/var/log/autoresearch-rsi/$INSTANCE}"
+LOCK_FILE="$RUNTIME_DIR/lease-keepalive.lock"
+PID_FILE="$RUNTIME_DIR/lease-keepalive.pid"
+STOP_FILE="$RUNTIME_DIR/lease-keepalive.stop"
+LOG_FILE="$LOG_DIR/lease-keepalive.log"
+
+[[ -n "$OWNER" ]] || {
+  echo "AUTORESEARCH_LEASE_OWNER or RSI_EXPECTED_CLAIM_OWNER is required" >&2
+  exit 2
+}
+[[ "$TTL_MIN" =~ ^[0-9]+$ ]] && (( TTL_MIN > 0 )) || {
+  echo "AUTORESEARCH_LEASE_TTL_MIN must be a positive integer" >&2
+  exit 2
+}
+[[ "$INTERVAL_SEC" =~ ^[0-9]+$ ]] && (( INTERVAL_SEC > 0 )) || {
+  echo "AUTORESEARCH_LEASE_RENEW_INTERVAL_SEC must be a positive integer" >&2
+  exit 2
+}
+
+IFS=',' read -r -a NODES <<<"$NODES_CSV"
+(( ${#NODES[@]} > 0 )) || {
+  echo "AUTORESEARCH_LEASE_NODES or RSI_NODES must not be empty" >&2
+  exit 2
+}
+
+mkdir -p "$STATE_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$(dirname "$HEARTBEAT")"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "another managed keepalive holds $LOCK_FILE" >&2
+  exit 1
+fi
+printf '%s\n' "$$" >"$PID_FILE"
+: >"$STOP_FILE"
+rm "$STOP_FILE"
+
+write_heartbeat() {
+  local status="$1"
+  local detail="$2"
+  python3 - "$HEARTBEAT" "$$" "$status" "$detail" <<'PY'
+import datetime
+import json
+import os
+import sys
+
+path, pid, status, detail = sys.argv[1:]
+payload = {
+    "pid": int(pid),
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(
+        timespec="seconds"
+    ),
+    "status": status,
+    "detail": detail,
+}
+tmp = f"{path}.tmp.{os.getpid()}"
+with open(tmp, "w", encoding="utf-8") as stream:
+    json.dump(payload, stream, ensure_ascii=False, sort_keys=True)
+    stream.write("\n")
+os.replace(tmp, path)
+PY
+}
+
+verify_claims() {
+  python3 - "$ROOT/.bridge" "$OWNER" "$PURPOSE" "${NODES[@]}" <<'PY'
+import datetime
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+owner = sys.argv[2]
+purpose = sys.argv[3]
+nodes = sys.argv[4:]
+now = datetime.datetime.now(datetime.timezone.utc)
+errors = []
+for node in nodes:
+    path = root / node / "claim.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        expires = datetime.datetime.strptime(
+            value["expires_at"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=datetime.timezone.utc)
+    except Exception as exc:
+        errors.append(
+            f"{node}: unreadable claim ({type(exc).__name__}: {exc})"
+        )
+        continue
+    if expires <= now:
+        errors.append(f"{node}: expired at {value.get('expires_at')}")
+    if value.get("owner") != owner:
+        errors.append(f"{node}: owner mismatch")
+    if value.get("purpose") != purpose:
+        errors.append(f"{node}: purpose mismatch")
+if errors:
+    print("; ".join(errors), file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+renew_allocation_compat() {
+  CB_SID="$OWNER" bash "$CB" renew "${NODES[@]}" --ttl "$TTL_MIN"
+}
+
+renew_central_allocations() {
+  local status_json
+  local allocation_ids
+  local status_path="$STATE_DIR/resource-status.json"
+  status_json="$(CB_SID="$OWNER" bash "$CB" resource-status --json)"
+  printf '%s\n' "$status_json" >"$status_path"
+  allocation_ids="$(
+    python3 - "$status_path" "$OWNER" "${NODES[@]}" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+owner = sys.argv[2]
+expected = set(sys.argv[3:])
+payload = json.loads(path.read_text(encoding="utf-8"))
+snapshot = payload.get("snapshot", payload)
+allocations = snapshot.get("allocations", [])
+selected = []
+covered = set()
+for allocation in allocations:
+    if allocation.get("status") != "active":
+        continue
+    if allocation.get("owner") != owner:
+        continue
+    nodes = set(str(node) for node in allocation.get("nodes", []))
+    overlap = nodes & expected
+    if not overlap:
+        continue
+    if nodes - expected:
+        raise SystemExit("allocation contains unexpected nodes")
+    allocation_id = str(allocation.get("id") or "")
+    if not allocation_id:
+        raise SystemExit("active allocation is missing an id")
+    selected.append(allocation_id)
+    covered.update(overlap)
+if covered != expected:
+    missing = ",".join(sorted(expected - covered))
+    raise SystemExit(f"active allocations do not cover expected nodes: {missing}")
+print("\n".join(selected))
+PY
+  )"
+  [[ -n "$allocation_ids" ]] || return 1
+  local allocation_id
+  while IFS= read -r allocation_id; do
+    [[ -n "$allocation_id" ]] || continue
+    CB_SID="$OWNER" bash "$CB" alloc-renew "$allocation_id" --ttl "$TTL_MIN"
+  done <<<"$allocation_ids"
+}
+
+sleep_interruptibly() {
+  local remaining="$1"
+  while (( remaining > 0 )); do
+    [[ -e "$STOP_FILE" ]] && return 1
+    local chunk=30
+    (( remaining < chunk )) && chunk="$remaining"
+    sleep "$chunk"
+    remaining=$((remaining - chunk))
+  done
+}
+
+heartbeat_loop() {
+  while true; do
+    sleep 60
+    write_heartbeat "ok" "managed keepalive running; next renewal pending"
+  done
+}
+
+cleanup() {
+  [[ -z "${HEARTBEAT_PID:-}" ]] || kill "$HEARTBEAT_PID" 2>/dev/null || true
+  write_heartbeat "stopped" "managed keepalive stopped" || true
+  if [[ -f "$PID_FILE" ]] && [[ "$(cat "$PID_FILE" 2>/dev/null || true)" == "$$" ]]; then
+    : >"$PID_FILE"
+  fi
+  printf '%s stop pid=%s\n' "$(date -Is)" "$$" >>"$LOG_FILE"
+}
+
+request_stop() {
+  : >"$STOP_FILE"
+}
+
+trap request_stop INT TERM
+trap cleanup EXIT
+
+printf '%s start pid=%s owner=%s nodes=%s\n' \
+  "$(date -Is)" "$$" "$OWNER" "$NODES_CSV" >>"$LOG_FILE"
+HEARTBEAT_PID=""
+heartbeat_loop &
+HEARTBEAT_PID=$!
+
+while [[ ! -e "$STOP_FILE" ]]; do
+  if ! verify_claims >>"$LOG_FILE" 2>&1; then
+    write_heartbeat "failed" "claim ownership verification failed"
+    exit 1
+  fi
+  if renew_central_allocations >>"$LOG_FILE" 2>&1; then
+    renew_mode="central-allocation"
+  elif renew_allocation_compat >>"$LOG_FILE" 2>&1; then
+    renew_mode="compatibility-alias"
+  else
+    write_heartbeat "failed" "allocation renewal failed"
+    exit 1
+  fi
+  if ! verify_claims >>"$LOG_FILE" 2>&1; then
+    write_heartbeat "failed" "post-renew verification failed"
+    exit 1
+  fi
+  printf '%s renew=ok mode=%s\n' "$(date -Is)" "$renew_mode" >>"$LOG_FILE"
+  write_heartbeat "ok" "allocation renewed and reverified"
+  sleep_interruptibly "$INTERVAL_SEC" || break
+done

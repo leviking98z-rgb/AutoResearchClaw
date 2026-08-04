@@ -1,0 +1,59 @@
+[Unit]
+Description=AutoResearchClaw RSI supervisor (%i)
+Documentation=file:/data/workspace/autoresearch-stack/AutoResearchClaw/deploy/systemd/README.md
+After=network-online.target data.mount apdcephfs_fsgm3-share_305110755.mount srv-bridge.service
+Wants=network-online.target srv-bridge.service
+RequiresMountsFor=/data/workspace/autoresearch-stack/AutoResearchClaw /apdcephfs_fsgm3/share_305110755/hunyuan/jinlw/.clusters
+PartOf=autoresearch-rsi.target
+OnFailure=autoresearch-rsi-alert@%N.service
+StartLimitIntervalSec=30min
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/data/workspace/autoresearch-stack/AutoResearchClaw
+Environment=HOME=/root
+Environment=LANG=C.UTF-8
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/codev/bin:/root/.cargo/bin:/root/.local/bin:/root/.nvm/versions/node/v22.23.1/bin:/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
+EnvironmentFile=/etc/autoresearch-rsi/%i.env
+StateDirectory=autoresearch-rsi/%i/supervisor
+StateDirectoryMode=0750
+RuntimeDirectory=autoresearch-rsi/%i/supervisor
+RuntimeDirectoryMode=0750
+LogsDirectory=autoresearch-rsi/%i
+LogsDirectoryMode=0750
+ExecCondition=/data/workspace/autoresearch-stack/AutoResearchClaw/deploy/systemd/autoresearch-rsi-guard start-supervisor %i
+ExecStart=/data/workspace/autoresearch-stack/AutoResearchClaw/deploy/systemd/autoresearch-rsi-supervisor-run %i
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=120s
+TimeoutStopSec=10min
+KillMode=mixed
+KillSignal=SIGTERM
+SendSIGKILL=yes
+SuccessExitStatus=143
+RestartPreventExitStatus=143
+StandardOutput=journal
+StandardError=journal
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+ReadWritePaths=/root/shared/.clusters /data/workspace/autoresearch-stack/AutoResearchClaw/workspace /var/lib/autoresearch-rsi/%i/supervisor /run/autoresearch-rsi/%i/supervisor /var/log/autoresearch-rsi/%i
+LimitNOFILE=524288
+TasksMax=infinity
+
+[Install]
+WantedBy=autoresearch-rsi.target

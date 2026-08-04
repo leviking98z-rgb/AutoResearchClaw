@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $# -eq 1 ]] || {
+  echo "usage: autoresearch-rsi-monitor-run INSTANCE" >&2
+  exit 2
+}
+
+INSTANCE="$1"
+REPO="${RSI_REPO_ROOT:-/data/workspace/autoresearch-stack/AutoResearchClaw}"
+CAMPAIGN_DIR="${RSI_CAMPAIGN_DIR:?RSI_CAMPAIGN_DIR is required}"
+PYTHON="${RSI_MONITOR_PYTHON:-$REPO/.venv/bin/python}"
+POOL_CONFIG="${RSI_POOL_CONFIG:-$REPO/config.cluster32.yaml}"
+PID_FILE="${RSI_MONITOR_PID_FILE:-$CAMPAIGN_DIR/rsi-monitor.pid}"
+LEASE_HEARTBEAT="${RSI_LEASE_HEARTBEAT:-/root/shared/.clusters/.tmp/autoresearch-rsi/lease-keepalive-heartbeat.json}"
+NODES="${RSI_NODES:-28.83.2.169,28.83.50.39,28.85.33.47,28.85.50.103}"
+EXPECTED_GPUS="${RSI_EXPECTED_GPUS_PER_NODE:-8}"
+OWNER="${RSI_EXPECTED_CLAIM_OWNER:-${AUTORESEARCH_LEASE_OWNER:-}}"
+PURPOSE="${RSI_EXPECTED_CLAIM_PURPOSE:-${AUTORESEARCH_LEASE_PURPOSE:-AutoResearch RSI 32-GPU execution pool}}"
+RESTART_COMMAND_JSON="${RSI_RESTART_COMMAND_JSON:-}"
+
+if [[ -z "$RESTART_COMMAND_JSON" ]]; then
+  RESTART_COMMAND_JSON="$(
+    "$PYTHON" - "$INSTANCE" <<'PY'
+import json
+import sys
+
+instance = sys.argv[1]
+print(
+    json.dumps(
+        [
+            "/usr/bin/systemctl",
+            "--no-block",
+            "restart",
+            f"autoresearch-rsi-supervisor@{instance}.service",
+        ]
+    )
+)
+PY
+  )"
+fi
+
+ARGS=(
+  "$REPO/researchclaw/rsi/monitor.py"
+  "$CAMPAIGN_DIR"
+  --loop
+  --pid-file "$PID_FILE"
+  --nodes "$NODES"
+  --expected-gpus-per-node "$EXPECTED_GPUS"
+  --pool-config "$POOL_CONFIG"
+  --lease-heartbeat "$LEASE_HEARTBEAT"
+  --restart-command-json "$RESTART_COMMAND_JSON"
+  --command-timeout-sec "${RSI_MONITOR_COMMAND_TIMEOUT_SEC:-120}"
+  --pool-probe-timeout-sec "${RSI_MONITOR_POOL_PROBE_TIMEOUT_SEC:-90}"
+  --external-probe-deadline-sec "${RSI_MONITOR_EXTERNAL_DEADLINE_SEC:-110}"
+  --interval-sec "${RSI_MONITOR_INTERVAL_SEC:-30}"
+  --pipeline-progress-stale-sec "${RSI_PIPELINE_PROGRESS_STALE_SEC:-14400}"
+)
+
+[[ -n "$OWNER" ]] && ARGS+=(--expected-claim-owner "$OWNER")
+[[ -n "$PURPOSE" ]] && ARGS+=(--expected-claim-purpose "$PURPOSE")
+
+cd "$REPO"
+exec "$PYTHON" "${ARGS[@]}"

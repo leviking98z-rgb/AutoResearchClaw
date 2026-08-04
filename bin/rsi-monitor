@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON="${RSI_PYTHON:-$ROOT/.venv/bin/python}"
+if [[ ! -x "$PYTHON" ]]; then
+  PYTHON="$(command -v python3 || true)"
+fi
+[[ -n "$PYTHON" ]] || {
+  echo "Python 3 is required (set RSI_PYTHON to override)." >&2
+  exit 1
+}
+
+cd "$ROOT"
+exec "$PYTHON" "$ROOT/researchclaw/rsi/monitor.py" "$@"

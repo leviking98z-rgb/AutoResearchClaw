@@ -41,7 +41,10 @@ class HardwareProfile:
         return asdict(self)
 
 
-def detect_hardware(ssh_config: object | None = None) -> HardwareProfile:
+def detect_hardware(
+    ssh_config: object | None = None,
+    clusterbridge_config: object | None = None,
+) -> HardwareProfile:
     """Detect GPU hardware and return a HardwareProfile.
 
     When *ssh_config* is provided (an ``SshRemoteConfig`` with ``host`` set),
@@ -52,6 +55,25 @@ def detect_hardware(ssh_config: object | None = None) -> HardwareProfile:
     2. macOS Apple Silicon (MPS) via platform check (local only)
     3. Fallback to CPU-only
     """
+    # --- Remote detection via ClusterBridge ---
+    if clusterbridge_config is not None:
+        node = getattr(clusterbridge_config, "node", "")
+        if node:
+            profile = _detect_nvidia_clusterbridge(clusterbridge_config)
+            if profile is not None:
+                return profile
+            return HardwareProfile(
+                has_gpu=False,
+                gpu_type="cpu",
+                gpu_name=f"ClusterBridge node ({node}) — no GPU detected",
+                vram_mb=None,
+                tier="cpu_only",
+                warning=(
+                    f"No GPU detected on ClusterBridge node {node}. "
+                    "Only CPU-based experiments are supported."
+                ),
+            )
+
     # --- Remote detection via SSH ---
     if ssh_config is not None:
         host = getattr(ssh_config, "host", "")
@@ -93,6 +115,62 @@ def detect_hardware(ssh_config: object | None = None) -> HardwareProfile:
             "For deep learning research ideas, please use a machine with a GPU or a remote GPU server."
         ),
     )
+
+
+def _detect_nvidia_clusterbridge(config: object) -> HardwareProfile | None:
+    """Detect NVIDIA GPU through the clusterbridge transport."""
+    node = getattr(config, "node", "")
+    cb_command = getattr(
+        config,
+        "cb_command",
+        "/root/shared/.clusters/.tools/clusterbridge.sh",
+    )
+    if not node:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "bash",
+                str(cb_command),
+                str(node),
+                "run",
+                "nvidia-smi --query-gpu=name,memory.total "
+                "--format=csv,noheader,nounits -i 0",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        line = result.stdout.strip().splitlines()[0].strip()
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            return None
+        gpu_name = parts[0]
+        vram_mb = int(float(parts[1]))
+        tier = "high" if vram_mb >= _HIGH_VRAM_THRESHOLD_MB else "limited"
+        warning = "" if tier == "high" else (
+            f"ClusterBridge GPU ({gpu_name}, {vram_mb} MB VRAM) has limited memory."
+        )
+        return HardwareProfile(
+            has_gpu=True,
+            gpu_type="cuda",
+            gpu_name=f"{gpu_name} (clusterbridge: {node})",
+            vram_mb=vram_mb,
+            tier=tier,
+            warning=warning,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
+        logger.warning(
+            "ClusterBridge hardware detection failed for %s: %s",
+            node,
+            exc,
+        )
+        return None
 
 
 def _detect_nvidia_remote(ssh_config: object) -> HardwareProfile | None:

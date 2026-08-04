@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+[[ $# -ge 2 ]] || {
+  echo "Usage: rsi-monitor-launch PID_FILE MONITOR_ARG..." >&2
+  exit 2
+}
+
+PID_FILE="$1"
+shift
+STOP_FILE="${PID_FILE}.watchdog.stop"
+WATCHDOG_PID_FILE="${PID_FILE}.watchdog.pid"
+BACKOFF_SEC="${RSI_MONITOR_RESTART_BACKOFF_SEC:-2}"
+CHILD_PID=""
+
+rm -f "$STOP_FILE"
+printf '%s\n' "$$" > "$WATCHDOG_PID_FILE"
+
+cleanup() {
+  if [[ -n "$CHILD_PID" ]] && kill -0 "$CHILD_PID" 2>/dev/null; then
+    kill -TERM "$CHILD_PID" 2>/dev/null || true
+    wait "$CHILD_PID" 2>/dev/null || true
+  fi
+  rm -f "$WATCHDOG_PID_FILE"
+  rm -f "$STOP_FILE"
+}
+trap 'touch "$STOP_FILE"; cleanup; exit 0' INT TERM
+trap cleanup EXIT
+
+while [[ ! -e "$STOP_FILE" ]]; do
+  "$@" &
+  CHILD_PID=$!
+  wait "$CHILD_PID"
+  RC=$?
+  CHILD_PID=""
+  rm -f "$PID_FILE"
+  [[ -e "$STOP_FILE" ]] && break
+  printf '%s monitor exited rc=%s; restarting in %ss\n' \
+    "$(date -Is)" "$RC" "$BACKOFF_SEC" >&2
+  sleep "$BACKOFF_SEC"
+done

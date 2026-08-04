@@ -1,0 +1,58 @@
+[Unit]
+Description=AutoResearchClaw RSI allocation keepalive (%i)
+Documentation=file:/data/workspace/autoresearch-stack/AutoResearchClaw/deploy/systemd/README.md
+After=network-online.target apdcephfs_fsgm3-share_305110755.mount
+Wants=network-online.target
+RequiresMountsFor=/apdcephfs_fsgm3/share_305110755/hunyuan/jinlw/.clusters
+PartOf=autoresearch-rsi.target
+OnFailure=autoresearch-rsi-alert@%N.service
+StartLimitIntervalSec=30min
+StartLimitBurst=20
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/shared/.clusters
+Environment=HOME=/root
+Environment=LANG=C.UTF-8
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
+EnvironmentFile=/etc/autoresearch-rsi/%i.env
+StateDirectory=autoresearch-rsi/%i/keepalive
+StateDirectoryMode=0750
+RuntimeDirectory=autoresearch-rsi/%i/keepalive
+RuntimeDirectoryMode=0750
+LogsDirectory=autoresearch-rsi/%i
+LogsDirectoryMode=0750
+ExecCondition=/data/workspace/autoresearch-stack/AutoResearchClaw/deploy/systemd/autoresearch-rsi-guard start-keepalive %i
+ExecStart=/data/workspace/autoresearch-stack/AutoResearchClaw/deploy/systemd/autoresearch-rsi-keepalive-run %i
+Restart=always
+RestartSec=30s
+TimeoutStartSec=120s
+TimeoutStopSec=3min
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+SuccessExitStatus=143
+RestartPreventExitStatus=143
+StandardOutput=journal
+StandardError=journal
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+ReadWritePaths=/root/shared/.clusters /var/lib/autoresearch-rsi/%i/keepalive /run/autoresearch-rsi/%i/keepalive /var/log/autoresearch-rsi/%i
+LimitNOFILE=524288
+TasksMax=infinity
+
+[Install]
+WantedBy=autoresearch-rsi.target

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $# -eq 2 ]] || {
+  echo "usage: autoresearch-rsi-control {pause|stop} INSTANCE" >&2
+  exit 2
+}
+
+ACTION="$1"
+INSTANCE="$2"
+REPO="${RSI_REPO_ROOT:-/data/workspace/autoresearch-stack/AutoResearchClaw}"
+CAMPAIGN_DIR="${RSI_CAMPAIGN_DIR:?RSI_CAMPAIGN_DIR is required}"
+TIMEOUT_SEC="${RSI_CONTROL_TIMEOUT_SEC:-300}"
+STATE_FILE="$CAMPAIGN_DIR/state.json"
+
+case "$ACTION" in
+  pause)
+    "$REPO/bin/rsi-pause" "$CAMPAIGN_DIR" "systemd requested cooperative pause"
+    ;;
+  stop)
+    # The supervisor interprets SIGTERM as a cooperative campaign stop and
+    # terminates the active pipeline/process group before updating state.
+    "$REPO/bin/rsi-stop" "$CAMPAIGN_DIR" \
+      --reason "systemd requested cooperative stop"
+    ;;
+  *)
+    echo "unsupported action: $ACTION" >&2
+    exit 2
+    ;;
+esac
+
+python3 - "$STATE_FILE" "$TIMEOUT_SEC" "$ACTION" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+path = pathlib.Path(sys.argv[1])
+timeout = max(0.0, float(sys.argv[2]))
+action = sys.argv[3]
+terminal = {"paused", "stopped", "completed", "crashed"}
+deadline = time.monotonic() + timeout
+last = ""
+while time.monotonic() < deadline:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        value = {}
+    status = str(value.get("status") or "")
+    pid = value.get("pid")
+    last = f"status={status!r} pid={pid!r}"
+    if status in terminal and not pid:
+        raise SystemExit(0)
+    time.sleep(1)
+print(
+    f"timed out waiting for cooperative {action}: {last}",
+    file=sys.stderr,
+)
+raise SystemExit(1)
+PY

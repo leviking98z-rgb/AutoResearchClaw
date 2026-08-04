@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from researchclaw.config import RCConfig
     from researchclaw.llm.acp_client import ACPClient
     from researchclaw.llm.client import LLMClient
+    from researchclaw.llm.roles import RoleLLMClient
 
 # Provider presets for common LLM services
 PROVIDER_PRESETS = {
@@ -66,3 +67,24 @@ def create_llm_client(config: RCConfig) -> LLMClient | ACPClient:
 
     # Use from_rc_config to properly initialize adapters (e.g., Anthropic)
     return _LLM.from_rc_config(config)
+
+
+def create_role_llm_client(
+    config: RCConfig,
+    role: str,
+    *,
+    run_dir: object | None = None,
+    stage: object | None = None,
+) -> RoleLLMClient:
+    """Lazy public factory for a first-class research-role LLM client."""
+
+    from pathlib import Path
+
+    from researchclaw.llm.roles import create_role_llm_client as _create
+
+    return _create(
+        config,
+        role,
+        run_dir=Path(run_dir) if run_dir is not None else None,
+        stage=stage,  # type: ignore[arg-type]
+    )

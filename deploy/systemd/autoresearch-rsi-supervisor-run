@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $# -eq 1 ]] || {
+  echo "usage: autoresearch-rsi-supervisor-run INSTANCE" >&2
+  exit 2
+}
+
+INSTANCE="$1"
+REPO="${RSI_REPO_ROOT:-/data/workspace/autoresearch-stack/AutoResearchClaw}"
+CAMPAIGN_DIR="${RSI_CAMPAIGN_DIR:?RSI_CAMPAIGN_DIR is required}"
+PYTHON="${RSI_SUPERVISOR_PYTHON:-/usr/bin/python3}"
+
+cd "$REPO"
+"$REPO/bin/researchclaw-ensure-deps" --python "$PYTHON"
+exec "$PYTHON" "$REPO/bin/rsi-resume" "$CAMPAIGN_DIR" --foreground

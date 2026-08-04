@@ -1,0 +1,44 @@
+[Unit]
+Description=AutoResearchClaw RSI dashboard (%i)
+Documentation=file:/data/workspace/autoresearch-stack/AutoResearchClaw/deploy/systemd/README.md
+After=network-online.target data.mount apdcephfs_fsgm3-share_305110755.mount
+Wants=network-online.target
+RequiresMountsFor=/data/workspace/autoresearch-stack/AutoResearchClaw /apdcephfs_fsgm3/share_305110755/hunyuan/jinlw/.clusters
+PartOf=autoresearch-rsi.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/data/workspace/autoresearch-stack/AutoResearchClaw
+Environment=HOME=/root
+Environment=LANG=C.UTF-8
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/autoresearch-rsi/%i.env
+ExecStart=/usr/bin/python3 -m researchclaw.rsi.dashboard --campaign-dir ${RSI_CAMPAIGN_DIR} --host 127.0.0.1 --port 8099
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+ReadWritePaths=/root/shared/.clusters
+MemoryMax=768M
+TasksMax=256
+
+[Install]
+WantedBy=autoresearch-rsi.target

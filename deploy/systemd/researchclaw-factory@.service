@@ -1,0 +1,27 @@
+[Unit]
+Description=ResearchClaw continuous multi-Idea Factory (%i)
+Documentation=file:/data/workspace/autoresearch-stack/AutoResearchClaw/docs/CONTINUOUS_RESEARCH_FACTORY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/researchclaw-factory/%i.env
+WorkingDirectory=/data/workspace/autoresearch-stack/AutoResearchClaw
+ExecStart=/data/workspace/autoresearch-stack/AutoResearchClaw/bin/researchclaw-factory --config ${FACTORY_CONFIG} start
+ExecReload=/data/workspace/autoresearch-stack/AutoResearchClaw/bin/researchclaw-factory --config ${FACTORY_CONFIG} status
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/root/shared /data/workspace/autoresearch-stack/AutoResearchClaw
+LimitNOFILE=524288
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

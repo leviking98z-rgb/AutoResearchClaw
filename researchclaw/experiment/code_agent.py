@@ -4,6 +4,7 @@ Supports three providers:
   - ``llm``         — existing LLM chat API (backward-compatible default)
   - ``claude_code`` — Claude Code CLI (``claude -p``)
   - ``codex``       — OpenAI Codex CLI (``codex exec``)
+  - ``cursor``      — Cursor Agent CLI (``cursor-agent --print``)
 
 Usage::
 
@@ -173,9 +174,56 @@ class LlmCodeAgent:
         prompts: Any,
         config: RCConfig,
     ) -> None:
-        self._llm = llm
+        role_llm = llm
+        code_role = config.llm.roles.get("coding_engineer")
+        code_model_override = (
+            getattr(code_role, "model", "")
+            or config.experiment.cli_agent.model
+        )
+        code_role_has_connection_override = code_role is not None and any(
+            (
+                code_role.provider,
+                code_role.base_url,
+                code_role.api_key_env,
+                code_role.api_key,
+            )
+        )
+        try:
+            from researchclaw.llm.roles import (
+                bind_role_llm_client,
+                create_role_llm_client,
+            )
+
+            if getattr(llm, "role", "") != "coding_engineer":
+                _audit_path = getattr(llm, "audit_path", None)
+                _run_dir = None
+                if _audit_path is not None:
+                    try:
+                        _run_dir = Path(_audit_path).parent.parent
+                    except (TypeError, ValueError):
+                        _run_dir = None
+                for_role = getattr(llm, "for_role", None)
+                if callable(for_role):
+                    role_llm = for_role("coding_engineer")
+                elif code_role_has_connection_override:
+                    role_llm = create_role_llm_client(
+                        config,
+                        "coding_engineer",
+                        run_dir=_run_dir,
+                    )
+                else:
+                    role_llm = bind_role_llm_client(
+                        llm,
+                        config,
+                        "coding_engineer",
+                        run_dir=_run_dir,
+                    )
+        except Exception:  # noqa: BLE001
+            role_llm = llm
+        self._llm = role_llm
         self._pm = prompts
         self._config = config
+        self._model_override = code_model_override
 
     @property
     def name(self) -> str:
@@ -208,8 +256,14 @@ class LlmCodeAgent:
         )
         # Higher max_tokens for reasoning models
         _code_max_tokens = sp.max_tokens or 8192
+        _code_role = self._config.llm.roles.get("coding_engineer")
+        _configured_code_model = (
+            getattr(_code_role, "model", "")
+            or self._config.experiment.cli_agent.model
+            or self._config.llm.primary_model
+        )
         if any(
-            self._config.llm.primary_model.startswith(p)
+            _configured_code_model.startswith(p)
             for p in ("gpt-5", "o3", "o4")
         ):
             _code_max_tokens = max(_code_max_tokens, 16384)
@@ -221,6 +275,7 @@ class LlmCodeAgent:
                 sp.user,
                 json_mode=sp.json_mode,
                 max_tokens=_code_max_tokens,
+                model=self._model_override or None,
             )
             files = _extract_multi_file_blocks(resp.content)
             # Retry on empty response with higher token limit
@@ -237,6 +292,7 @@ class LlmCodeAgent:
                     sp.user,
                     json_mode=sp.json_mode,
                     max_tokens=32768,
+                    model=self._model_override or None,
                 )
                 files = _extract_multi_file_blocks(resp.content)
 
@@ -305,6 +361,7 @@ class LlmCodeAgent:
                 ip.system,
                 user_prompt,
                 max_tokens=ip.max_tokens or 8192,
+                model=self._model_override or None,
             )
             extracted_files = _extract_multi_file_blocks(response.content)
             if not extracted_files:
@@ -354,7 +411,12 @@ class LlmCodeAgent:
                 issues_text=issues,
                 all_files_ctx=all_files_ctx,
             )
-            resp = _chat_with_prompt(self._llm, rp.system, rp.user)
+            resp = _chat_with_prompt(
+                self._llm,
+                rp.system,
+                rp.user,
+                model=self._model_override or None,
+            )
             # Try multi-file extraction first, then single-block
             repaired = _extract_multi_file_blocks(resp.content)
             if not repaired:
@@ -726,6 +788,90 @@ class CodexAgent(_CliAgentBase):
 
 
 # ---------------------------------------------------------------------------
+# CursorAgent
+# ---------------------------------------------------------------------------
+
+class CursorAgent(_CliAgentBase):
+    """Code agent backed by Cursor Agent CLI (``cursor-agent --print``)."""
+
+    _provider_name = "cursor"
+
+    def _build_cmd(self, prompt: str, workdir: Path) -> list[str]:
+        cmd = [
+            self._binary,
+            "--print",
+            "--force",
+            "--output-format", "text",
+            "--workspace", str(workdir),
+        ]
+        if self._model:
+            cmd += ["--model", self._model]
+        cmd.extend(self._extra_args)
+        cmd.append(prompt)
+        return cmd
+
+    def generate(
+        self,
+        *,
+        exp_plan: str,
+        topic: str,
+        metric_key: str,
+        pkg_hint: str,
+        compute_budget: str,
+        extra_guidance: str,
+        workdir: Path,
+        timeout_sec: int = 600,
+    ) -> CodeAgentResult:
+        prompt = self._generate_prompt(
+            topic, exp_plan, metric_key, pkg_hint, compute_budget, extra_guidance,
+        )
+        cmd = self._build_cmd(prompt, workdir)
+        rc, stdout, stderr, elapsed, to = self._run_subprocess(
+            cmd, workdir, timeout_sec or self._default_timeout,
+        )
+        return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
+
+    def refine(
+        self,
+        *,
+        current_files: dict[str, str],
+        run_summaries: list[str],
+        metric_key: str,
+        metric_direction: str,
+        topic: str,
+        extra_hints: str,
+        workdir: Path,
+        timeout_sec: int = 600,
+    ) -> CodeAgentResult:
+        _seed_workdir(workdir, current_files)
+        prompt = self._refine_prompt(
+            current_files, run_summaries, metric_key, metric_direction,
+            topic, extra_hints,
+        )
+        cmd = self._build_cmd(prompt, workdir)
+        rc, stdout, stderr, elapsed, to = self._run_subprocess(
+            cmd, workdir, timeout_sec or self._default_timeout,
+        )
+        return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
+
+    def repair(
+        self,
+        *,
+        files: dict[str, str],
+        issues: str,
+        workdir: Path,
+        timeout_sec: int = 300,
+    ) -> CodeAgentResult:
+        _seed_workdir(workdir, files)
+        prompt = self._repair_prompt(files, issues)
+        cmd = self._build_cmd(prompt, workdir)
+        rc, stdout, stderr, elapsed, to = self._run_subprocess(
+            cmd, workdir, timeout_sec or self._default_timeout,
+        )
+        return self._build_result(workdir, rc, stdout, stderr, elapsed, to)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -768,6 +914,25 @@ def create_code_agent(
                 "Install it or set experiment.code_agent.binary_path."
             )
         return CodexAgent(  # type: ignore[return-value]
+            binary_path=binary,
+            model=agent_cfg.model or "",
+            max_budget_usd=agent_cfg.max_budget_usd,
+            timeout_sec=agent_cfg.timeout_sec,
+            extra_args=list(agent_cfg.extra_args),
+        )
+
+    if provider == "cursor":
+        binary = (
+            agent_cfg.binary_path
+            or shutil.which("cursor-agent")
+            or shutil.which("agent")
+        )
+        if not binary:
+            raise RuntimeError(
+                "Cursor Agent binary not found. "
+                "Install it or set experiment.cli_agent.binary_path."
+            )
+        return CursorAgent(  # type: ignore[return-value]
             binary_path=binary,
             model=agent_cfg.model or "",
             max_budget_usd=agent_cfg.max_budget_usd,

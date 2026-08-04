@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CB="${RSI_CB_COMMAND:-/root/shared/.clusters/.tools/clusterbridge.sh}"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  bin/rsi-daemon CAMPAIGN_DIR [rsi-monitor options]
+
+Starts rsi-monitor as a detached ClusterBridge-owned process. The campaign
+directory receives rsi-monitor.log and rsi-monitor.pid. This script does not
+start, stop, or kill the RSI supervisor.
+
+For a bounded smoke test:
+  bin/rsi-daemon CAMPAIGN_DIR --max-iterations 1
+EOF
+  exit 2
+}
+
+[[ $# -ge 1 ]] || usage
+CAMPAIGN_DIR="$1"
+shift
+mkdir -p "$CAMPAIGN_DIR"
+CAMPAIGN_DIR="$(cd "$CAMPAIGN_DIR" && pwd)"
+
+PID_FILE="$CAMPAIGN_DIR/rsi-monitor.pid"
+LOG_FILE="$CAMPAIGN_DIR/rsi-monitor.log"
+DEFAULT_NODES=(
+  "28.83.2.169"
+  "28.83.50.39"
+  "28.85.33.47"
+  "28.85.50.103"
+)
+DEFAULT_POOL_CONFIG="$ROOT/config.cluster32.yaml"
+DEFAULT_LEASE_HEARTBEAT="/root/shared/.clusters/.tmp/autoresearch-rsi/lease-keepalive-heartbeat.json"
+DEFAULT_CLAIM_OWNER="${CODEX_THREAD_ID:-${CB_SID:-}}"
+DEFAULT_CLAIM_PURPOSE="AutoResearch RSI 32-GPU execution pool"
+
+if [[ -f "$PID_FILE" ]]; then
+  read -r EXISTING_PID EXISTING_TICKS < <(
+    "$ROOT/.venv/bin/python" - "$PID_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    text = path.read_text(encoding="utf-8").strip()
+except OSError:
+    print()
+    raise SystemExit
+try:
+    value = json.loads(text)
+except json.JSONDecodeError:
+    value = text
+if isinstance(value, dict):
+    pid = value.get("pid")
+    ticks = value.get("start_ticks")
+else:
+    pid = value
+    ticks = None
+try:
+    pid = int(pid)
+except (TypeError, ValueError):
+    pid = 0
+try:
+    ticks = int(ticks)
+except (TypeError, ValueError):
+    ticks = 0
+print(pid if pid > 0 else "", ticks if ticks > 0 else "")
+PY
+  )
+  EXISTING_MATCHES=0
+  if [[ -n "${EXISTING_PID:-}" ]] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+    if [[ -z "${EXISTING_TICKS:-}" ]]; then
+      EXISTING_MATCHES=1
+    elif [[ -r "/proc/$EXISTING_PID/stat" ]]; then
+      OBSERVED_TICKS="$(awk '{print $22}' "/proc/$EXISTING_PID/stat" 2>/dev/null || true)"
+      [[ "$OBSERVED_TICKS" == "$EXISTING_TICKS" ]] && EXISTING_MATCHES=1
+    fi
+  fi
+  if [[ "$EXISTING_MATCHES" == "1" ]]; then
+    echo "rsi-monitor is already running with PID $EXISTING_PID" >&2
+    exit 1
+  fi
+  rm -f "$PID_FILE"
+fi
+WATCHDOG_PID_FILE="${PID_FILE}.watchdog.pid"
+if [[ -f "$WATCHDOG_PID_FILE" ]]; then
+  EXISTING_WATCHDOG="$(tr -dc '0-9' <"$WATCHDOG_PID_FILE" || true)"
+  if [[ -n "$EXISTING_WATCHDOG" ]] \
+    && kill -0 "$EXISTING_WATCHDOG" 2>/dev/null; then
+    echo "rsi-monitor watchdog is already running with PID $EXISTING_WATCHDOG" >&2
+    exit 1
+  fi
+  rm -f "$WATCHDOG_PID_FILE"
+fi
+
+MONITOR_CMD=(
+  "$ROOT/bin/rsi-monitor"
+  "$CAMPAIGN_DIR"
+  --loop
+  --pid-file "$PID_FILE"
+)
+
+if [[ -z "${RSI_NODES:-}" && " $* " != *" --node "* && " $* " != *" --nodes "* ]]; then
+  for node in "${DEFAULT_NODES[@]}"; do
+    MONITOR_CMD+=(--node "$node")
+  done
+  MONITOR_CMD+=(--expected-gpus-per-node 8)
+fi
+if [[ -z "${RSI_POOL_CONFIG:-}" && " $* " != *" --pool-config "* ]]; then
+  MONITOR_CMD+=(--pool-config "$DEFAULT_POOL_CONFIG")
+fi
+if [[ -z "${RSI_LEASE_HEARTBEAT:-}" && " $* " != *" --lease-heartbeat "* ]]; then
+  MONITOR_CMD+=(--lease-heartbeat "$DEFAULT_LEASE_HEARTBEAT")
+fi
+if [[ -n "$DEFAULT_CLAIM_OWNER" && -z "${RSI_EXPECTED_CLAIM_OWNER:-}" && " $* " != *" --expected-claim-owner "* ]]; then
+  MONITOR_CMD+=(--expected-claim-owner "$DEFAULT_CLAIM_OWNER")
+fi
+if [[ -z "${RSI_EXPECTED_CLAIM_PURPOSE:-}" && " $* " != *" --expected-claim-purpose "* ]]; then
+  MONITOR_CMD+=(--expected-claim-purpose "$DEFAULT_CLAIM_PURPOSE")
+fi
+MONITOR_CMD+=("$@")
+
+# Quote every argv element before embedding redirection in the detached shell.
+printf -v DETACHED_CMD '%q ' "${MONITOR_CMD[@]}"
+printf -v QUOTED_LOG '%q' "$LOG_FILE"
+DETACHED_CMD+=">>$QUOTED_LOG 2>&1"
+
+if [[ "${RSI_DAEMON_FOREGROUND:-0}" == "1" ]]; then
+  exec bash -lc "$DETACHED_CMD"
+fi
+
+[[ -r "$CB" ]] || {
+  echo "ClusterBridge command is not readable: $CB" >&2
+  exit 1
+}
+
+LAUNCHER="$ROOT/bin/rsi-monitor-launch"
+[[ -x "$LAUNCHER" ]] || {
+  echo "Monitor launcher is not executable: $LAUNCHER" >&2
+  exit 1
+}
+exec bash "$CB" detach "$LAUNCHER" "$PID_FILE" bash -lc "$DETACHED_CMD"

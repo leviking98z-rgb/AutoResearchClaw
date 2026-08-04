@@ -1,0 +1,35 @@
+clusterbridge_pool:
+  pool_id: autoresearch-rsi-32gpu
+  purpose: "AutoResearch RSI 32-GPU execution pool"
+  cb_command: "/root/shared/.clusters/.tools/clusterbridge.sh"
+  log_root: "/root/shared/.clusters/.tmp/autoresearch-rsi/pools"
+  claim_ttl_min: 180
+  renew_interval_sec: 1800
+  max_renew_failures: 3
+  command_timeout_sec: 180
+  parallelism: 4
+  expected_total_gpus: 32
+  allow_force_claim: false
+  expected_claim_owner: "${AUTORESEARCH_CLAIM_OWNER}"
+  nodes:
+    - address: "28.83.2.169"
+      ray_ip: "28.83.2.169"
+      gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+    - address: "28.83.50.39"
+      ray_ip: "28.83.50.39"
+      gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+    - address: "28.85.33.47"
+      ray_ip: "28.85.33.47"
+      gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+    - address: "28.85.50.103"
+      ray_ip: "28.85.50.103"
+      gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+  ray:
+    command: "/opt/conda/envs/torch-base/bin/ray"
+    python: "/opt/conda/envs/torch-base/bin/python3"
+    head_node: "28.83.2.169"
+    port: 6379
+    start_timeout_sec: 180
+    resource_timeout_sec: 300
+    poll_interval_sec: 3
+    stop_timeout_sec: 60

@@ -20,7 +20,7 @@ import threading
 import time
 import weakref
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 from researchclaw.llm.client import LLMResponse
 
@@ -42,6 +42,7 @@ class ACPConfig:
     acpx_command: str = ""  # auto-detect if empty
     session_name: str = "researchclaw"
     timeout_sec: int = 1800  # per-prompt timeout
+    model: str = ""
 
 
 def _find_acpx() -> str | None:
@@ -67,8 +68,8 @@ class ACPClient:
     """
 
     # Track live instances for atexit cleanup (weak refs to avoid preventing GC)
-    _live_instances: list[weakref.ref[ACPClient]] = []
-    _atexit_registered: bool = False
+    _live_instances: ClassVar[list[weakref.ref[ACPClient]]] = []
+    _atexit_registered: ClassVar[bool] = False
 
     def __init__(self, acp_config: ACPConfig) -> None:
         self.config = acp_config
@@ -91,6 +92,7 @@ class ACPClient:
             acpx_command=getattr(acp, "acpx_command", ""),
             session_name=getattr(acp, "session_name", "researchclaw"),
             timeout_sec=getattr(acp, "timeout_sec", 1800),
+            model=str(getattr(rc_config.llm, "primary_model", "") or ""),
         ))
 
     # ------------------------------------------------------------------
@@ -117,9 +119,11 @@ class ACPClient:
         """
         prompt_text = self._messages_to_prompt(messages, system=system)
         content = self._send_prompt(prompt_text)
-        if strip_thinking:
-            from researchclaw.utils.thinking_tags import strip_thinking_tags
-            content = strip_thinking_tags(content)
+        # ACP adapters may include internal reasoning markers such as
+        # ``[thinking]`` even when the caller did not explicitly request
+        # stripping.  These markers must never leak into paper artifacts.
+        from researchclaw.utils.thinking_tags import strip_thinking_tags
+        content = strip_thinking_tags(content)
         return LLMResponse(
             content=content,
             model=f"acp:{self.config.agent}",
@@ -158,7 +162,7 @@ class ACPClient:
                  self.config.agent, "sessions", "close",
                  self.config.session_name],
                 capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=15,
+                errors="replace", timeout=15, check=False,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -217,7 +221,7 @@ class ACPClient:
              self.config.agent, "sessions", "ensure",
              "--name", self.config.session_name],
             capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=30,
+            errors="replace", timeout=30, check=False,
         )
         if result.returncode != 0:
             # Fall back to 'new'
@@ -226,12 +230,31 @@ class ACPClient:
                  self.config.agent, "sessions", "new",
                  "--name", self.config.session_name],
                 capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=30,
+                errors="replace", timeout=30, check=False,
             )
             if result.returncode != 0:
                 raise RuntimeError(
                     f"Failed to create ACP session: {result.stderr.strip()}"
                 )
+
+        # ACP model selection is session-scoped.  Cursor's ACP adapter supports
+        # session/set_config_option, so set an explicit model after ensure/new
+        # when configured.  Other agents can ignore/reject this non-fatally.
+        model = (
+            self.config.model.strip()
+            or os.environ.get("RESEARCHCLAW_ACP_MODEL", "").strip()
+        )
+        if model:
+            try:
+                subprocess.run(
+                    [acpx, "--ttl", "0", "--cwd", self._abs_cwd(),
+                     self.config.agent, "set", "-s", self.config.session_name,
+                     "model", model],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=30, check=False,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("ACP model selection failed (non-fatal)")
 
         # Warm-up: consume the agent's cold-start greeting and set
         # text-only mode so it does not use tools or pollute responses.
@@ -250,7 +273,7 @@ class ACPClient:
                  self.config.agent, "-s", self.config.session_name,
                  _warmup],
                 capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=60,
+                errors="replace", timeout=60, check=False,
             )
         except Exception:  # noqa: BLE001
             logger.debug("ACP warm-up prompt failed (non-fatal)")

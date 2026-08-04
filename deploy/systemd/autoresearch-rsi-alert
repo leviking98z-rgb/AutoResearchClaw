@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Send deduplicated RSI service-failure notices through internal AgentMail."""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+AM = Path("/root/shared/.clusters/.tools/am.sh")
+STATE_ROOT = Path("/var/lib/autoresearch-rsi/alerts")
+DEFAULT_COOLDOWN_SEC = 1800
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print("usage: autoresearch-rsi-alert UNIT RESULT", file=sys.stderr)
+        return 2
+    unit, result = sys.argv[1:]
+    recipient = os.environ.get("RSI_ALERT_RECIPIENT", "").strip()
+    if not recipient:
+        return 0
+    cooldown = max(
+        0,
+        int(os.environ.get("RSI_ALERT_COOLDOWN_SEC", DEFAULT_COOLDOWN_SEC)),
+    )
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    safe_name = unit.replace("/", "_")
+    state_path = STATE_ROOT / f"{safe_name}.json"
+    lock_path = STATE_ROOT / f"{safe_name}.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            previous = json.loads(state_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            previous = {}
+        now = int(time.time())
+        if (
+            result == previous.get("result")
+            and now - int(previous.get("sent_at", 0)) < cooldown
+        ):
+            return 0
+        message = (
+            f"[AutoResearch 24/7 告警] systemd unit={unit} "
+            f"result={result}; host={os.uname().nodename}; "
+            "请检查 systemctl status / journalctl。"
+        )
+        completed = subprocess.run(
+            ["bash", str(AM), "send", recipient, message],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        if completed.returncode != 0:
+            print(
+                completed.stderr.strip()
+                or completed.stdout.strip()
+                or "AgentMail send failed",
+                file=sys.stderr,
+            )
+            return completed.returncode or 1
+        temporary = state_path.with_suffix(f".tmp.{os.getpid()}")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "unit": unit,
+                    "result": result,
+                    "sent_at": now,
+                    "recipient": recipient,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, state_path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

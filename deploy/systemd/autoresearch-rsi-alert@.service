@@ -1,0 +1,23 @@
+[Unit]
+Description=AutoResearchClaw failure alert for %i
+After=network-online.target apdcephfs_fsgm3-share_305110755.mount
+Wants=network-online.target
+RequiresMountsFor=/apdcephfs_fsgm3/share_305110755/hunyuan/jinlw/.clusters
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
+EnvironmentFile=-/etc/autoresearch-rsi/alerts.env
+ExecStart=/data/workspace/autoresearch-stack/AutoResearchClaw/deploy/systemd/autoresearch-rsi-alert %i failed
+StateDirectory=autoresearch-rsi/alerts
+StateDirectoryMode=0750
+TimeoutStartSec=90s
+StandardOutput=journal
+StandardError=journal
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=full
+ReadWritePaths=/root/shared/.clusters /var/lib/autoresearch-rsi/alerts

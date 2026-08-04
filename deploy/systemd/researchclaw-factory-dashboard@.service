@@ -1,0 +1,21 @@
+[Unit]
+Description=ResearchClaw Factory dashboard (%i)
+After=network-online.target researchclaw-factory@%i.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/researchclaw-factory/%i.env
+WorkingDirectory=/data/workspace/autoresearch-stack/AutoResearchClaw
+ExecStart=/data/workspace/autoresearch-stack/AutoResearchClaw/bin/researchclaw-factory-dashboard --config ${FACTORY_CONFIG} --host 127.0.0.1 --port ${FACTORY_DASHBOARD_PORT}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/root/shared /data/workspace/autoresearch-stack/AutoResearchClaw
+
+[Install]
+WantedBy=multi-user.target

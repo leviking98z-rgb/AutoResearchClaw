@@ -1,0 +1,9 @@
+[Unit]
+Description=AutoResearchClaw RSI managed campaigns
+Documentation=file:/data/workspace/autoresearch-stack/AutoResearchClaw/deploy/systemd/README.md
+After=network-online.target data.mount apdcephfs_fsgm3-share_305110755.mount srv-bridge.service
+Wants=network-online.target
+RequiresMountsFor=/data/workspace/autoresearch-stack/AutoResearchClaw /apdcephfs_fsgm3/share_305110755/hunyuan/jinlw/.clusters
+
+[Install]
+WantedBy=multi-user.target

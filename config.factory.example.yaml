@@ -1,0 +1,69 @@
+# Continuous multi-Idea Research Factory.
+# Disabled by default so existing single-Idea campaigns are never hot-switched.
+factory:
+  enabled: false
+  factory_id: rsi-research-factory
+  state_dir: /root/shared/.clusters/.workdir/research-factory/rsi
+  topic_brief: >-
+    Discover falsifiable, compute-tractable research questions about recursive
+    self-improvement and self-iterative optimization of LLMs and LLM agents.
+
+  reservoir:
+    low_watermark: 12
+    target_size: 24
+    generation_batch_size: 6
+    generation_interval_sec: 300
+    retry_backoff_sec: 60
+
+  population:
+    max_active_ideas: 10
+    max_screening_ideas: 4
+    max_pilot_ideas: 6
+    max_validation_ideas: 3
+    max_paper_ideas: 2
+    max_same_family_active: 2
+
+  scheduler:
+    llm_slots: 2
+    gpu_target_utilization: 0.90
+    reserved_gpus: 2
+    pilot_max_gpus_per_idea: 4
+    validation_max_gpus_per_idea: 8
+    max_gpu_share_per_idea: 0.50
+    backfill_enabled: true
+    checkpoint_preemption: false
+    poll_interval_sec: 5
+
+  gpu:
+    enabled: false
+    pool_config: config.cluster32.yaml
+    restore_state: true
+    claim_on_start: false
+    prepare_on_start: false
+    release_on_shutdown: false
+
+  budgets:
+    desk_llm_calls: 12
+    smoke_gpu_hours: 0.5
+    pilot_gpu_hours: 4
+    validation_gpu_hours: 32
+    scale_gpu_hours: 0
+    max_wall_clock_hours: 72
+    max_engineering_repairs: 2
+    max_no_progress_rounds: 2
+
+  early_stopping:
+    minimum_seeds: 3
+    minimum_effect_size: 0.03
+    success_probability: 0.95
+    futility_probability: 0.95
+    maximum_gpu_hours: 12
+
+  worker:
+    python: /data/workspace/autoresearch-stack/AutoResearchClaw/.venv/bin/python
+    pipeline_config: /data/workspace/autoresearch-stack/AutoResearchClaw/config.rsi.yaml
+    skip_preflight: true
+    auto_approve: true
+    graceful_shutdown_sec: 30
+    simulation: false
+    simulation_delay_sec: 0.01

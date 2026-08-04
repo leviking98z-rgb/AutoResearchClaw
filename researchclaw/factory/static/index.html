@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>ResearchClaw · Continuous Research Factory</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header>
+      <div>
+        <small>CONTINUOUS MULTI-IDEA RESEARCH</small>
+        <h1>Research Factory</h1>
+      </div>
+      <div class="actions">
+        <span id="connection">连接中</span>
+        <button id="pause">暂停准入</button>
+        <button id="resume">恢复</button>
+        <button id="refresh">刷新</button>
+      </div>
+    </header>
+    <main>
+      <section id="metrics" class="metrics"></section>
+      <section id="board" class="board"></section>
+      <section class="lower">
+        <article>
+          <h2>GPU Leases</h2>
+          <div id="leases"></div>
+        </article>
+        <article>
+          <h2>最近事件</h2>
+          <div id="events"></div>
+        </article>
+      </section>
+    </main>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>ResearchClaw · RSI 自动研究控制台</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="noise"></div>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">RC</div>
+        <div>
+          <div class="eyebrow">AUTONOMOUS RESEARCH OPERATIONS</div>
+          <h1>RSI 自动研究控制台</h1>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span id="connection" class="connection connecting">
+          <span class="pulse-dot"></span>
+          正在连接
+        </span>
+        <span id="last-refresh" class="muted">--</span>
+        <button id="refresh-button" class="icon-button" title="立即刷新">↻</button>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="hero panel">
+        <div class="hero-main">
+          <div class="status-row">
+            <span id="campaign-status" class="status-pill neutral">读取中</span>
+            <span id="campaign-id" class="mono muted">--</span>
+          </div>
+          <h2 id="topic-title">正在读取当前研究题目…</h2>
+          <p id="research-question" class="hero-question"></p>
+          <div class="hero-meta">
+            <div>
+              <span class="label">当前 Cycle</span>
+              <strong id="cycle-value">--</strong>
+            </div>
+            <div>
+              <span class="label">实际执行阶段</span>
+              <strong id="current-stage">--</strong>
+            </div>
+            <div>
+              <span class="label">最近 Checkpoint</span>
+              <strong id="checkpoint-stage">--</strong>
+            </div>
+            <div>
+              <span class="label">连续运行</span>
+              <strong id="runtime-value">--</strong>
+            </div>
+          </div>
+        </div>
+        <aside class="control-card">
+          <div>
+            <span class="label">无人值守模式</span>
+            <strong id="autonomy-state">--</strong>
+            <p id="control-hint">读取控制状态…</p>
+          </div>
+          <div class="control-buttons">
+            <button id="pause-button" class="button warning" disabled>协作暂停</button>
+            <button id="resume-button" class="button success" disabled>恢复运行</button>
+          </div>
+          <p class="safety-note">不提供永久停止或释放 GPU，避免误操作。</p>
+        </aside>
+      </section>
+
+      <section class="metric-grid" id="metric-grid">
+        <article class="metric panel">
+          <span class="metric-icon cyan">◉</span>
+          <div><span class="label">Supervisor</span><strong id="supervisor-metric">--</strong></div>
+          <small id="supervisor-detail">--</small>
+        </article>
+        <article class="metric panel">
+          <span class="metric-icon violet">◆</span>
+          <div><span class="label">Ray / GPU</span><strong id="gpu-metric">--</strong></div>
+          <small id="gpu-detail">--</small>
+        </article>
+        <article class="metric panel">
+          <span class="metric-icon amber">↯</span>
+          <div><span class="label">当前实验</span><strong id="task-metric">--</strong></div>
+          <small id="task-detail">--</small>
+        </article>
+        <article class="metric panel">
+          <span class="metric-icon green">✓</span>
+          <div><span class="label">研究循环</span><strong id="cycle-metric">--</strong></div>
+          <small id="cycle-detail">--</small>
+        </article>
+      </section>
+
+      <section class="panel pipeline-panel">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">END-TO-END PIPELINE</span>
+            <h3>23 阶段研究流水线</h3>
+          </div>
+          <div class="legend">
+            <span><i class="dot done"></i>已完成</span>
+            <span><i class="dot running"></i>执行中</span>
+            <span><i class="dot revisit"></i>回滚重做</span>
+            <span><i class="dot pending"></i>待执行</span>
+          </div>
+        </div>
+        <div id="rollback-banner" class="rollback-banner hidden"></div>
+        <div id="stage-track" class="stage-track skeleton-block"></div>
+      </section>
+
+      <section class="two-column">
+        <article class="panel experiment-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">LIVE EXPERIMENT</span>
+              <h3>当前 GPU 实验</h3>
+            </div>
+            <span id="task-state" class="status-pill neutral">等待数据</span>
+          </div>
+          <dl class="detail-list">
+            <div><dt>Task ID</dt><dd id="task-id" class="mono">--</dd></div>
+            <div><dt>实验条件</dt><dd id="task-condition">--</dd></div>
+            <div><dt>随机种子</dt><dd id="task-seed">--</dd></div>
+            <div><dt>最新动作</dt><dd id="task-activity">--</dd></div>
+          </dl>
+          <div id="download-box" class="download-box hidden">
+            <div class="progress-caption">
+              <span>数据下载</span><strong id="download-percent">0%</strong>
+            </div>
+            <div class="progress"><div id="download-bar"></div></div>
+            <small id="download-detail">--</small>
+          </div>
+          <div class="topic-facts">
+            <div>
+              <span class="label">可证伪假设</span>
+              <p id="topic-hypothesis">--</p>
+            </div>
+            <div>
+              <span class="label">主指标</span>
+              <p id="topic-metric">--</p>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel health-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">INFRASTRUCTURE</span>
+              <h3>集群与监控状态</h3>
+            </div>
+            <span id="monitor-overall" class="status-pill neutral">读取中</span>
+          </div>
+          <div id="health-list" class="health-list skeleton-block"></div>
+          <p id="health-explainer" class="health-explainer"></p>
+        </article>
+      </section>
+
+      <section class="panel activity-panel">
+        <div class="tabs">
+          <button class="tab active" data-tab="logs">实时日志</button>
+          <button class="tab" data-tab="events">最近事件</button>
+          <button class="tab" data-tab="artifacts">论文与产物</button>
+          <div class="tab-spacer"></div>
+          <select id="log-source" aria-label="日志来源">
+            <option value="pipeline">Pipeline</option>
+            <option value="experiment">Experiment stdout</option>
+            <option value="experiment_stderr">Experiment stderr</option>
+            <option value="supervisor">Supervisor</option>
+          </select>
+        </div>
+        <div id="logs-view" class="tab-view active">
+          <pre id="log-output">正在加载日志…</pre>
+        </div>
+        <div id="events-view" class="tab-view">
+          <div id="events-list" class="event-list"></div>
+        </div>
+        <div id="artifacts-view" class="tab-view">
+          <div id="artifacts-list" class="artifact-grid"></div>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

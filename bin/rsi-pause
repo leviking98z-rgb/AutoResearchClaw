@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON="${RSI_PYTHON:-$ROOT/.venv/bin/python}"
+if [[ ! -x "$PYTHON" ]]; then
+  PYTHON="$(command -v python3 || true)"
+fi
+[[ -n "$PYTHON" ]] || {
+  echo "Python 3 is required (set RSI_PYTHON to override)." >&2
+  exit 1
+}
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  bin/rsi-pause CAMPAIGN_DIR [REASON...]
+
+Creates a cooperative pause request and nudges the supervisor to promptly
+cancel its local pipeline and any recorded detached pool task. Claims and the
+independent monitor remain active so the campaign can be resumed.
+EOF
+  exit 2
+}
+
+[[ $# -ge 1 ]] || usage
+CAMPAIGN_DIR="$1"
+shift
+REASON="${*:-operator requested cooperative pause}"
+
+cd "$ROOT"
+exec "$PYTHON" - "$CAMPAIGN_DIR" "$REASON" <<'PY'
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+from researchclaw.rsi.storage import CampaignStore
+import os
+import signal
+
+campaign_dir, reason = sys.argv[1:]
+store = CampaignStore(Path(campaign_dir))
+store.initialize()
+path = store.set_control("pause", reason)
+try:
+    state = store.load_state()
+    pid = int(state.get("pid") or 0)
+except (FileNotFoundError, TypeError, ValueError):
+    pid = 0
+if pid > 0 and hasattr(signal, "SIGUSR1"):
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except (ProcessLookupError, PermissionError):
+        pass
+print(f"Cooperative pause requested: {path}")
+print("Supervisor was notified; the monitor and GPU claims remain active.")
+PY

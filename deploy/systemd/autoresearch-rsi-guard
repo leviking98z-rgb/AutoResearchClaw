@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Fail closed before a managed unit can duplicate a production daemon."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+
+def die(message: str) -> NoReturn:
+    print(f"autoresearch-rsi-guard: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def process_start_ticks(pid: int) -> int | None:
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+        return int(fields[21])
+    except (FileNotFoundError, IndexError, OSError, ValueError):
+        return None
+
+
+def read_json(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        die("usage: autoresearch-rsi-guard ACTION INSTANCE")
+    action, instance = sys.argv[1:]
+    campaign_raw = os.environ.get("RSI_CAMPAIGN_DIR", "").strip()
+    if not campaign_raw:
+        die("RSI_CAMPAIGN_DIR is not set")
+    campaign_dir = Path(campaign_raw).expanduser().resolve()
+    manifest = read_json(campaign_dir / "campaign.json")
+    campaign_id = str(manifest.get("campaign_id") or campaign_dir.name)
+    if campaign_id != instance:
+        die(
+            f"instance {instance!r} does not match campaign_id "
+            f"{campaign_id!r}"
+        )
+    repo = Path(
+        os.environ.get(
+            "RSI_REPO_ROOT",
+            "/data/workspace/autoresearch-stack/AutoResearchClaw",
+        )
+    )
+    if not (repo / "bin" / "rsi-resume").is_file():
+        die(f"invalid RSI_REPO_ROOT: {repo}")
+
+    if action == "start-supervisor":
+        state = read_json(campaign_dir / "state.json")
+        try:
+            pid = int(state.get("pid") or 0)
+            ticks = int(state.get("supervisor_start_ticks") or 0)
+        except (TypeError, ValueError):
+            pid = ticks = 0
+        if pid > 0 and ticks > 0 and process_start_ticks(pid) == ticks:
+            die(f"supervisor already running with PID {pid}")
+        return 0
+
+    if action == "start-monitor":
+        pid_file = Path(
+            os.environ.get(
+                "RSI_MONITOR_PID_FILE",
+                str(campaign_dir / "rsi-monitor.pid"),
+            )
+        )
+        identity = read_json(pid_file)
+        try:
+            pid = int(identity.get("pid") or 0)
+            ticks = int(identity.get("start_ticks") or 0)
+        except (TypeError, ValueError):
+            pid = ticks = 0
+        if pid > 0 and (
+            ticks == 0 and process_start_ticks(pid) is not None
+            or ticks > 0 and process_start_ticks(pid) == ticks
+        ):
+            die(f"monitor already running with PID {pid}")
+        watchdog_path = Path(f"{pid_file}.watchdog.pid")
+        try:
+            watchdog_pid = int(
+                watchdog_path.read_text(encoding="utf-8").strip()
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            watchdog_pid = 0
+        if watchdog_pid > 0 and process_start_ticks(watchdog_pid) is not None:
+            die(f"monitor watchdog already running with PID {watchdog_pid}")
+        return 0
+
+    if action == "start-keepalive":
+        own_pid = os.getpid()
+        systemd_unit = f"autoresearch-rsi-keepalive@{instance}.service"
+        for process_dir in Path("/proc").iterdir():
+            if not process_dir.name.isdigit():
+                continue
+            pid = int(process_dir.name)
+            if pid == own_pid:
+                continue
+            try:
+                cmdline = (
+                    (process_dir / "cmdline")
+                    .read_bytes()
+                    .replace(b"\0", b" ")
+                    .decode(errors="replace")
+                )
+                cgroup = (process_dir / "cgroup").read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except (FileNotFoundError, OSError):
+                continue
+            if (
+                "autoresearch-rsi-lease-keepalive" in cmdline
+                or (
+                    "autoresearch-rsi-keepalive-run" in cmdline
+                    and systemd_unit not in cgroup
+                )
+            ):
+                die(f"allocation keepalive already running with PID {pid}")
+        heartbeat = Path(
+            os.environ.get(
+                "RSI_LEASE_HEARTBEAT",
+                "/root/shared/.clusters/.tmp/autoresearch-rsi/"
+                "lease-keepalive-heartbeat.json",
+            )
+        )
+        value = read_json(heartbeat)
+        try:
+            pid = int(value.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 0 and process_start_ticks(pid) is not None:
+            die(f"allocation keepalive already running with PID {pid}")
+        return 0
+
+    die(f"unknown action: {action}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

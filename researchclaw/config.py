@@ -100,13 +100,15 @@ EXPERIMENT_MODES = {
     "sandbox",
     "docker",
     "ssh_remote",
+    "clusterbridge",
+    "clusterbridge_pool",
     "colab_drive",
     "agentic",
     "collider_agent",  # Physics: ColliderAgent via Claude Code + Magnus
     "biology_agent",   # Biology: Biology-Agent (FBA / pFBA / FVA via COBRApy + BIGG) via Claude Code
     "stat_agent",      # Statistics: stat_research_agent (sim studies, CI/coverage) via Claude Code
 }
-CLI_AGENT_PROVIDERS = {"llm", "claude_code", "codex"}
+CLI_AGENT_PROVIDERS = {"llm", "claude_code", "codex", "cursor"}
 
 
 def _get_by_path(data: dict[str, Any], dotted_key: str) -> Any:
@@ -143,6 +145,9 @@ class ResearchConfig:
     daily_paper_count: int = 0
     quality_threshold: float = 0.0
     graceful_degradation: bool = True
+    campaign_brief: str = ""
+    autonomous_topic_selection: bool = False
+    selected_topic_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -191,6 +196,32 @@ class AcpConfig:
 
 
 @dataclass(frozen=True)
+class RoleConfig:
+    """Per-role LLM routing and isolation policy.
+
+    Blank connection fields inherit from the top-level ``llm`` configuration.
+    This makes role routing backward-compatible while allowing any role to move
+    to a different provider, endpoint, credential, or model independently.
+    """
+
+    provider: str = ""
+    base_url: str = ""
+    wire_api: str = ""
+    api_key_env: str = ""
+    api_key: str = ""
+    model: str = ""
+    # ``None`` means inherit the top-level fallback chain.  An explicit empty
+    # tuple means this role intentionally disables fallback models.
+    fallback_models: tuple[str, ...] | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    timeout_sec: int | None = None
+    isolated_session: bool = True
+    session_name: str = ""
+    tools: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class LlmConfig:
     provider: str
     base_url: str = ""
@@ -203,6 +234,7 @@ class LlmConfig:
     notes: str = ""
     timeout_sec: int = 600
     acp: AcpConfig = field(default_factory=AcpConfig)
+    roles: dict[str, RoleConfig] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -260,6 +292,37 @@ class SshRemoteConfig:
     timeout_sec: int = 600  # default 10 min for experiment execution
     scp_timeout_sec: int = 300  # default 5 min for file uploads
     setup_timeout_sec: int = 300  # default 5 min for setup commands
+
+
+@dataclass(frozen=True)
+class ClusterBridgeConfig:
+    """Remote GPU execution through the shared-CephFS clusterbridge transport."""
+
+    node: str = ""
+    cb_command: str = "/root/shared/.clusters/.tools/clusterbridge.sh"
+    shared_root: str = "/root/shared/.clusters/.tmp/researchclaw"
+    remote_python: str = "/opt/conda/envs/torch-base/bin/python3"
+    gpu_ids: tuple[int, ...] = (0,)
+    setup_commands: tuple[str, ...] = ()
+    network_isolation: bool = True
+    cleanup_remote: bool = True
+    timeout_sec: int = 3600
+    claim_ttl_min: int = 180
+
+
+@dataclass(frozen=True)
+class ClusterBridgePoolSandboxConfig:
+    """Execute experiments against an already prepared ClusterBridge/Ray pool."""
+
+    config_file: str = "config.cluster32.yaml"
+    remote_python: str = "/opt/conda/envs/torch-base/bin/python3"
+    setup_commands: tuple[str, ...] = ()
+    network_isolation: bool = True
+    cleanup_remote: bool = True
+    timeout_sec: int = 3600
+    restore_state: bool = True
+    require_prepared: bool = True
+    deterministic_task_namespace: str = ""
 
 
 @dataclass(frozen=True)
@@ -542,6 +605,7 @@ class CliAgentConfig:
     provider: "llm"          — use existing LLM chat API (default, backward-compatible)
               "claude_code"  — Claude Code CLI (``claude -p``)
               "codex"        — OpenAI Codex CLI (``codex exec``)
+              "cursor"       — Cursor Agent CLI (``cursor-agent --print``)
 
     Auth for claude_code: ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL env vars.
     Auth for codex:       OPENAI_API_KEY env var.
@@ -571,6 +635,10 @@ class ExperimentConfig:
     biology_agent: BiologyAgentConfig = field(default_factory=BiologyAgentConfig)
     stat_agent: StatAgentConfig = field(default_factory=StatAgentConfig)
     ssh_remote: SshRemoteConfig = field(default_factory=SshRemoteConfig)
+    clusterbridge: ClusterBridgeConfig = field(default_factory=ClusterBridgeConfig)
+    clusterbridge_pool: ClusterBridgePoolSandboxConfig = field(
+        default_factory=ClusterBridgePoolSandboxConfig
+    )
     colab_drive: ColabDriveConfig = field(default_factory=ColabDriveConfig)
     code_agent: CodeAgentConfig = field(default_factory=CodeAgentConfig)
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
@@ -938,6 +1006,13 @@ class RCConfig:
                 daily_paper_count=int(research.get("daily_paper_count", 0)),
                 quality_threshold=float(research.get("quality_threshold", 0.0)),
                 graceful_degradation=bool(research.get("graceful_degradation", True)),
+                campaign_brief=str(research.get("campaign_brief", "") or ""),
+                autonomous_topic_selection=bool(
+                    research.get("autonomous_topic_selection", False)
+                ),
+                selected_topic_file=str(
+                    research.get("selected_topic_file", "") or ""
+                ),
             ),
             runtime=RuntimeConfig(
                 timezone=runtime["timezone"],
@@ -1111,6 +1186,56 @@ def validate_config(
     ):
         errors.append(f"Invalid llm.wire_api: {llm_wire_api}")
 
+    role_configs = _get_by_path(data, "llm.roles")
+    if role_configs is not None and not isinstance(role_configs, dict):
+        errors.append("llm.roles must be a mapping")
+    elif isinstance(role_configs, dict):
+        for role_name, role_data in role_configs.items():
+            role_path = f"llm.roles.{role_name}"
+            if not isinstance(role_name, str) or not role_name.strip():
+                errors.append("llm.roles keys must be non-empty strings")
+                continue
+            if not isinstance(role_data, dict):
+                errors.append(f"{role_path} must be a mapping")
+                continue
+            role_wire_api = role_data.get("wire_api")
+            if not _is_blank(role_wire_api) and role_wire_api not in (
+                "chat_completions",
+                "responses",
+            ):
+                errors.append(f"Invalid {role_path}.wire_api: {role_wire_api}")
+            role_temperature = role_data.get("temperature")
+            if role_temperature is not None:
+                try:
+                    temperature_value = float(role_temperature)
+                except (TypeError, ValueError):
+                    errors.append(f"{role_path}.temperature must be numeric")
+                else:
+                    if not 0.0 <= temperature_value <= 2.0:
+                        errors.append(
+                            f"{role_path}.temperature must be between 0 and 2"
+                        )
+            for integer_field in ("max_tokens", "timeout_sec"):
+                value = role_data.get(integer_field)
+                if value is None:
+                    continue
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value <= 0
+                ):
+                    errors.append(
+                        f"{role_path}.{integer_field} must be a positive integer"
+                    )
+            fallback_models = role_data.get("fallback_models")
+            if fallback_models is not None and not isinstance(
+                fallback_models, (list, tuple)
+            ):
+                errors.append(f"{role_path}.fallback_models must be a list")
+            tools = role_data.get("tools")
+            if tools is not None and not isinstance(tools, (list, tuple)):
+                errors.append(f"{role_path}.tools must be a list")
+
     hitl_required_stages = _get_by_path(data, "security.hitl_required_stages")
     if hitl_required_stages is not None:
         if not isinstance(hitl_required_stages, list):
@@ -1125,6 +1250,31 @@ def validate_config(
     exp_mode = _get_by_path(data, "experiment.mode")
     if not _is_blank(exp_mode) and exp_mode not in EXPERIMENT_MODES:
         errors.append(f"Invalid experiment.mode: {exp_mode}")
+    if exp_mode == "clusterbridge":
+        cb_node = _get_by_path(data, "experiment.clusterbridge.node")
+        cb_command = _get_by_path(data, "experiment.clusterbridge.cb_command")
+        cb_root = _get_by_path(data, "experiment.clusterbridge.shared_root")
+        if _is_blank(cb_node):
+            errors.append(
+                "experiment.clusterbridge.node is required in clusterbridge mode"
+            )
+        if _is_blank(cb_command):
+            errors.append(
+                "experiment.clusterbridge.cb_command is required in clusterbridge mode"
+            )
+        if _is_blank(cb_root):
+            errors.append(
+                "experiment.clusterbridge.shared_root is required in clusterbridge mode"
+            )
+    if exp_mode == "clusterbridge_pool":
+        pool_config = _get_by_path(
+            data, "experiment.clusterbridge_pool.config_file"
+        )
+        if _is_blank(pool_config):
+            errors.append(
+                "experiment.clusterbridge_pool.config_file is required in "
+                "clusterbridge_pool mode"
+            )
 
     exp_direction = _get_by_path(data, "experiment.metric_direction")
     if not _is_blank(exp_direction) and exp_direction not in ("minimize", "maximize"):
@@ -1155,6 +1305,52 @@ def validate_config(
 
 def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
     acp_data = data.get("acp") or {}
+    roles_data = data.get("roles") or {}
+    roles: dict[str, RoleConfig] = {}
+    if isinstance(roles_data, dict):
+        for raw_name, raw_role in roles_data.items():
+            if not isinstance(raw_role, dict):
+                continue
+            role_name = str(raw_name).strip().casefold().replace("-", "_")
+            if not role_name:
+                continue
+            temperature_raw = raw_role.get("temperature")
+            max_tokens_raw = raw_role.get("max_tokens")
+            timeout_raw = raw_role.get("timeout_sec")
+            role_fallbacks = raw_role.get("fallback_models")
+            roles[role_name] = RoleConfig(
+                provider=str(raw_role.get("provider", "") or ""),
+                base_url=str(raw_role.get("base_url", "") or ""),
+                wire_api=str(raw_role.get("wire_api", "") or ""),
+                api_key_env=str(raw_role.get("api_key_env", "") or ""),
+                api_key=str(raw_role.get("api_key", "") or ""),
+                model=str(
+                    raw_role.get("model", raw_role.get("primary_model", "")) or ""
+                ),
+                fallback_models=(
+                    None
+                    if role_fallbacks is None
+                    else tuple(role_fallbacks or ())
+                ),
+                temperature=(
+                    None
+                    if temperature_raw is None
+                    else _safe_float(temperature_raw, 0.7)
+                ),
+                max_tokens=(
+                    None
+                    if max_tokens_raw is None
+                    else _safe_int(max_tokens_raw, 4096)
+                ),
+                timeout_sec=(
+                    None
+                    if timeout_raw is None
+                    else _safe_int(timeout_raw, 600)
+                ),
+                isolated_session=bool(raw_role.get("isolated_session", True)),
+                session_name=str(raw_role.get("session_name", "") or ""),
+                tools=tuple(str(tool) for tool in (raw_role.get("tools") or ())),
+            )
     return LlmConfig(
         provider=data.get("provider", "openai-compatible"),
         base_url=data.get("base_url", ""),
@@ -1173,6 +1369,7 @@ def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
             session_name=acp_data.get("session_name", "researchclaw"),
             timeout_sec=int(acp_data.get("timeout_sec", 1800)),
         ),
+        roles=roles,
     )
 
 
@@ -1305,6 +1502,8 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
     sandbox_data = data.get("sandbox") or {}
     docker_data = data.get("docker") or {}
     ssh_data = data.get("ssh_remote") or {}
+    clusterbridge_data = data.get("clusterbridge") or {}
+    clusterbridge_pool_data = data.get("clusterbridge_pool") or {}
     colab_data = data.get("colab_drive") or {}
     return ExperimentConfig(
         mode=data.get("mode", "simulated"),
@@ -1359,6 +1558,78 @@ def _parse_experiment_config(data: dict[str, Any]) -> ExperimentConfig:
             timeout_sec=_safe_int(ssh_data.get("timeout_sec"), 600),
             scp_timeout_sec=_safe_int(ssh_data.get("scp_timeout_sec"), 300),
             setup_timeout_sec=_safe_int(ssh_data.get("setup_timeout_sec"), 300),
+        ),
+        clusterbridge=ClusterBridgeConfig(
+            node=clusterbridge_data.get("node", ""),
+            cb_command=clusterbridge_data.get(
+                "cb_command",
+                "/root/shared/.clusters/.tools/clusterbridge.sh",
+            ),
+            shared_root=clusterbridge_data.get(
+                "shared_root",
+                "/root/shared/.clusters/.tmp/researchclaw",
+            ),
+            remote_python=clusterbridge_data.get(
+                "remote_python",
+                "/opt/conda/envs/torch-base/bin/python3",
+            ),
+            gpu_ids=tuple(
+                int(g) for g in clusterbridge_data.get("gpu_ids", (0,))
+            ),
+            setup_commands=tuple(
+                clusterbridge_data.get("setup_commands") or ()
+            ),
+            network_isolation=bool(
+                clusterbridge_data.get("network_isolation", True)
+            ),
+            cleanup_remote=bool(
+                clusterbridge_data.get("cleanup_remote", True)
+            ),
+            timeout_sec=_safe_int(
+                clusterbridge_data.get("timeout_sec"),
+                3600,
+            ),
+            claim_ttl_min=_safe_int(
+                clusterbridge_data.get("claim_ttl_min"),
+                180,
+            ),
+        ),
+        clusterbridge_pool=ClusterBridgePoolSandboxConfig(
+            config_file=str(
+                clusterbridge_pool_data.get(
+                    "config_file",
+                    "config.cluster32.yaml",
+                )
+            ),
+            remote_python=str(
+                clusterbridge_pool_data.get(
+                    "remote_python",
+                    "/opt/conda/envs/torch-base/bin/python3",
+                )
+            ),
+            setup_commands=tuple(
+                clusterbridge_pool_data.get("setup_commands") or ()
+            ),
+            network_isolation=bool(
+                clusterbridge_pool_data.get("network_isolation", True)
+            ),
+            cleanup_remote=bool(
+                clusterbridge_pool_data.get("cleanup_remote", True)
+            ),
+            timeout_sec=_safe_int(
+                clusterbridge_pool_data.get("timeout_sec"),
+                3600,
+            ),
+            restore_state=bool(
+                clusterbridge_pool_data.get("restore_state", True)
+            ),
+            require_prepared=bool(
+                clusterbridge_pool_data.get("require_prepared", True)
+            ),
+            deterministic_task_namespace=str(
+                clusterbridge_pool_data.get("deterministic_task_namespace", "")
+                or ""
+            ),
         ),
         colab_drive=ColabDriveConfig(
             drive_root=colab_data.get("drive_root", ""),

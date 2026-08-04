@@ -4,8 +4,10 @@ import importlib
 import json
 import logging
 import os
+import shlex
 import shutil
 import socket
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -705,6 +707,71 @@ def check_docker_runtime(config: RCConfig) -> CheckResult:
     return CheckResult(name="docker_runtime", status="pass", detail=detail)
 
 
+def check_clusterbridge_runtime(config: RCConfig) -> CheckResult:
+    """Check ClusterBridge transport, selected node, PyTorch and CUDA."""
+    from researchclaw.experiment.clusterbridge_sandbox import ClusterBridgeSandbox
+
+    cb_cfg = config.experiment.clusterbridge
+    ok, msg = ClusterBridgeSandbox.check_available(cb_cfg)
+    if not ok:
+        return CheckResult(
+            name="clusterbridge_runtime",
+            status="fail",
+            detail=msg,
+            fix=(
+                "Check `cb list`, claim the configured node, and update "
+                "experiment.clusterbridge.node/cb_command"
+            ),
+        )
+
+    probe_code = (
+        "import torch; "
+        "assert torch.cuda.is_available(); "
+        "print(torch.__version__, torch.version.cuda, "
+        "torch.cuda.get_device_name(0), torch.cuda.device_count())"
+    )
+    probe = (
+        f"{shlex.quote(cb_cfg.remote_python)} "
+        f"-c {shlex.quote(probe_code)}"
+    )
+    try:
+        cp = subprocess.run(
+            [
+                "bash",
+                cb_cfg.cb_command,
+                cb_cfg.node,
+                "run",
+                probe,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=90,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return CheckResult(
+            name="clusterbridge_runtime",
+            status="fail",
+            detail=f"{msg}; CUDA probe failed: {exc}",
+            fix="Verify the remote Python path and PyTorch/CUDA installation",
+        )
+    if cp.returncode != 0:
+        detail = cp.stderr.strip() or cp.stdout.strip()
+        return CheckResult(
+            name="clusterbridge_runtime",
+            status="fail",
+            detail=f"{msg}; CUDA probe failed: {detail}",
+            fix="Verify the remote Python path and PyTorch/CUDA installation",
+        )
+    return CheckResult(
+        name="clusterbridge_runtime",
+        status="pass",
+        detail=f"{msg}; CUDA ready: {cp.stdout.strip()}",
+    )
+
+
 def run_doctor(config_path: str | Path) -> DoctorReport:
     """Run all health checks and return report."""
     checks: list[CheckResult] = []
@@ -757,6 +824,50 @@ def run_doctor(config_path: str | Path) -> DoctorReport:
                     status="fail",
                     detail=f"Docker health check error: {exc}",
                     fix="Ensure Docker is installed and the daemon is running",
+                )
+            )
+
+    if experiment_mode == "clusterbridge":
+        try:
+            checks.append(check_clusterbridge_runtime(config))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("ClusterBridge health check failed: %s", exc)
+            checks.append(
+                CheckResult(
+                    name="clusterbridge_runtime",
+                    status="fail",
+                    detail=f"ClusterBridge health check error: {exc}",
+                    fix="Check ClusterBridge configuration and node availability",
+                )
+            )
+    if experiment_mode == "clusterbridge_pool":
+        try:
+            from researchclaw.experiment.clusterbridge_pool_sandbox import (
+                ClusterBridgePoolSandbox,
+            )
+
+            ok, detail = ClusterBridgePoolSandbox.check_available(
+                config.experiment.clusterbridge_pool
+            )
+            checks.append(
+                CheckResult(
+                    name="clusterbridge_pool_runtime",
+                    status="pass" if ok else "fail",
+                    detail=detail,
+                    fix=(
+                        ""
+                        if ok
+                        else "Claim and prepare the configured ClusterBridge pool"
+                    ),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            checks.append(
+                CheckResult(
+                    name="clusterbridge_pool_runtime",
+                    status="fail",
+                    detail=f"ClusterBridge pool health check error: {exc}",
+                    fix="Check the pool config and durable pool state",
                 )
             )
 

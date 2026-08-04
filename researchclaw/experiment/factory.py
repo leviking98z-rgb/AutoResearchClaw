@@ -20,6 +20,8 @@ def create_sandbox(config: ExperimentConfig, workdir: Path) -> SandboxProtocol:
 
     - ``"sandbox"`` → :class:`ExperimentSandbox` (subprocess)
     - ``"docker"``  → :class:`DockerSandbox`  (Docker container)
+    - ``"clusterbridge"`` → :class:`ClusterBridgeSandbox` (remote GPU node)
+    - ``"clusterbridge_pool"`` → multi-node ClusterBridge/Ray pool
     """
     if config.mode == "docker":
         from researchclaw.experiment.docker_sandbox import DockerSandbox
@@ -59,6 +61,34 @@ def create_sandbox(config: ExperimentConfig, workdir: Path) -> SandboxProtocol:
 
         logger.info("SSH remote sandbox: %s", msg)
         return SshRemoteSandbox(ssh_cfg, workdir)
+
+    if config.mode == "clusterbridge":
+        from researchclaw.experiment.clusterbridge_sandbox import (
+            ClusterBridgeSandbox,
+        )
+
+        cb_cfg = config.clusterbridge
+        if not cb_cfg.node:
+            raise RuntimeError(
+                "clusterbridge mode requires experiment.clusterbridge.node in config."
+            )
+        ok, msg = ClusterBridgeSandbox.check_available(cb_cfg)
+        if not ok:
+            raise RuntimeError(f"ClusterBridge connectivity check failed: {msg}")
+        logger.info("ClusterBridge sandbox: %s", msg)
+        return ClusterBridgeSandbox(cb_cfg, workdir)
+
+    if config.mode == "clusterbridge_pool":
+        from researchclaw.experiment.clusterbridge_pool_sandbox import (
+            ClusterBridgePoolSandbox,
+        )
+
+        pool_cfg = config.clusterbridge_pool
+        ok, msg = ClusterBridgePoolSandbox.check_available(pool_cfg)
+        if not ok:
+            raise RuntimeError(f"ClusterBridge pool check failed: {msg}")
+        logger.info("ClusterBridge pool sandbox: %s", msg)
+        return ClusterBridgePoolSandbox(pool_cfg, workdir)
 
     if config.mode == "colab_drive":
         from researchclaw.experiment.colab_sandbox import ColabDriveSandbox
