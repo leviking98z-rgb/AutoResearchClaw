@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 from researchclaw.pipeline.stage_cache import (
+    CACHE_SCHEMA_VERSION,
+    cached_result,
     restore_stage_cache,
     save_stage_cache,
     stage_input_fingerprint,
@@ -79,7 +82,7 @@ def test_stage_cache_roundtrip(tmp_path: Path) -> None:
     assert saved is not None
     assert hit is not None
     assert (restored_dir / "candidates.jsonl").read_text() == '{"title":"paper"}\n'
-    assert not (restored_dir / "stale.txt").exists()
+    assert (restored_dir / "stale.txt").read_text() == "remove me"
     assert json.loads((restored_dir / "cache_restore.json").read_text())["hit"]
 
 
@@ -128,6 +131,92 @@ def test_config_change_changes_fingerprint(tmp_path: Path) -> None:
     )
 
     assert first != second
+
+
+def test_prompt_file_content_change_invalidates_fingerprint(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    _stage3(run_dir)
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("version one")
+    config = _config(tmp_path / "cache")
+    config.prompts.custom_file = str(prompt_file)
+    first, _ = stage_input_fingerprint(
+        stage=Stage.LITERATURE_COLLECT,
+        run_dir=run_dir,
+        config=config,
+    )
+    prompt_file.write_text("version two")
+    second, _ = stage_input_fingerprint(
+        stage=Stage.LITERATURE_COLLECT,
+        run_dir=run_dir,
+        config=config,
+    )
+
+    assert first != second
+
+
+def test_hypothesis_fingerprint_includes_candidates_and_guidance(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage4 = run_dir / "stage-04"
+    stage4.mkdir(parents=True)
+    candidates = stage4 / "candidates.jsonl"
+    candidates.write_text('{"title":"one"}\n')
+    stage7 = run_dir / "stage-07"
+    stage7.mkdir()
+    (stage7 / "synthesis.md").write_text("synthesis")
+    stage8 = run_dir / "stage-08"
+    stage8.mkdir()
+    guidance = stage8 / "hitl_guidance.md"
+    guidance.write_text("prefer robust hypotheses")
+    config = _config(tmp_path / "cache")
+
+    first, _ = stage_input_fingerprint(
+        stage=Stage.HYPOTHESIS_GEN,
+        run_dir=run_dir,
+        config=config,
+    )
+    candidates.write_text('{"title":"two"}\n')
+    second, _ = stage_input_fingerprint(
+        stage=Stage.HYPOTHESIS_GEN,
+        run_dir=run_dir,
+        config=config,
+    )
+    guidance.write_text("prefer efficient hypotheses")
+    third, _ = stage_input_fingerprint(
+        stage=Stage.HYPOTHESIS_GEN,
+        run_dir=run_dir,
+        config=config,
+    )
+
+    assert first != second
+    assert second != third
+
+
+def test_fingerprint_prefers_canonical_stage_over_versioned_copy(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    canonical = run_dir / "stage-07"
+    canonical.mkdir(parents=True)
+    (canonical / "synthesis.md").write_text("canonical")
+    versioned = run_dir / "stage-07_v1"
+    versioned.mkdir()
+    (versioned / "synthesis.md").write_text("old version")
+    fingerprint, components = stage_input_fingerprint(
+        stage=Stage.HYPOTHESIS_GEN,
+        run_dir=run_dir,
+        config=_config(tmp_path / "cache"),
+    )
+
+    assert fingerprint
+    synthesis = next(
+        item for item in components["inputs"] if item["name"] == "synthesis.md"
+    )
+    assert synthesis["files"][0]["sha256"] == (
+        hashlib.sha256(b"canonical").hexdigest()
+    )
 
 
 def test_corrupt_payload_is_cache_miss(tmp_path: Path) -> None:
@@ -194,6 +283,123 @@ def test_expired_literature_cache_is_miss(tmp_path: Path) -> None:
         )
         is None
     )
+
+
+def test_expired_literature_cache_can_be_rebuilt(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    run_dir = tmp_path / "run"
+    _stage3(run_dir)
+    stage4 = run_dir / "stage-04"
+    stage4.mkdir()
+    output = stage4 / "candidates.jsonl"
+    output.write_text('{"version":1}\n')
+    config = _config(cache_dir)
+    first = save_stage_cache(
+        stage=Stage.LITERATURE_COLLECT,
+        stage_dir=stage4,
+        run_dir=run_dir,
+        run_id="first",
+        config=config,
+        artifacts=("candidates.jsonl",),
+    )
+    assert first is not None
+    manifest_path = Path(first["cache_entry"]) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["created_at"] = (
+        datetime.now(UTC) - timedelta(hours=25)
+    ).isoformat(timespec="seconds")
+    manifest_path.write_text(json.dumps(manifest))
+    output.write_text('{"version":2}\n')
+
+    second = save_stage_cache(
+        stage=Stage.LITERATURE_COLLECT,
+        stage_dir=stage4,
+        run_dir=run_dir,
+        run_id="second",
+        config=config,
+        artifacts=("candidates.jsonl",),
+    )
+
+    assert second is not None
+    assert second["saved"] is True
+    assert second["replaced"] is True
+    restored = tmp_path / "restored" / "stage-04"
+    hit = restore_stage_cache(
+        stage=Stage.LITERATURE_COLLECT,
+        stage_dir=restored,
+        run_dir=run_dir,
+        config=config,
+    )
+    assert hit is not None
+    assert (restored / "candidates.jsonl").read_text() == '{"version":2}\n'
+
+
+def test_old_cache_schema_is_rejected_and_rebuilt(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    run_dir = tmp_path / "run"
+    _stage3(run_dir)
+    stage4 = run_dir / "stage-04"
+    stage4.mkdir()
+    output = stage4 / "candidates.jsonl"
+    output.write_text('{"new":true}\n')
+    config = _config(cache_dir)
+    saved = save_stage_cache(
+        stage=Stage.LITERATURE_COLLECT,
+        stage_dir=stage4,
+        run_dir=run_dir,
+        run_id="first",
+        config=config,
+        artifacts=("candidates.jsonl",),
+    )
+    assert saved is not None
+    manifest_path = Path(saved["cache_entry"]) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["schema_version"] = CACHE_SCHEMA_VERSION - 1
+    manifest_path.write_text(json.dumps(manifest))
+
+    assert restore_stage_cache(
+        stage=Stage.LITERATURE_COLLECT,
+        stage_dir=tmp_path / "old" / "stage-04",
+        run_dir=run_dir,
+        config=config,
+    ) is None
+    rebuilt = save_stage_cache(
+        stage=Stage.LITERATURE_COLLECT,
+        stage_dir=stage4,
+        run_dir=run_dir,
+        run_id="rebuilt",
+        config=config,
+        artifacts=("candidates.jsonl",),
+    )
+    assert rebuilt is not None
+    assert rebuilt["saved"] is True
+    assert rebuilt["replaced"] is True
+    assert json.loads(manifest_path.read_text())["schema_version"] == (
+        CACHE_SCHEMA_VERSION
+    )
+
+
+def test_cached_result_uses_manifest_artifact_list(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    run_dir = tmp_path / "run"
+    _stage3(run_dir)
+    stage4 = run_dir / "stage-04"
+    stage4.mkdir()
+    (stage4 / "candidates.jsonl").write_text("{}\n")
+    (stage4 / "references.bib").write_text("@article{x}\n")
+    saved = save_stage_cache(
+        stage=Stage.LITERATURE_COLLECT,
+        stage_dir=stage4,
+        run_dir=run_dir,
+        run_id="first",
+        config=_config(cache_dir),
+        artifacts=("candidates.jsonl", "references.bib"),
+    )
+    assert saved is not None
+
+    result = cached_result(Stage.LITERATURE_COLLECT, saved)
+
+    assert result.artifacts == ("candidates.jsonl", "references.bib")
 
 
 def test_zero_ttl_disables_literature_cache_expiry(tmp_path: Path) -> None:

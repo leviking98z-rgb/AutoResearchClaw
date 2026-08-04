@@ -100,11 +100,6 @@ fallback models, retry/fallback counts, elapsed time, token usage, finish and
 truncation status, generation controls, and a SHA-256 request fingerprint.
 Prompt bodies, API keys, and chain-of-thought are not stored.
 
-The same metadata is mirrored as `llm_call` rows in
-`<run>/pipeline_events.jsonl`, providing one chronological stream for
-stage/cache/model retrospectives while preserving the per-role audit files for
-focused debugging.
-
 Campaign events include:
 
 - cycle start/completion;

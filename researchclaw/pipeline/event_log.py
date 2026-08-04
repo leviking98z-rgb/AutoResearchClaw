@@ -27,7 +27,6 @@ class EventType(str, Enum):
     CACHE_MISS = "cache_miss"
     CACHE_STORE = "cache_store"
     LITERATURE_MEMORY = "literature_memory"
-    LLM_CALL = "llm_call"
     RESUME = "resume"
 
 

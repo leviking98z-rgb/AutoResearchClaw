@@ -274,14 +274,6 @@ def test_role_client_writes_audit_without_prompt_content(tmp_path: Path) -> None
     assert row["json_mode"] is False
     assert len(row["request_sha256"]) == 64
     assert secret_prompt not in audit_path.read_text(encoding="utf-8")
-    pipeline_rows = [
-        json.loads(line)
-        for line in (tmp_path / "pipeline_events.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
-    assert pipeline_rows[-1]["type"] == "llm_call"
-    assert pipeline_rows[-1]["role"] == "skeptical_reviewer"
 
 
 def test_role_audit_records_retry_and_fallback_metadata(tmp_path: Path) -> None:

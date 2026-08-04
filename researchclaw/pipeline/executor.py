@@ -437,6 +437,44 @@ def _run_hitl_post_stage(
     return result
 
 
+def _validate_stage_outputs(
+    *,
+    stage: Stage,
+    stage_dir: Path,
+    config: RCConfig,
+    result: StageResult,
+) -> StageResult:
+    """Validate the stage contract after execution or human edits."""
+
+    if result.status != StageStatus.DONE:
+        return result
+    contract = CONTRACTS[stage]
+    for output_file in _select_output_files(contract, config):
+        if output_file.endswith("/"):
+            path = stage_dir / output_file.rstrip("/")
+            if not path.is_dir() or not any(path.iterdir()):
+                return StageResult(
+                    stage=stage,
+                    status=StageStatus.FAILED,
+                    artifacts=result.artifacts,
+                    error=f"Missing output directory: {output_file}",
+                    decision="retry",
+                    evidence_refs=result.evidence_refs,
+                )
+        else:
+            path = stage_dir / output_file
+            if not path.exists() or path.stat().st_size == 0:
+                return StageResult(
+                    stage=stage,
+                    status=StageStatus.FAILED,
+                    artifacts=result.artifacts,
+                    error=f"Missing or empty output: {output_file}",
+                    decision="retry",
+                    evidence_refs=result.evidence_refs,
+                )
+    return result
+
+
 def _run_collaboration_loop(
     stage: Stage,
     result: StageResult,
@@ -642,7 +680,7 @@ def execute_stage(
                 config=config,
             )
             if cache_details is not None:
-                result = cached_result(stage)
+                result = cached_result(stage, cache_details)
                 logger.info(
                     "[cache] HIT stage=%s fingerprint=%s source_run=%s",
                     stage.name,
@@ -736,32 +774,13 @@ def execute_stage(
                 decision="retry",
             )
 
-    if result.status == StageStatus.DONE and cache_details is None:
-        for output_file in _select_output_files(contract, config):
-            if output_file.endswith("/"):
-                path = stage_dir / output_file.rstrip("/")
-                if not path.is_dir() or not any(path.iterdir()):
-                    result = StageResult(
-                        stage=stage,
-                        status=StageStatus.FAILED,
-                        artifacts=result.artifacts,
-                        error=f"Missing output directory: {output_file}",
-                        decision="retry",
-                        evidence_refs=result.evidence_refs,
-                    )
-                    break
-            else:
-                path = stage_dir / output_file
-                if not path.exists() or path.stat().st_size == 0:
-                    result = StageResult(
-                        stage=stage,
-                        status=StageStatus.FAILED,
-                        artifacts=result.artifacts,
-                        error=f"Missing or empty output: {output_file}",
-                        decision="retry",
-                        evidence_refs=result.evidence_refs,
-                    )
-                    break
+    if cache_details is None:
+        result = _validate_stage_outputs(
+            stage=stage,
+            stage_dir=stage_dir,
+            config=config,
+            result=result,
+        )
 
     # --- MetaClaw PRM quality gate evaluation ---
     try:
@@ -829,10 +848,16 @@ def execute_stage(
     profile_name = (
         getattr(getattr(config, "project", None), "profile", None) or None
     )
-    if cache_details is None and gate_required(
-        stage,
-        config.security.hitl_required_stages,
-        profile=profile_name,
+    hitl_session = _get_hitl_session(adapters)
+    if (
+        cache_details is None
+        and result.status == StageStatus.DONE
+        and hitl_session is None
+        and gate_required(
+            stage,
+            config.security.hitl_required_stages,
+            profile=profile_name,
+        )
     ):
         if auto_approve_gates:
             if bridge.use_memory:
@@ -856,6 +881,12 @@ def execute_stage(
     # --- HITL post-stage hook ---
     if cache_details is None:
         result = _run_hitl_post_stage(stage, result, run_dir, adapters, config=config)
+        result = _validate_stage_outputs(
+            stage=stage,
+            stage_dir=stage_dir,
+            config=config,
+            result=result,
+        )
 
     # Publish only fully accepted output. Contract validation, PRM, configured
     # approval gates, and HITL post-review must all leave the stage DONE;

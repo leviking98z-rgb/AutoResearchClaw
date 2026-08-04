@@ -19,6 +19,7 @@ import importlib.metadata
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from collections.abc import Iterable, Mapping
@@ -32,7 +33,10 @@ from researchclaw.pipeline.stages import Stage, StageStatus
 
 logger = logging.getLogger(__name__)
 
-CACHE_SCHEMA_VERSION = 1
+# Schema 2 is the first version whose entries are published only after the
+# output contract, PRM, approval gate, and HITL review all accept the stage.
+# Reject schema-1 entries because older builds could save pre-verdict output.
+CACHE_SCHEMA_VERSION = 2
 CACHEABLE_STAGES = frozenset(
     {
         Stage.LITERATURE_COLLECT,
@@ -49,37 +53,71 @@ LITERATURE_FRESHNESS_STAGES = frozenset(
     }
 )
 
+_AUXILIARY_INPUTS: dict[Stage, tuple[str, ...]] = {
+    Stage.LITERATURE_COLLECT: ("queries.json",),
+    Stage.KNOWLEDGE_EXTRACT: ("web_context.md",),
+    Stage.HYPOTHESIS_GEN: ("candidates.jsonl", "hitl_guidance.md"),
+}
+
 _CONFIG_FIELDS: dict[Stage, tuple[str, ...]] = {
     Stage.LITERATURE_COLLECT: (
         "research.topic",
         "research.daily_paper_count",
         "literature_search",
         "web_search",
+        "llm.provider",
+        "llm.base_url",
+        "llm.wire_api",
+        "llm.primary_model",
+        "llm.fallback_models",
+        "llm.timeout_sec",
         "llm.roles.literature_researcher",
         "prompts",
+        "project.profile",
+        "skills",
     ),
     Stage.LITERATURE_SCREEN: (
         "research.topic",
         "research.domains",
         "research.quality_threshold",
+        "llm.provider",
+        "llm.primary_model",
+        "llm.fallback_models",
         "llm.roles.literature_researcher",
         "prompts",
+        "project.profile",
+        "skills",
     ),
     Stage.KNOWLEDGE_EXTRACT: (
         "research.topic",
+        "llm.provider",
+        "llm.primary_model",
+        "llm.fallback_models",
         "llm.roles.literature_researcher",
         "prompts",
+        "project.profile",
+        "skills",
     ),
     Stage.SYNTHESIS: (
         "research.topic",
+        "llm.provider",
+        "llm.primary_model",
+        "llm.fallback_models",
         "llm.roles.idea_scientist",
         "prompts",
+        "project.profile",
+        "skills",
     ),
     Stage.HYPOTHESIS_GEN: (
         "research.topic",
         "literature_search",
+        "llm.provider",
+        "llm.primary_model",
+        "llm.fallback_models",
         "llm.roles.idea_scientist",
         "prompts",
+        "project.profile",
+        "skills",
     ),
 }
 
@@ -131,9 +169,81 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _find_input(run_dir: Path, input_name: str) -> Path | None:
+def _path_content_view(value: Any) -> Any:
+    if not isinstance(value, str) or not value.strip():
+        return value
+    path = Path(value).expanduser()
+    if not path.is_file():
+        return value
+    try:
+        return {
+            "path": str(path),
+            "size": path.stat().st_size,
+            "sha256": _hash_file(path),
+        }
+    except OSError:
+        return value
+
+
+def _prompt_config_view(config: Any) -> dict[str, Any]:
+    prompts = getattr(config, "prompts", None)
+    if prompts is None:
+        return {}
+    custom_file = getattr(prompts, "custom_file", "")
+    raw_extra = getattr(prompts, "extra_prompts", ())
+    if isinstance(raw_extra, Mapping):
+        extra_items = raw_extra.items()
+    else:
+        extra_items = raw_extra or ()
+    extra: list[dict[str, Any]] = []
+    for item in extra_items:
+        try:
+            name, value = item
+        except (TypeError, ValueError):
+            continue
+        extra.append(
+            {
+                "stage": str(name),
+                "value": _path_content_view(str(value)),
+            }
+        )
+    return {
+        "custom_file": _path_content_view(str(custom_file)),
+        "extra_prompts": sorted(extra, key=lambda row: row["stage"]),
+    }
+
+
+def _find_input(
+    run_dir: Path,
+    input_name: str,
+    *,
+    current_stage: Stage,
+) -> Path | None:
+    def _stage_sort_key(path: Path) -> tuple[str, int]:
+        name = path.name
+        if "_v" in name:
+            base, _, version = name.rpartition("_v")
+            try:
+                return (base, -int(version))
+            except ValueError:
+                return (name, -999)
+        return (name, 0)
+
     target = input_name.rstrip("/")
-    for stage_dir in sorted(run_dir.glob("stage-*"), reverse=True):
+    allow_current_stage = input_name == "hitl_guidance.md"
+    for stage_dir in sorted(
+        run_dir.glob("stage-*"),
+        key=_stage_sort_key,
+        reverse=True,
+    ):
+        match = re.match(r"stage-(\d+)", stage_dir.name)
+        if match is None:
+            continue
+        stage_number = int(match.group(1))
+        if stage_number > int(current_stage):
+            continue
+        if stage_number == int(current_stage) and not allow_current_stage:
+            continue
         candidate = stage_dir / target
         if input_name.endswith("/") and candidate.is_dir():
             return candidate
@@ -152,13 +262,12 @@ def stage_input_fingerprint(
 
     contract = CONTRACTS[stage]
     input_names = list(contract.input_files)
-    # Some stage implementations consume auxiliary artifacts in addition to
-    # the minimal contract file.  Fingerprint those effective inputs as well.
-    if stage == Stage.LITERATURE_COLLECT and "queries.json" not in input_names:
-        input_names.append("queries.json")
+    for auxiliary in _AUXILIARY_INPUTS.get(stage, ()):
+        if auxiliary not in input_names:
+            input_names.append(auxiliary)
     inputs: list[dict[str, Any]] = []
     for input_name in input_names:
-        path = _find_input(run_dir, input_name)
+        path = _find_input(run_dir, input_name, current_stage=stage)
         if path is None:
             inputs.append({"name": input_name, "missing": True})
             continue
@@ -175,6 +284,10 @@ def stage_input_fingerprint(
         inputs.append({"name": input_name, "files": records})
     config_view = {
         field: _get_path(config, field) for field in _CONFIG_FIELDS.get(stage, ())
+    }
+    config_view["prompts_content"] = _prompt_config_view(config)
+    config_view["environment"] = {
+        "ARC_ABL_DISABLE_DEBATE": os.environ.get("ARC_ABL_DISABLE_DEBATE", ""),
     }
     try:
         package_version = importlib.metadata.version("researchclaw")
@@ -300,16 +413,12 @@ def restore_stage_cache(
     payload = entry / "payload"
     stage_dir.mkdir(parents=True, exist_ok=True)
     restored = {str(record["path"]) for record in manifest["files"]}
-    for existing in sorted(stage_dir.rglob("*"), reverse=True):
-        if existing.is_file():
-            relative = str(existing.relative_to(stage_dir))
-            if relative not in restored:
-                existing.unlink()
+    for relative in sorted(restored):
+        existing = stage_dir / relative
+        if existing.is_file() or existing.is_symlink():
+            existing.unlink()
         elif existing.is_dir():
-            try:
-                existing.rmdir()
-            except OSError:
-                pass
+            shutil.rmtree(existing)
     for record in manifest["files"]:
         relative = str(record["path"])
         source = payload / relative
@@ -323,6 +432,7 @@ def restore_stage_cache(
         "cache_entry": str(entry),
         "source_run_id": manifest.get("run_id"),
         "source_stage_dir": manifest.get("source_stage_dir"),
+        "artifacts": manifest.get("artifacts", []),
         "files": len(manifest["files"]),
         "age_sec": round(age_sec, 3),
         "ttl_hours": ttl_hours,
@@ -355,13 +465,6 @@ def save_stage_cache(
     )
     parent = root / f"stage-{int(stage):02d}"
     entry = parent / fingerprint
-    if (entry / "manifest.json").is_file():
-        return {
-            "saved": False,
-            "fingerprint": fingerprint,
-            "cache_entry": str(entry),
-            "reason": "already_exists",
-        }
     parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{fingerprint}.", dir=parent))
     payload = temporary / "payload"
@@ -396,33 +499,97 @@ def save_stage_cache(
             "fingerprint_components": components,
             "run_id": run_id,
             "source_stage_dir": str(stage_dir),
+            "artifacts": sorted(
+                {
+                    str(artifact).rstrip("/")
+                    for artifact in artifacts
+                    if str(artifact).strip()
+                }
+            ),
             "files": [copied[key] for key in sorted(copied)],
         }
         (temporary / "manifest.json").write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
         )
-        try:
-            temporary.replace(entry)
-        except FileExistsError:
-            shutil.rmtree(temporary, ignore_errors=True)
+        replaced = False
+        if entry.exists():
+            existing_manifest: dict[str, Any] | None = None
+            try:
+                loaded = json.loads(
+                    (entry / "manifest.json").read_text(encoding="utf-8")
+                )
+                if isinstance(loaded, dict):
+                    existing_manifest = loaded
+            except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+                pass
+            ttl_hours = _freshness_ttl_hours(stage, config)
+            existing_valid = (
+                existing_manifest is not None
+                and _manifest_valid(entry, existing_manifest)
+            )
+            existing_fresh = (
+                existing_valid
+                and (
+                    ttl_hours <= 0
+                    or _entry_age_sec(entry, existing_manifest)
+                    <= ttl_hours * 3600
+                )
+            )
+            if existing_fresh:
+                shutil.rmtree(temporary, ignore_errors=True)
+                return {
+                    "saved": False,
+                    "fingerprint": fingerprint,
+                    "cache_entry": str(entry),
+                    "reason": "already_exists",
+                }
+            backup = parent / f".{fingerprint}.stale-{os.getpid()}"
+            shutil.rmtree(backup, ignore_errors=True)
+            try:
+                entry.replace(backup)
+                temporary.replace(entry)
+                replaced = True
+            finally:
+                shutil.rmtree(backup, ignore_errors=True)
+        else:
+            try:
+                temporary.replace(entry)
+            except FileExistsError:
+                shutil.rmtree(temporary, ignore_errors=True)
+                return {
+                    "saved": False,
+                    "fingerprint": fingerprint,
+                    "cache_entry": str(entry),
+                    "reason": "concurrent_writer",
+                }
         return {
             "saved": True,
             "fingerprint": fingerprint,
             "cache_entry": str(entry),
             "files": len(copied),
+            "replaced": replaced,
         }
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
 
 
-def cached_result(stage: Stage) -> Any:
+def cached_result(stage: Stage, cache_details: Mapping[str, Any] | None = None) -> Any:
     """Build a StageResult lazily to avoid an executor import cycle."""
 
     from researchclaw.pipeline._helpers import StageResult
 
     contract = CONTRACTS[stage]
-    artifacts = tuple(contract.output_files)
+    artifacts: tuple[str, ...] = tuple(contract.output_files)
+    if cache_details is not None:
+        manifest_path = Path(str(cache_details.get("cache_entry", ""))) / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw_artifacts = manifest.get("artifacts") if isinstance(manifest, dict) else None
+            if isinstance(raw_artifacts, list) and raw_artifacts:
+                artifacts = tuple(str(item) for item in raw_artifacts if str(item))
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+            pass
     return StageResult(
         stage=stage,
         status=StageStatus.DONE,

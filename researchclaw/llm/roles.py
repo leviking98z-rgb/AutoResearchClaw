@@ -195,7 +195,6 @@ class RoleLLMClient:
         self.audit_path = audit_path
         self.config = getattr(backend, "config", None)
         self._audit_lock = threading.Lock()
-        self._event_lock = threading.Lock()
 
     @property
     def backend(self) -> Any:
@@ -439,18 +438,6 @@ class RoleLLMClient:
                 "a", encoding="utf-8"
             ) as handle:
                 handle.write(line)
-            event_path = self.audit_path.parent.parent / "pipeline_events.jsonl"
-            from researchclaw.pipeline.event_log import (
-                EventLog,
-                EventType,
-                create_event,
-            )
-
-            with self._event_lock:
-                EventLog(
-                    event_path.parent,
-                    filename=event_path.name,
-                ).append(create_event(EventType.LLM_CALL, **record))
         except Exception:  # noqa: BLE001
             logger.warning(
                 "Could not write role LLM audit log: %s",

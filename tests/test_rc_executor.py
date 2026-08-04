@@ -442,6 +442,200 @@ def test_stage_cache_hit_skips_gates_and_post_hitl_review(
     assert decision["status"] == "done"
 
 
+def test_prm_rejection_is_not_overwritten_by_approval_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    from researchclaw.config import MetaClawBridgeConfig, MetaClawPRMConfig
+    from researchclaw.pipeline._helpers import StageResult
+
+    (run_dir / "stage-04").mkdir()
+    (run_dir / "stage-04" / "candidates.jsonl").write_text("{}\n")
+    stage_dir = run_dir / "stage-05"
+
+    def fake_executor(*args: Any, **kwargs: Any) -> StageResult:
+        _ = (args, kwargs)
+        stage_dir.mkdir(exist_ok=True)
+        (stage_dir / "shortlist.jsonl").write_text("{}\n")
+        return StageResult(
+            stage=Stage.LITERATURE_SCREEN,
+            status=StageStatus.DONE,
+            artifacts=("shortlist.jsonl",),
+        )
+
+    config = replace(
+        rc_config,
+        metaclaw_bridge=MetaClawBridgeConfig(
+            enabled=True,
+            prm=MetaClawPRMConfig(enabled=True, gate_stages=(5,)),
+        ),
+    )
+    monkeypatch.setitem(
+        rc_executor._STAGE_EXECUTORS,
+        Stage.LITERATURE_SCREEN,
+        fake_executor,
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_cache.restore_stage_cache",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "researchclaw.metaclaw_bridge.prm_gate.ResearchPRMGate.from_bridge_config",
+        lambda config: SimpleNamespace(
+            model="judge",
+            votes=1,
+            evaluate_stage=lambda stage, text: -1.0,
+        ),
+    )
+
+    result = rc_executor.execute_stage(
+        Stage.LITERATURE_SCREEN,
+        run_dir=run_dir,
+        run_id="prm-reject",
+        config=config,
+        adapters=adapters,
+        auto_approve_gates=False,
+    )
+
+    assert result.status == StageStatus.FAILED
+    assert result.decision == "retry"
+    assert "PRM quality gate" in (result.error or "")
+
+
+def test_hitl_session_owns_gate_and_approval_finishes_done(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+) -> None:
+    from researchclaw.hitl.config import HITLConfig
+    from researchclaw.hitl.intervention import HumanAction, HumanInput
+    from researchclaw.hitl.session import HITLSession
+    from researchclaw.pipeline._helpers import StageResult
+
+    (run_dir / "stage-04").mkdir()
+    (run_dir / "stage-04" / "candidates.jsonl").write_text("{}\n")
+    stage_dir = run_dir / "stage-05"
+
+    def fake_executor(*args: Any, **kwargs: Any) -> StageResult:
+        _ = (args, kwargs)
+        stage_dir.mkdir(exist_ok=True)
+        (stage_dir / "shortlist.jsonl").write_text("{}\n")
+        return StageResult(
+            stage=Stage.LITERATURE_SCREEN,
+            status=StageStatus.DONE,
+            artifacts=("shortlist.jsonl",),
+        )
+
+    session = HITLSession(
+        config=HITLConfig.from_dict(
+            {
+                "enabled": True,
+                "mode": "custom",
+                "stage_policies": {"5": {"require_approval": True}},
+            }
+        ),
+        run_dir=run_dir,
+    )
+    session.set_input_callback(
+        lambda _: HumanInput(action=HumanAction.APPROVE)
+    )
+    adapters = AdapterBundle(hitl=session)
+    monkeypatch.setitem(
+        rc_executor._STAGE_EXECUTORS,
+        Stage.LITERATURE_SCREEN,
+        fake_executor,
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_cache.restore_stage_cache",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_cache.save_stage_cache",
+        lambda **kwargs: {"saved": True},
+    )
+
+    result = rc_executor.execute_stage(
+        Stage.LITERATURE_SCREEN,
+        run_dir=run_dir,
+        run_id="hitl-gate",
+        config=rc_config,
+        adapters=adapters,
+        auto_approve_gates=False,
+    )
+
+    assert result.status == StageStatus.DONE
+    assert result.decision == "proceed"
+
+
+def test_post_hitl_edit_is_revalidated_before_cache_store(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    from researchclaw.pipeline._helpers import StageResult
+
+    config = replace(
+        rc_config,
+        security=replace(rc_config.security, hitl_required_stages=()),
+    )
+    (run_dir / "stage-07").mkdir()
+    (run_dir / "stage-07" / "synthesis.md").write_text("synthesis")
+    stage_dir = run_dir / "stage-08"
+
+    def fake_executor(*args: Any, **kwargs: Any) -> StageResult:
+        _ = (args, kwargs)
+        stage_dir.mkdir(exist_ok=True)
+        (stage_dir / "hypotheses.md").write_text("valid before edit")
+        return StageResult(
+            stage=Stage.HYPOTHESIS_GEN,
+            status=StageStatus.DONE,
+            artifacts=("hypotheses.md",),
+        )
+
+    def fake_post_hitl(
+        stage: Stage,
+        result: StageResult,
+        run_dir: Path,
+        adapters: AdapterBundle,
+        config: RCConfig | None = None,
+    ) -> StageResult:
+        _ = (stage, run_dir, adapters, config)
+        (stage_dir / "hypotheses.md").write_text("")
+        return result
+
+    saved: list[bool] = []
+    monkeypatch.setitem(
+        rc_executor._STAGE_EXECUTORS,
+        Stage.HYPOTHESIS_GEN,
+        fake_executor,
+    )
+    monkeypatch.setattr(rc_executor, "_run_hitl_post_stage", fake_post_hitl)
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_cache.restore_stage_cache",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_cache.save_stage_cache",
+        lambda **kwargs: saved.append(True),
+    )
+
+    result = rc_executor.execute_stage(
+        Stage.HYPOTHESIS_GEN,
+        run_dir=run_dir,
+        run_id="edit-invalid",
+        config=config,
+        adapters=adapters,
+        auto_approve_gates=True,
+    )
+
+    assert result.status == StageStatus.FAILED
+    assert result.error == "Missing or empty output: hypotheses.md"
+    assert saved == []
+
+
 def test_topic_init_copies_structured_selected_topic_into_stage_context(
     monkeypatch: pytest.MonkeyPatch,
     run_dir: Path,
