@@ -226,6 +226,21 @@ def test_execute_pipeline_writes_pipeline_summary_json(
     )
     summary_path = run_dir / "pipeline_summary.json"
     assert summary_path.exists()
+    observability_path = run_dir / "observability_summary.json"
+    assert observability_path.exists()
+    observability = json.loads(
+        observability_path.read_text(encoding="utf-8")
+    )
+    assert observability["pipeline"]["stage_count"] == 23
+    assert observability["pipeline"]["stage_failures"] == 0
+    event_types = [
+        json.loads(line)["type"]
+        for line in (run_dir / "pipeline_events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert "pipeline_end" in event_types
+    assert "llm_summary" in event_types
 
 
 def test_pipeline_summary_has_expected_fields_and_values(

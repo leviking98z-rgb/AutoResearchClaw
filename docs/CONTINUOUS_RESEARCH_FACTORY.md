@@ -821,6 +821,7 @@ Exit criteria:
 Deliverables:
 
 - Factory Kanban and Idea drill-down;
+- append-only global and per-Idea itemized event journals;
 - GPU map, queues, utilization, budgets, and leases;
 - lineage and gate-decision views;
 - cooperative per-Idea pause, park, resume, and reject controls;
@@ -830,6 +831,7 @@ Deliverables:
 Exit criteria:
 
 - every displayed status is derived from durable state;
+- every Idea and Work Item transition can be replayed from its local timeline;
 - stale heartbeats and orphan tasks are visible;
 - control operations are idempotent and auditable;
 - a restart drill restores Factory, Broker, workers, and dashboard; and

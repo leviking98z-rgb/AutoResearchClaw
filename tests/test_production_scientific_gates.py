@@ -10,7 +10,9 @@ from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
 from researchclaw.llm.client import LLMResponse
 from researchclaw.pipeline.stage_impls._experiment_design import (
+    _apply_selected_topic_contract,
     _execute_experiment_design,
+    _selected_topic_prompt_contract,
 )
 from researchclaw.pipeline.stage_impls._paper_writing import (
     _collect_raw_experiment_metrics,
@@ -35,7 +37,12 @@ class _FakeLLM:
         return LLMResponse(content=self.content, model="fake")
 
 
-def _config(tmp_path: Path, *, topic: str) -> RCConfig:
+def _config(
+    tmp_path: Path,
+    *,
+    topic: str,
+    benchmark_agent_enabled: bool = False,
+) -> RCConfig:
     return RCConfig.from_dict(
         {
             "project": {"name": "production-scientific-gates", "mode": "docs-first"},
@@ -64,7 +71,7 @@ def _config(tmp_path: Path, *, topic: str) -> RCConfig:
                 "metric_key": "calibration_error",
                 "metric_direction": "minimize",
                 "time_budget_sec": 600,
-                "benchmark_agent": {"enabled": False},
+                "benchmark_agent": {"enabled": benchmark_agent_enabled},
             },
             "web_search": {"enabled": False},
         },
@@ -73,8 +80,8 @@ def _config(tmp_path: Path, *, topic: str) -> RCConfig:
     )
 
 
-def _write_selected_topic(run_dir: Path) -> None:
-    selected = {
+def _selected_topic() -> dict[str, object]:
+    return {
         "id": "calibration-aware-acceptance",
         "title": "Calibration-Aware Acceptance Gates for LLM Self-Improvement",
         "research_question": (
@@ -85,17 +92,56 @@ def _write_selected_topic(run_dir: Path) -> None:
             "A calibration-aware gate lowers accepted-regression rate relative "
             "to unconditional and confidence-only controls."
         ),
-        "datasets": ["held-out LLM agent task traces", "accept/reject calibration set"],
+        "datasets": ["GSM8K", "MATH", "MBPP", "HumanEval"],
         "models": ["API-backed LLM agent"],
-        "primary_metric": "accepted-regression rate and expected calibration error",
+        "primary_metric": (
+            "held-out accuracy at selected iteration and tokens per solved task"
+        ),
         "baselines": ["no-self-improvement control", "confidence-only gate"],
         "ablations": ["without calibration", "without rollback"],
+        "failure_safety_tests": ["accepted regression", "reward hacking"],
+        "cheap_pilot": "Run 100 held-out tasks for three self-improvement rounds.",
+        "compute": {
+            "gpu_count": 1,
+            "wall_clock_hours": 1,
+            "notes": "cheap pilot before scaling",
+        },
+        "pivot_policy": "Pivot if the held-out signal is absent after the pilot.",
     }
+
+
+def _write_selected_topic(run_dir: Path) -> None:
     stage1 = run_dir / "stage-01"
     stage1.mkdir(parents=True, exist_ok=True)
     (stage1 / "selected_topic.json").write_text(
-        json.dumps(selected), encoding="utf-8"
+        json.dumps(_selected_topic()), encoding="utf-8"
     )
+
+
+def _aligned_rsi_plan() -> dict[str, object]:
+    selected = _selected_topic()
+    return {
+        "research_question": selected["research_question"],
+        "falsifiable_hypothesis": selected["falsifiable_hypothesis"],
+        "objectives": [
+            "Measure held-out regression across recursive LLM-agent updates"
+        ],
+        "datasets": selected["datasets"],
+        "models": selected["models"],
+        "baselines": selected["baselines"],
+        "proposed_methods": ["calibration-aware acceptance and rollback gate"],
+        "ablations": selected["ablations"],
+        "primary_metric": selected["primary_metric"],
+        "metrics": [
+            selected["primary_metric"],
+            "accepted-regression rate",
+            "expected calibration error",
+        ],
+        "cheap_pilot": selected["cheap_pilot"],
+        "pivot_policy": selected["pivot_policy"],
+        "risks": ["benchmark leakage", "selection bias"],
+        "compute_budget": {"max_gpu": 1, "max_hours": 1},
+    }
 
 
 def _write_failed_placeholder_evidence(run_dir: Path) -> None:
@@ -233,6 +279,242 @@ def test_stage9_accepts_generic_topic_plan_without_rsi_special_case(
 
     assert result.status == StageStatus.DONE
     assert (stage_dir / "exp_plan.yaml").exists()
+
+
+def test_stage9_rsi_prompt_uses_selected_datasets_not_cifar_tier(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-09"
+    stage_dir.mkdir(parents=True)
+    _write_selected_topic(run_dir)
+    (run_dir / "stage-08").mkdir()
+    (run_dir / "stage-08" / "hypotheses.md").write_text(
+        "# Hypothesis\nCalibration-aware acceptance reduces LLM regressions.",
+        encoding="utf-8",
+    )
+    llm = _FakeLLM(yaml.safe_dump(_aligned_rsi_plan()))
+
+    result = _execute_experiment_design(
+        stage_dir,
+        run_dir,
+        _config(
+            tmp_path,
+            topic="Calibration-Aware Acceptance Gates for LLM Self-Improvement",
+        ),
+        AdapterBundle(),
+        llm=llm,
+    )
+
+    assert result.status == StageStatus.DONE
+    prompt = llm.calls[0][0]["content"]
+    assert "MANDATORY SELECTED-TOPIC CONTRACT" in prompt
+    assert "GSM8K, MATH, MBPP, HumanEval" in prompt
+    assert "CIFAR-10, CIFAR-100, MNIST" not in prompt
+
+
+def test_stage9_skips_benchmark_agent_for_authoritative_benchmarks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-09"
+    stage_dir.mkdir(parents=True)
+    _write_selected_topic(run_dir)
+    (run_dir / "stage-08").mkdir()
+    (run_dir / "stage-08" / "hypotheses.md").write_text(
+        "# Hypothesis\nCalibration-aware acceptance reduces LLM regressions.",
+        encoding="utf-8",
+    )
+    called = False
+
+    class _ExplodingBenchmarkOrchestrator:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            nonlocal called
+            called = True
+            raise AssertionError("BenchmarkAgent should have been skipped")
+
+    monkeypatch.setattr(
+        "researchclaw.agents.benchmark_agent.BenchmarkOrchestrator",
+        _ExplodingBenchmarkOrchestrator,
+    )
+    llm = _FakeLLM(yaml.safe_dump(_aligned_rsi_plan()))
+
+    result = _execute_experiment_design(
+        stage_dir,
+        run_dir,
+        _config(
+            tmp_path,
+            topic="Calibration-Aware Acceptance Gates for LLM Self-Improvement",
+            benchmark_agent_enabled=True,
+        ),
+        AdapterBundle(),
+        llm=llm,
+    )
+
+    assert result.status == StageStatus.DONE
+    assert called is False
+    assert not (stage_dir / "benchmark_plan.json").exists()
+
+
+def test_selected_topic_contract_rejects_benchmark_agent_cifar_override() -> None:
+    selected = _selected_topic()
+    contaminated = {
+        **_aligned_rsi_plan(),
+        "datasets": ["CIFAR-10", "STL-10"],
+        "models": ["ResNet-50"],
+        "baselines": ["DANN", "CORAL"],
+    }
+
+    anchored = _apply_selected_topic_contract(
+        contaminated,
+        selected,
+        str(selected["title"]),
+    )
+
+    assert anchored["datasets"] == ["GSM8K", "MATH", "MBPP", "HumanEval"]
+    assert anchored["models"] == ["API-backed LLM agent"]
+    assert anchored["baselines"][:2] == [
+        "no-self-improvement control",
+        "confidence-only gate",
+    ]
+    assert anchored["research_question"] == selected["research_question"]
+    assert anchored["falsifiable_hypothesis"] == selected["falsifiable_hypothesis"]
+    assert anchored["primary_metric"] == selected["primary_metric"]
+
+
+def test_stage9_discards_contaminated_benchmark_agent_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-09"
+    stage_dir.mkdir(parents=True)
+    selected = _selected_topic()
+    selected.pop("baselines")
+    stage1 = run_dir / "stage-01"
+    stage1.mkdir(parents=True)
+    (stage1 / "selected_topic.json").write_text(
+        json.dumps(selected),
+        encoding="utf-8",
+    )
+    (run_dir / "stage-08").mkdir()
+    (run_dir / "stage-08" / "hypotheses.md").write_text(
+        "# Hypothesis\nCalibration-aware acceptance reduces LLM regressions.",
+        encoding="utf-8",
+    )
+    orchestrated = False
+
+    class _ContaminatedBenchmarkOrchestrator:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def orchestrate(self, _context: object) -> SimpleNamespace:
+            nonlocal orchestrated
+            orchestrated = True
+            return SimpleNamespace(
+                selected_benchmarks=[{"name": "CIFAR-10"}],
+                selected_baselines=[{"name": "DANN"}, {"name": "CORAL"}],
+                total_llm_calls=4,
+                elapsed_sec=120.0,
+                to_dict=lambda: {"selected_benchmarks": [{"name": "CIFAR-10"}]},
+            )
+
+    monkeypatch.setattr(
+        "researchclaw.agents.benchmark_agent.BenchmarkOrchestrator",
+        _ContaminatedBenchmarkOrchestrator,
+    )
+    llm = _FakeLLM(yaml.safe_dump(_aligned_rsi_plan()))
+
+    result = _execute_experiment_design(
+        stage_dir,
+        run_dir,
+        _config(
+            tmp_path,
+            topic="Calibration-Aware Acceptance Gates for LLM Self-Improvement",
+            benchmark_agent_enabled=True,
+        ),
+        AdapterBundle(),
+        llm=llm,
+    )
+
+    assert result.status == StageStatus.DONE
+    assert orchestrated is True
+    assert not (stage_dir / "benchmark_plan.json").exists()
+    plan = yaml.safe_load(
+        (stage_dir / "exp_plan.yaml").read_text(encoding="utf-8")
+    )
+    assert plan["datasets"] == selected["datasets"]
+    assert "CIFAR-10" not in json.dumps(plan)
+    assert "DANN" not in json.dumps(plan)
+    assert "CORAL" not in json.dumps(plan)
+
+
+def test_stage9_preserves_full_selected_topic_contract_in_exp_plan(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-09"
+    stage_dir.mkdir(parents=True)
+    selected = _selected_topic()
+    _write_selected_topic(run_dir)
+    (run_dir / "stage-08").mkdir()
+    (run_dir / "stage-08" / "hypotheses.md").write_text(
+        "# Hypothesis\nCalibration-aware acceptance reduces LLM regressions.",
+        encoding="utf-8",
+    )
+    llm = _FakeLLM(yaml.safe_dump(_aligned_rsi_plan()))
+
+    result = _execute_experiment_design(
+        stage_dir,
+        run_dir,
+        _config(
+            tmp_path,
+            topic="Calibration-Aware Acceptance Gates for LLM Self-Improvement",
+        ),
+        AdapterBundle(),
+        llm=llm,
+    )
+
+    assert result.status == StageStatus.DONE
+    plan = yaml.safe_load(
+        (stage_dir / "exp_plan.yaml").read_text(encoding="utf-8")
+    )
+    assert plan["topic"] == selected["title"]
+    assert plan["research_question"] == selected["research_question"]
+    assert plan["falsifiable_hypothesis"] == selected["falsifiable_hypothesis"]
+    assert plan["primary_metric"] == selected["primary_metric"]
+    assert plan["datasets"] == selected["datasets"]
+    assert plan["models"] == selected["models"]
+    assert plan["baselines"][:2] == selected["baselines"]
+    assert plan["ablations"][:2] == selected["ablations"]
+    assert plan["cheap_pilot"] == selected["cheap_pilot"]
+    assert plan["pivot_policy"] == selected["pivot_policy"]
+    assert plan["selected_compute"] == selected["compute"]
+    assert plan["selected_topic_contract"]["id"] == selected["id"]
+    report = json.loads(
+        (stage_dir / "semantic_alignment.json").read_text(encoding="utf-8")
+    )
+    assert report["aligned"] is True
+    assert report["phase"] == "final"
+
+
+def test_selected_topic_prompt_contract_includes_authoritative_fields() -> None:
+    selected = _selected_topic()
+
+    prompt = _selected_topic_prompt_contract(
+        selected,
+        str(selected["title"]),
+    )
+
+    assert str(selected["research_question"]) in prompt
+    assert str(selected["falsifiable_hypothesis"]) in prompt
+    assert str(selected["primary_metric"]) in prompt
+    assert "GSM8K" in prompt
+    assert "cheap_pilot" in prompt
+    assert "pivot_policy" in prompt
 
 
 def test_raw_metric_collection_rejects_failed_placeholder_metrics(

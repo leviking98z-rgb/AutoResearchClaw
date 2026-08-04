@@ -75,6 +75,229 @@ def _write_pipeline_summary(run_dir: Path, summary: dict[str, object]) -> None:
     )
 
 
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _write_observability_summary(run_dir: Path) -> dict[str, object]:
+    """Aggregate append-only run journals into a compact review artifact.
+
+    Raw JSONL remains the source of truth.  This summary makes retrospective
+    optimization cheap for operators and dashboards without storing prompts or
+    secrets a second time.
+    """
+
+    pipeline_event_count = 0
+    stage_count = 0
+    stage_elapsed_sec = 0.0
+    stage_failures = 0
+    cache_hits = 0
+    cache_stores = 0
+    resume_events = 0
+    literature_event_count = 0
+    literature_summary: dict[str, object] = {
+        "events": 0,
+        "memory_hits": 0,
+        "collected": 0,
+        "new_items": 0,
+        "persisted": 0,
+        "total_candidates": 0,
+        "errors": [],
+    }
+    pipeline_events_path = run_dir / "pipeline_events.jsonl"
+    try:
+        with pipeline_events_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                pipeline_event_count += 1
+                event_type = row.get("type")
+                if event_type in {"stage_end", "stage_fail"}:
+                    stage_count += 1
+                    try:
+                        stage_elapsed_sec += float(
+                            row.get("elapsed_sec", 0.0) or 0.0
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                    if event_type == "stage_fail":
+                        stage_failures += 1
+                elif event_type == "cache_hit":
+                    cache_hits += 1
+                elif event_type == "cache_store":
+                    cache_stores += 1
+                elif event_type == "resume":
+                    resume_events += 1
+                elif event_type == "literature_memory":
+                    literature_event_count += 1
+                    literature_summary["events"] = literature_event_count
+                    infohub = row.get("infohub")
+                    infohub_data = infohub if isinstance(infohub, dict) else {}
+                    for key in (
+                        "memory_hits",
+                        "collected",
+                        "new_items",
+                        "persisted",
+                    ):
+                        literature_summary[key] = (
+                            _safe_int(literature_summary[key])
+                            + _safe_int(infohub_data.get(key))
+                        )
+                    literature_summary["total_candidates"] = (
+                        _safe_int(literature_summary["total_candidates"])
+                        + _safe_int(row.get("total_candidates"))
+                    )
+                    error = str(
+                        infohub_data.get("error")
+                        or row.get("error")
+                        or ""
+                    ).strip()
+                    if error:
+                        errors = literature_summary["errors"]
+                        if isinstance(errors, list):
+                            errors.append(error)
+    except (FileNotFoundError, OSError):
+        pass
+
+    role_summaries: dict[str, dict[str, object]] = {}
+    for audit_path in sorted((run_dir / "audit").glob("llm-*.jsonl")):
+        role = audit_path.stem.removeprefix("llm-")
+        summary: dict[str, object] = {
+            "calls": 0,
+            "ok": 0,
+            "errors": 0,
+            "elapsed_sec": 0.0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "retries": 0,
+            "fallback_count": 0,
+            "truncated": 0,
+            "models": {},
+        }
+        try:
+            handle = audit_path.open("r", encoding="utf-8")
+        except OSError:
+            continue
+        models: dict[str, int] = {}
+        with handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                summary["calls"] = _safe_int(summary["calls"]) + 1
+                status = str(row.get("status", "") or "")
+                if status == "ok":
+                    summary["ok"] = _safe_int(summary["ok"]) + 1
+                else:
+                    summary["errors"] = _safe_int(summary["errors"]) + 1
+                try:
+                    summary["elapsed_sec"] = round(
+                        float(summary["elapsed_sec"])
+                        + float(row.get("elapsed_sec", 0.0) or 0.0),
+                        6,
+                    )
+                except (TypeError, ValueError):
+                    pass
+                for key in (
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_tokens",
+                    "retries",
+                    "fallback_count",
+                ):
+                    summary[key] = _safe_int(summary[key]) + _safe_int(
+                        row.get(key)
+                    )
+                if bool(row.get("truncated", False)):
+                    summary["truncated"] = (
+                        _safe_int(summary["truncated"]) + 1
+                    )
+                model = str(
+                    row.get("response_model")
+                    or row.get("requested_model")
+                    or "unknown"
+                )
+                models[model] = models.get(model, 0) + 1
+        summary["models"] = models
+        role_summaries[role] = summary
+
+    total_llm_calls = sum(
+        _safe_int(value.get("calls"))
+        for value in role_summaries.values()
+    )
+    total_llm_errors = sum(
+        _safe_int(value.get("errors"))
+        for value in role_summaries.values()
+    )
+    summary_doc: dict[str, object] = {
+        "schema_version": 1,
+        "generated_at": _utcnow_iso(),
+        "pipeline": {
+            "event_count": pipeline_event_count,
+            "stage_count": stage_count,
+            "stage_elapsed_sec": round(stage_elapsed_sec, 3),
+            "stage_failures": stage_failures,
+            "cache_hits": cache_hits,
+            "cache_stores": cache_stores,
+            "literature_memory_events": literature_event_count,
+            "resume_events": resume_events,
+        },
+        "literature": literature_summary,
+        "llm": {
+            "calls": total_llm_calls,
+            "errors": total_llm_errors,
+            "elapsed_sec": round(
+                sum(
+                    float(value.get("elapsed_sec", 0.0) or 0.0)
+                    for value in role_summaries.values()
+                ),
+                3,
+            ),
+            "prompt_tokens": sum(
+                _safe_int(value.get("prompt_tokens"))
+                for value in role_summaries.values()
+            ),
+            "completion_tokens": sum(
+                _safe_int(value.get("completion_tokens"))
+                for value in role_summaries.values()
+            ),
+            "total_tokens": sum(
+                _safe_int(value.get("total_tokens"))
+                for value in role_summaries.values()
+            ),
+            "retries": sum(
+                _safe_int(value.get("retries"))
+                for value in role_summaries.values()
+            ),
+            "fallback_count": sum(
+                _safe_int(value.get("fallback_count"))
+                for value in role_summaries.values()
+            ),
+            "truncated": sum(
+                _safe_int(value.get("truncated"))
+                for value in role_summaries.values()
+            ),
+            "roles": role_summaries,
+        },
+    }
+    (run_dir / "observability_summary.json").write_text(
+        json.dumps(summary_doc, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return summary_doc
+
+
 def _write_checkpoint(
     run_dir: Path, stage: Stage, run_id: str,
     adapters: "AdapterBundle | None" = None,
@@ -590,13 +813,36 @@ def execute_pipeline(
                             stage=stage.name,
                             **stored,
                         ))
+                if stage == Stage.LITERATURE_COLLECT:
+                    search_meta_path = (
+                        run_dir
+                        / f"stage-{int(stage):02d}"
+                        / "search_meta.json"
+                    )
+                    try:
+                        search_meta = json.loads(
+                            search_meta_path.read_text(encoding="utf-8")
+                        )
+                    except (
+                        FileNotFoundError,
+                        json.JSONDecodeError,
+                        OSError,
+                    ):
+                        search_meta = {}
+                    if isinstance(search_meta, dict):
+                        event_log.append(create_event(
+                            EventType.LITERATURE_MEMORY,
+                            run_id=run_id,
+                            stage=stage.name,
+                            **search_meta,
+                        ))
             except Exception:
                 pass
 
         # ── ExperimentSpec: generate after design, validate after analysis ──
         if stage == Stage.EXPERIMENT_DESIGN and result.status == StageStatus.DONE:
             try:
-                from researchclaw.pipeline.experiment_spec import ExperimentSpec, MetricDef, generate_spec
+                from researchclaw.pipeline.experiment_spec import generate_spec
                 spec_text = generate_spec(config.research.topic, "")
                 spec_path = run_dir / f"stage-{int(stage):02d}" / "experiment_spec.md"
                 spec_path.write_text(spec_text, encoding="utf-8")
@@ -907,6 +1153,22 @@ def execute_pipeline(
                 EventType.PIPELINE_END, run_id=run_id,
                 stages_done=done_count, stages_failed=failed_count,
             ))
+        except Exception:
+            pass
+    observability_summary = _write_observability_summary(run_dir)
+    if event_log:
+        try:
+            llm_summary = observability_summary.get("llm", {})
+            if isinstance(llm_summary, dict):
+                event_log.append(create_event(
+                    EventType.LLM_SUMMARY,
+                    run_id=run_id,
+                    **{
+                        key: value
+                        for key, value in llm_summary.items()
+                        if key != "roles"
+                    },
+                ))
         except Exception:
             pass
 
@@ -1269,7 +1531,6 @@ def _package_deliverables(
             if compile_result.success:
                 logger.info("IMP-18: paper.tex compiles successfully")
                 # Keep the generated PDF
-                pdf_path = dest / tex_path.stem
                 pdf_file = dest / (tex_path.stem + ".pdf")
                 if pdf_file.exists():
                     packaged.append(f"{tex_path.stem}.pdf")

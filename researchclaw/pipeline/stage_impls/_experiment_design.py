@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +120,247 @@ def _selected_topic_contract(
     return selected
 
 
+_SELECTED_TOPIC_CONTRACT_FIELDS = (
+    "id",
+    "title",
+    "research_question",
+    "falsifiable_hypothesis",
+    "datasets",
+    "models",
+    "primary_metric",
+    "baselines",
+    "ablations",
+    "failure_safety_tests",
+    "cheap_pilot",
+    "compute",
+    "pivot_policy",
+)
+
+
+def _has_authoritative_selected_topic(
+    selected_topic: dict[str, Any],
+) -> bool:
+    """Return whether Stage 1 supplied a concrete autonomous topic contract."""
+
+    return bool(str(selected_topic.get("id", "") or "").strip())
+
+
+def _selected_topic_prompt_contract(
+    selected_topic: dict[str, Any],
+    fallback_topic: str,
+) -> str:
+    """Render the selected topic as a mandatory Stage-9 prompt contract."""
+
+    if not _has_authoritative_selected_topic(selected_topic):
+        return ""
+    contract = {
+        key: selected_topic.get(key)
+        for key in _SELECTED_TOPIC_CONTRACT_FIELDS
+        if selected_topic.get(key) not in (None, "", [], {})
+    }
+    contract.setdefault("title", fallback_topic)
+    return (
+        "## MANDATORY SELECTED-TOPIC CONTRACT\n"
+        "This JSON object is the authoritative scientific specification for "
+        "the experiment. The broader campaign brief and generic dataset "
+        "examples are policy/context only.\n"
+        "You MUST preserve its title, research question, falsifiable "
+        "hypothesis, primary metric, declared datasets, models, baselines, "
+        "ablations, cheap pilot, compute constraints, safety tests, and pivot "
+        "policy. You may add implementation detail, but MUST NOT substitute "
+        "an unrelated benchmark, task, model family, or metric.\n"
+        "Return the hypothesis and primary metric explicitly in the YAML.\n"
+        f"```json\n{json.dumps(contract, ensure_ascii=False, indent=2)}\n```\n"
+    )
+
+
+def _merge_unique_plan_items(primary: Any, secondary: Any) -> list[Any]:
+    """Merge plan fields while preserving authoritative selected items first."""
+
+    merged: list[Any] = []
+    seen: set[str] = set()
+    for item in (
+        *_normalize_plan_field(primary),
+        *_normalize_plan_field(secondary),
+    ):
+        if isinstance(item, dict):
+            identity = str(
+                item.get("name")
+                or item.get("title")
+                or item.get("id")
+                or item
+            ).strip().casefold()
+        else:
+            identity = str(item).strip().casefold()
+        if not identity or identity in seen:
+            continue
+        seen.add(identity)
+        merged.append(item)
+    return merged
+
+
+def _apply_selected_topic_contract(
+    plan: dict[str, Any],
+    selected_topic: dict[str, Any],
+    fallback_topic: str,
+) -> dict[str, Any]:
+    """Anchor a generated plan to the authoritative autonomous selection.
+
+    Stage 9 may enrich implementation detail, but it is not allowed to replace
+    the selected scientific question with a convenient benchmark.  Dataset and
+    model identity are therefore replaced by the selected values, while
+    baselines and ablations keep the selected controls first and may retain
+    compatible additions proposed by the designer.
+    """
+
+    if not _has_authoritative_selected_topic(selected_topic):
+        plan.setdefault("topic", fallback_topic)
+        return plan
+
+    anchored = dict(plan)
+    title = str(selected_topic.get("title", fallback_topic) or fallback_topic)
+    anchored["topic"] = title
+    anchored["title"] = title
+
+    for field in (
+        "research_question",
+        "falsifiable_hypothesis",
+        "primary_metric",
+        "cheap_pilot",
+        "pivot_policy",
+    ):
+        value = selected_topic.get(field)
+        if value not in (None, ""):
+            anchored[field] = value
+
+    for field in ("datasets", "models"):
+        selected = _normalize_plan_field(selected_topic.get(field))
+        if selected:
+            anchored[field] = selected
+
+    for field in ("baselines", "ablations", "failure_safety_tests"):
+        selected = selected_topic.get(field)
+        if _normalize_plan_field(selected):
+            anchored[field] = _merge_unique_plan_items(
+                selected,
+                anchored.get(field),
+            )
+
+    compute = selected_topic.get("compute")
+    if isinstance(compute, dict) and compute:
+        generated_compute = anchored.get("compute_budget")
+        merged_compute = (
+            dict(generated_compute)
+            if isinstance(generated_compute, dict)
+            else {}
+        )
+        merged_compute.update(compute)
+        anchored["compute_budget"] = merged_compute
+        anchored["selected_compute"] = dict(compute)
+
+    selected_models = _normalize_plan_field(selected_topic.get("models"))
+    if selected_models:
+        anchored["models"] = selected_models
+
+    primary_metric = str(
+        selected_topic.get("primary_metric", "") or ""
+    ).strip()
+    if primary_metric:
+        anchored["metrics"] = _merge_unique_plan_items(
+            [primary_metric],
+            anchored.get("metrics"),
+        )
+
+    anchored["selected_topic_id"] = str(selected_topic.get("id", "") or "")
+    anchored["selected_topic_contract"] = {
+        key: selected_topic.get(key)
+        for key in _SELECTED_TOPIC_CONTRACT_FIELDS
+        if selected_topic.get(key) not in (None, "", [], {})
+    }
+    return anchored
+
+
+def _selected_topic_declares_benchmarks(
+    selected_topic: dict[str, Any],
+) -> bool:
+    """Whether BenchmarkAgent discovery would duplicate an explicit contract."""
+
+    return bool(
+        _has_authoritative_selected_topic(selected_topic)
+        and _normalize_plan_field(selected_topic.get("datasets"))
+        and _normalize_plan_field(selected_topic.get("baselines"))
+    )
+
+
+def _write_semantic_alignment(
+    stage_dir: Path,
+    plan: dict[str, Any],
+    selected_topic: dict[str, Any],
+    fallback_topic: str,
+    *,
+    phase: str,
+    persist: bool = True,
+) -> dict[str, Any]:
+    report = _validate_experiment_semantics(
+        plan,
+        selected_topic,
+        fallback_topic,
+    )
+    report["phase"] = phase
+    if not persist:
+        return report
+    report_path = (
+        stage_dir / "semantic_alignment.json"
+        if phase == "final"
+        else stage_dir / f"semantic_alignment_{phase}.json"
+    )
+    report["report_path"] = report_path.name
+    report_path.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return report
+
+
+def _semantic_misalignment_result(
+    stage_dir: Path,
+    semantic_report: dict[str, Any],
+) -> StageResult:
+    phase_report_name = str(
+        semantic_report.get("report_path") or "semantic_alignment.json"
+    )
+    canonical_report_name = "semantic_alignment.json"
+    if phase_report_name != canonical_report_name:
+        canonical_report = dict(semantic_report)
+        canonical_report["report_path"] = canonical_report_name
+        (stage_dir / canonical_report_name).write_text(
+            json.dumps(canonical_report, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    logger.error(
+        "Stage 9 BLOCKED during %s: experiment plan is semantically "
+        "misaligned with selected topic %r: %s",
+        semantic_report.get("phase", "validation"),
+        semantic_report["selected_topic_title"],
+        "; ".join(semantic_report["reasons"]),
+    )
+    return StageResult(
+        stage=Stage.EXPERIMENT_DESIGN,
+        status=StageStatus.PAUSED,
+        artifacts=tuple(
+            dict.fromkeys(
+                (canonical_report_name, phase_report_name)
+            )
+        ),
+        error=(
+            "Experiment plan is not semantically aligned with the "
+            "authoritative selected_topic contract"
+        ),
+        evidence_refs=(f"stage-09/{canonical_report_name}",),
+        decision="semantic_misalignment",
+    )
+
+
 def _flatten_semantic_text(value: Any) -> str:
     if isinstance(value, dict):
         return " ".join(
@@ -165,6 +405,10 @@ def _validate_experiment_semantics(
             key: plan.get(key)
             for key in (
                 "topic",
+                "title",
+                "research_question",
+                "falsifiable_hypothesis",
+                "primary_metric",
                 "objectives",
                 "datasets",
                 "models",
@@ -173,6 +417,9 @@ def _validate_experiment_semantics(
                 "proposed_methods",
                 "ablations",
                 "metrics",
+                "cheap_pilot",
+                "failure_safety_tests",
+                "pivot_policy",
             )
         }
     )
@@ -261,6 +508,35 @@ def _validate_experiment_semantics(
             "models, or primary metric"
         )
 
+    required_field_matches: dict[str, bool] = {}
+    if selected_topic.get("id"):
+        for field in (
+            "research_question",
+            "falsifiable_hypothesis",
+            "primary_metric",
+        ):
+            expected = _flatten_semantic_text(
+                selected_topic.get(field)
+            ).strip().casefold()
+            if expected:
+                required_field_matches[field] = (
+                    expected in _flatten_semantic_text(
+                        plan.get(field)
+                    ).strip().casefold()
+                )
+        missing_required_fields = sorted(
+            field
+            for field, matched in required_field_matches.items()
+            if not matched
+        )
+        if missing_required_fields:
+            reasons.append(
+                "Plan does not preserve the selected topic's authoritative "
+                + ", ".join(missing_required_fields)
+            )
+    else:
+        missing_required_fields = []
+
     return {
         "aligned": not reasons,
         "selected_topic_id": str(selected_topic.get("id", "") or ""),
@@ -271,6 +547,8 @@ def _validate_experiment_semantics(
         "topic_is_vision": topic_is_vision,
         "matched_anchor_groups": matched_anchor_groups,
         "missing_anchor_groups": missing_anchor_groups,
+        "required_field_matches": required_field_matches,
+        "missing_required_fields": missing_required_fields,
         "forbidden_drift_terms": forbidden_drift_terms,
         "reasons": reasons,
     }
@@ -288,6 +566,15 @@ def _execute_experiment_design(
     llm = _bind_stage_role(llm, Stage.EXPERIMENT_DESIGN)
     hypotheses = _read_prior_artifact(run_dir, "hypotheses.md") or ""
     _selected_topic = _selected_topic_contract(run_dir, config)
+    _authoritative_topic = _has_authoritative_selected_topic(_selected_topic)
+    _selected_contract_prompt = _selected_topic_prompt_contract(
+        _selected_topic,
+        config.research.topic,
+    )
+    _design_topic = str(
+        _selected_topic.get("title", config.research.topic)
+        or config.research.topic
+    )
     preamble = _build_context_preamble(
         config, run_dir, include_goal=True, include_hypotheses=True
     )
@@ -300,7 +587,7 @@ def _execute_experiment_design(
     try:
         from researchclaw.domains.detector import detect_domain as _detect_domain_adv
         _domain_profile = _detect_domain_adv(
-            topic=config.research.topic,
+            topic=_design_topic,
             hypotheses=hypotheses,
         )
         logger.info(
@@ -333,7 +620,7 @@ def _execute_experiment_design(
             from researchclaw.domains.prompt_adapter import get_adapter as _get_prompt_adapter
             _adapter = _get_prompt_adapter(_domain_profile)
             _design_blocks = _adapter.get_experiment_design_blocks(
-                {"topic": config.research.topic}
+                {"topic": _design_topic}
             )
             if _design_blocks.experiment_design_context:
                 _domain_design_context = (
@@ -364,7 +651,7 @@ def _execute_experiment_design(
         _rl_kws = ("reinforcement learning", "ppo", "sac", "td3", "ddpg",
                     "dqn", "mujoco", "continuous control", "actor-critic",
                     "policy gradient", "exploration bonus")
-        _is_rl_topic = any(kw in config.research.topic.lower() for kw in _rl_kws)
+        _is_rl_topic = any(kw in _design_topic.lower() for kw in _rl_kws)
         if _is_rl_topic:
             try:
                 _dg_block += _pm.block("rl_step_guidance")
@@ -388,7 +675,7 @@ def _execute_experiment_design(
         # F-01: Inject framework docs for experiment design
         try:
             from researchclaw.data import detect_frameworks, load_framework_docs
-            _fw_ids = detect_frameworks(config.research.topic, hypotheses)
+            _fw_ids = detect_frameworks(_design_topic, hypotheses)
             if _fw_ids:
                 _fw_docs = load_framework_docs(_fw_ids, max_chars=4000)
                 if _fw_docs:
@@ -402,7 +689,14 @@ def _execute_experiment_design(
             "- CPU: shared server"
         )
         _per_condition_sec = int(config.experiment.time_budget_sec * 0.7 / 6)
-        _tier1 = "CIFAR-10, CIFAR-100, MNIST, FashionMNIST, STL-10, SVHN"
+        _selected_datasets = _plan_field_names(
+            _normalize_plan_field(_selected_topic.get("datasets"))
+        )
+        _tier1 = (
+            ", ".join(_selected_datasets)
+            if _authoritative_topic and _selected_datasets
+            else "CIFAR-10, CIFAR-100, MNIST, FashionMNIST, STL-10, SVHN"
+        )
 
         _overlay = _get_evolution_overlay(run_dir, "experiment_design")
         sp = _pm.for_stage(
@@ -419,6 +713,13 @@ def _execute_experiment_design(
             per_condition_budget_sec=_per_condition_sec,
             available_tier1_datasets=_tier1,
         )
+        if _selected_contract_prompt:
+            sp = type(sp)(
+                system=sp.system,
+                user=f"{_selected_contract_prompt}\n\n{sp.user}",
+                json_mode=sp.json_mode,
+                max_tokens=sp.max_tokens,
+            )
         resp = _chat_with_prompt(
             llm,
             sp.system,
@@ -479,10 +780,14 @@ def _execute_experiment_design(
                 logger.info("Stage 09: Retrying with strict YAML-only prompt...")
                 _retry_prompt = (
                     "Output ONLY valid YAML. No prose, no markdown fences, no explanation.\n"
-                    f"Topic: {config.research.topic}\n"
+                    f"{_selected_contract_prompt}\n"
+                    f"Topic: {_design_topic}\n"
                     "Required keys: baselines, proposed_methods, ablations, "
-                    "datasets, metrics, objectives, risks, compute_budget.\n"
-                    "Each key maps to a list of strings."
+                    "datasets, models, metrics, objectives, risks, compute_budget, "
+                    "research_question, falsifiable_hypothesis, primary_metric, "
+                    "cheap_pilot, pivot_policy.\n"
+                    "List-like keys map to lists; contract fields must be copied "
+                    "exactly from the mandatory selected-topic contract."
                 )
                 _retry_resp = _chat_with_prompt(
                     llm,
@@ -518,7 +823,7 @@ def _execute_experiment_design(
                     _method_candidates[:3], _baseline_candidates[:3],
                 )
                 plan = {
-                    "topic": config.research.topic,
+                    "topic": _design_topic,
                     "generated": _utcnow_iso(),
                     "objectives": ["Evaluate hypotheses with controlled experiments"],
                     "datasets": ["primary_dataset"],
@@ -532,13 +837,13 @@ def _execute_experiment_design(
 
     if plan is None:
         # BUG-12: Use domain-aware names instead of fully generic placeholders
-        _topic_prefix = config.research.topic.split()[0] if config.research.topic else "method"
+        _topic_prefix = _design_topic.split()[0] if _design_topic else "method"
         logger.warning(
             "Stage 09: LLM failed to produce valid experiment plan YAML. "
             "Using topic-derived fallback."
         )
         plan = {
-            "topic": config.research.topic,
+            "topic": _design_topic,
             "generated": _utcnow_iso(),
             "objectives": ["Evaluate hypotheses with controlled experiments"],
             "datasets": ["primary_dataset", "secondary_dataset"],
@@ -549,6 +854,13 @@ def _execute_experiment_design(
             "risks": ["validity threats", "confounding variables"],
             "compute_budget": {"max_gpu": 1, "max_hours": 4},
         }
+
+    _generated_plan = dict(plan)
+    plan = _apply_selected_topic_contract(
+        plan,
+        _selected_topic,
+        config.research.topic,
+    )
 
     # Schema-deficit guard: when the LLM returned a parseable dict that
     # bypassed every fallback cascade (because plan was never None) but
@@ -587,6 +899,49 @@ def _execute_experiment_design(
             evidence_refs=("stage-09/plan_meta.json",),
             decision="schema_deficient",
         )
+
+    # Reject topic drift before the multi-call BenchmarkAgent can spend several
+    # minutes acquiring code for an already invalid plan.  The authoritative
+    # contract is applied first, so this checks both the generated methods and
+    # the fixed scientific endpoints.
+    _pre_contract_plan = dict(_generated_plan)
+    if _authoritative_topic:
+        for _field in (
+            "topic",
+            "title",
+            "research_question",
+            "falsifiable_hypothesis",
+            "datasets",
+            "models",
+            "primary_metric",
+            "baselines",
+            "ablations",
+            "metrics",
+            "cheap_pilot",
+            "failure_safety_tests",
+            "pivot_policy",
+        ):
+            _selected_value = _selected_topic.get(_field)
+            if _selected_value in (None, "", [], {}):
+                continue
+            if _field in _pre_contract_plan:
+                # Preserve what the LLM actually proposed so forbidden domain
+                # drift is caught before the authoritative contract repairs it.
+                continue
+            _pre_contract_plan[_field] = _selected_value
+    _pre_benchmark_semantic_report = _write_semantic_alignment(
+        stage_dir,
+        _pre_contract_plan,
+        _selected_topic,
+        config.research.topic,
+        phase="pre_benchmark",
+    )
+    if not _pre_benchmark_semantic_report["aligned"]:
+        return _semantic_misalignment_result(
+            stage_dir,
+            _pre_benchmark_semantic_report,
+        )
+
     # ── BA: BenchmarkAgent — intelligent dataset/baseline selection ──────
     _benchmark_plan = None
     # BUG-40: Skip BenchmarkAgent for non-ML domains — it has no relevant
@@ -597,7 +952,7 @@ def _execute_experiment_design(
         try:
             from researchclaw.domains.detector import detect_domain as _detect_domain_adv
             _ba_domain_profile = _detect_domain_adv(
-                topic=config.research.topic,
+                topic=_design_topic,
                 hypotheses=hypotheses,
             )
         except Exception:  # noqa: BLE001
@@ -608,13 +963,23 @@ def _execute_experiment_design(
         else "generic"
     )
     _ba_domain_ok = _ba_domain_id.startswith("ml_")
+    _ba_contract_complete = _selected_topic_declares_benchmarks(
+        _selected_topic
+    )
     if not _ba_domain_ok:
         logger.info(
             "BenchmarkAgent skipped: domain profile '%s' is not an ML profile (topic: %s)",
-            _ba_domain_id, config.research.topic[:80],
+            _ba_domain_id, _design_topic[:80],
+        )
+    elif _ba_contract_complete:
+        logger.info(
+            "BenchmarkAgent skipped: selected topic %s already declares "
+            "authoritative datasets and baselines",
+            _selected_topic.get("id"),
         )
     if (
         _ba_domain_ok
+        and not _ba_contract_complete
         and config.experiment.benchmark_agent.enabled
         and config.experiment.mode
         in ("sandbox", "docker", "clusterbridge", "clusterbridge_pool")
@@ -657,14 +1022,19 @@ def _execute_experiment_design(
                 stage_dir=stage_dir / "benchmark_agent",
             )
             _benchmark_plan = _ba.orchestrate({
-                "topic": config.research.topic,
+                "topic": _design_topic,
                 "hypothesis": hypotheses,
-                "experiment_plan": plan.get("objectives", "") if isinstance(plan, dict) else "",
+                "experiment_plan": (
+                    _flatten_semantic_text(plan.get("objectives", ""))
+                    if isinstance(plan, dict)
+                    else ""
+                ),
             })
 
             # Inject BenchmarkAgent selections into experiment plan
             if isinstance(plan, dict) and _benchmark_plan.selected_benchmarks:
-                plan["datasets"] = [
+                _candidate_plan = dict(plan)
+                _candidate_plan["datasets"] = [
                     b.get("name", "Unknown") for b in _benchmark_plan.selected_benchmarks
                 ]
                 # Normalize existing baselines — LLM may emit dict, list of
@@ -672,19 +1042,62 @@ def _execute_experiment_design(
                 _baselines_from_plan = _plan_field_names(
                     _normalize_plan_field(plan.get("baselines", []))
                 )
-                plan["baselines"] = [
+                _candidate_plan["baselines"] = [
                     bl.get("name", "Unknown") for bl in _benchmark_plan.selected_baselines
                 ] + _baselines_from_plan
                 # Deduplicate baselines
-                plan["baselines"] = list(dict.fromkeys(plan["baselines"]))
+                _candidate_plan["baselines"] = list(
+                    dict.fromkeys(_candidate_plan["baselines"])
+                )
+                _raw_benchmark_semantic_report = _write_semantic_alignment(
+                    stage_dir,
+                    _candidate_plan,
+                    _selected_topic,
+                    config.research.topic,
+                    phase="benchmark_candidate",
+                    persist=False,
+                )
+                if not _raw_benchmark_semantic_report["aligned"]:
+                    logger.warning(
+                        "BenchmarkAgent suggestions discarded because they "
+                        "violate the selected-topic contract: %s",
+                        "; ".join(
+                            _raw_benchmark_semantic_report["reasons"]
+                        ),
+                    )
+                    _benchmark_plan = None
+                else:
+                    _candidate_plan = _apply_selected_topic_contract(
+                        _candidate_plan,
+                        _selected_topic,
+                        config.research.topic,
+                    )
+                    _benchmark_semantic_report = _write_semantic_alignment(
+                        stage_dir,
+                        _candidate_plan,
+                        _selected_topic,
+                        config.research.topic,
+                        phase="post_benchmark",
+                    )
+                    if not _benchmark_semantic_report["aligned"]:
+                        logger.warning(
+                            "BenchmarkAgent suggestions discarded because "
+                            "the anchored plan is still misaligned: %s",
+                            "; ".join(_benchmark_semantic_report["reasons"]),
+                        )
+                        _benchmark_plan = None
+                    else:
+                        plan = _candidate_plan
 
-            logger.info(
-                "BenchmarkAgent: %d benchmarks, %d baselines selected (%d LLM calls, %.1fs)",
-                len(_benchmark_plan.selected_benchmarks),
-                len(_benchmark_plan.selected_baselines),
-                _benchmark_plan.total_llm_calls,
-                _benchmark_plan.elapsed_sec,
-            )
+            if _benchmark_plan is not None:
+                logger.info(
+                    "BenchmarkAgent: %d benchmarks, %d baselines selected "
+                    "(%d LLM calls, %.1fs)",
+                    len(_benchmark_plan.selected_benchmarks),
+                    len(_benchmark_plan.selected_baselines),
+                    _benchmark_plan.total_llm_calls,
+                    _benchmark_plan.elapsed_sec,
+                )
         except Exception as _ba_exc:
             logger.warning("BenchmarkAgent failed (non-fatal): %s", _ba_exc)
 
@@ -698,7 +1111,11 @@ def _execute_experiment_design(
         except Exception:  # noqa: BLE001
             pass
 
-    plan.setdefault("topic", config.research.topic)
+    plan = _apply_selected_topic_contract(
+        plan,
+        _selected_topic,
+        config.research.topic,
+    )
 
     # BUG-R41-09: Enforce condition count limit based on time budget.
     # Too many conditions (30+) guarantee timeouts and wasted compute.
@@ -769,7 +1186,11 @@ def _execute_experiment_design(
                 try:
                     parsed_update = yaml.safe_load(updated)
                     if isinstance(parsed_update, dict):
-                        plan = parsed_update
+                        plan = _apply_selected_topic_contract(
+                            parsed_update,
+                            _selected_topic,
+                            config.research.topic,
+                        )
                 except yaml.YAMLError:
                     pass
         except Exception:
@@ -778,32 +1199,17 @@ def _execute_experiment_design(
     # Production scientific gate: the executable plan must still test the
     # authoritative selected topic. Run after every automatic and HITL rewrite
     # so no later mutation can reintroduce an unrelated benchmark.
-    _semantic_report = _validate_experiment_semantics(
+    _semantic_report = _write_semantic_alignment(
+        stage_dir,
         plan,
         _selected_topic,
         config.research.topic,
-    )
-    (stage_dir / "semantic_alignment.json").write_text(
-        json.dumps(_semantic_report, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+        phase="final",
     )
     if not _semantic_report["aligned"]:
-        logger.error(
-            "Stage 9 BLOCKED: experiment plan is semantically misaligned "
-            "with selected topic %r: %s",
-            _semantic_report["selected_topic_title"],
-            "; ".join(_semantic_report["reasons"]),
-        )
-        return StageResult(
-            stage=Stage.EXPERIMENT_DESIGN,
-            status=StageStatus.PAUSED,
-            artifacts=("semantic_alignment.json",),
-            error=(
-                "Experiment plan is not semantically aligned with the "
-                "authoritative selected_topic contract"
-            ),
-            evidence_refs=("stage-09/semantic_alignment.json",),
-            decision="semantic_misalignment",
+        return _semantic_misalignment_result(
+            stage_dir,
+            _semantic_report,
         )
 
     # --- HITL: Baseline Navigator data persistence ---

@@ -6,6 +6,7 @@ import json
 import os
 import threading
 from collections.abc import Iterable, Mapping
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +119,30 @@ class FactoryStore:
     def idea_dir(self, idea_id: str) -> Path:
         return self.ideas_dir / idea_id
 
+    def idea_event(
+        self,
+        idea_id: str,
+        event_type: str,
+        **payload: Any,
+    ) -> dict[str, Any]:
+        """Append an Idea-local timeline in addition to the global journal."""
+
+        value = {
+            "timestamp": utc_now(),
+            "type": event_type,
+            "factory_id": self.factory_id,
+            "idea_id": idea_id,
+            **payload,
+        }
+        path = self.idea_dir(idea_id) / "events.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n"
+        with self._event_lock, path.open("a", encoding="utf-8") as stream:
+            stream.write(line)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return value
+
     def _idea_path(self, idea_id: str) -> Path:
         return self.idea_dir(idea_id) / "idea.json"
 
@@ -137,6 +162,15 @@ class FactoryStore:
                 event_type,
                 idea_id=idea.idea_id,
                 status=idea.status.value,
+            )
+            self.idea_event(
+                idea.idea_id,
+                event_type,
+                status=idea.status.value,
+                budget_tier=idea.budget_tier.value,
+                priority=idea.priority,
+                current_item_id=idea.current_item_id,
+                exit_reason=idea.exit_reason,
             )
         return idea
 
@@ -272,6 +306,17 @@ class FactoryStore:
                 item_id=item.item_id,
                 status=item.status.value,
                 attempt=item.attempt,
+            )
+            self.idea_event(
+                item.idea_id,
+                event_type,
+                item_id=item.item_id,
+                kind=item.kind.value,
+                profile=item.profile,
+                status=item.status.value,
+                attempt=item.attempt,
+                resources=asdict(item.resources),
+                result=item.result,
             )
         return item
 

@@ -1124,6 +1124,41 @@ class CampaignDashboard:
         run_dir = _latest_cycle_dir(self.campaign_dir, state)
         if source == "pipeline":
             path = run_dir / "pipeline.log" if run_dir is not None else None
+        elif source == "pipeline_events":
+            path = (
+                run_dir / "pipeline_events.jsonl"
+                if run_dir is not None
+                else None
+            )
+        elif source == "llm_audit":
+            audit_paths = (
+                list((run_dir / "audit").glob("llm-*.jsonl"))
+                if run_dir is not None
+                else []
+            )
+            path = (
+                max(
+                    audit_paths,
+                    key=lambda candidate: candidate.stat().st_mtime,
+                )
+                if audit_paths
+                else None
+            )
+        elif source.startswith("llm_audit:"):
+            role = source.partition(":")[2]
+            if not re.fullmatch(r"[a-z0-9_.-]+", role):
+                raise ValueError("invalid LLM audit role")
+            path = (
+                run_dir / "audit" / f"llm-{role}.jsonl"
+                if run_dir is not None
+                else None
+            )
+        elif source == "observability":
+            path = (
+                run_dir / "observability_summary.json"
+                if run_dir is not None
+                else None
+            )
         elif source == "supervisor":
             path = self.campaign_dir / "supervisor.log"
         elif source in {"experiment", "experiment_stdout", "experiment_stderr"}:

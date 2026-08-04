@@ -26,6 +26,15 @@ def test_factory_dashboard_exposes_kanban_and_controls(tmp_path: Path) -> None:
         assert client.get("/").status_code == 200
         payload = client.get("/api/dashboard").json()
         assert payload["lanes"]["pilot"][0]["idea_id"] == idea.idea_id
+        timeline = client.get(
+            f"/api/ideas/{idea.idea_id}/events?limit=10"
+        ).json()
+        assert timeline["idea_id"] == idea.idea_id
+        assert timeline["events"][-1]["type"] == "idea_saved"
+        assert client.get("/api/ideas/%2E%2E/events").status_code in {
+            400,
+            404,
+        }
         assert client.post(
             "/api/control/pause", json={"reason": "test"}
         ).status_code == 200

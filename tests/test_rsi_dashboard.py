@@ -115,6 +115,35 @@ def _campaign(tmp_path: Path) -> tuple[Path, Path]:
         "[rc-test] Stage 13/23 ITERATIVE_REFINE — running...",
         encoding="utf-8",
     )
+    (run / "pipeline_events.jsonl").write_text(
+        json.dumps(
+            {
+                "timestamp": now,
+                "type": "stage_end",
+                "stage": "RESEARCH_DECISION",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    audit = run / "audit" / "llm-idea_scientist.jsonl"
+    audit.parent.mkdir()
+    audit.write_text(
+        json.dumps(
+            {
+                "timestamp": now,
+                "role": "idea_scientist",
+                "status": "ok",
+                "total_tokens": 42,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_json(
+        run / "observability_summary.json",
+        {"schema_version": 1, "llm": {"calls": 1, "total_tokens": 42}},
+    )
     (campaign / "events.jsonl").write_text(
         json.dumps({"timestamp": now, "type": "cycle_started"}) + "\n",
         encoding="utf-8",
@@ -269,6 +298,15 @@ def test_api_serves_frontend_events_logs_and_safe_artifacts(
         assert client.get("/api/events?limit=10").json()["events"][0]["type"] == "cycle_started"
         assert "Stage 13/23" in client.get(
             "/api/logs?source=pipeline&tail=20"
+        ).json()["text"]
+        assert '"type": "stage_end"' in client.get(
+            "/api/logs?source=pipeline_events&tail=20"
+        ).json()["text"]
+        assert '"role": "idea_scientist"' in client.get(
+            "/api/logs?source=llm_audit&tail=20"
+        ).json()["text"]
+        assert '"total_tokens": 42' in client.get(
+            "/api/logs?source=observability&tail=20"
         ).json()["text"]
         artifacts = client.get("/api/artifacts").json()["artifacts"]
         assert any(item["path"] == "stage-14/analysis.md" for item in artifacts)

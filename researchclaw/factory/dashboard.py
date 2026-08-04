@@ -110,6 +110,30 @@ class FactoryDashboard:
                 events.append(dict(value))
         return events
 
+    def idea_events(
+        self,
+        idea_id: str,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if not idea_id or any(
+            token in idea_id for token in ("/", "\\", "..")
+        ):
+            raise ValueError("invalid idea_id")
+        path = self.store.idea_dir(idea_id) / "events.jsonl"
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (FileNotFoundError, OSError):
+            return []
+        events: list[dict[str, Any]] = []
+        for line in lines[-max(1, min(limit, 2000)) :]:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, Mapping):
+                events.append(dict(value))
+        return events
+
 
 def create_dashboard_app(
     factory_root: str | Path,
@@ -139,6 +163,14 @@ def create_dashboard_app(
     @app.get("/api/events")
     def events(limit: int = 200) -> dict[str, Any]:
         return {"events": dashboard.events(limit)}
+
+    @app.get("/api/ideas/{idea_id}/events")
+    def idea_events(idea_id: str, limit: int = 200) -> dict[str, Any]:
+        try:
+            events = dashboard.idea_events(idea_id, limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"idea_id": idea_id, "events": events}
 
     def require_control() -> None:
         if not control_enabled:

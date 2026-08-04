@@ -92,6 +92,14 @@ class GPUBroker:
             lease_id=lease.lease_id,
             allocated_gpus=lease.allocated_gpus,
         )
+        self.store.idea_event(
+            item.idea_id,
+            "gpu_lease_admitted",
+            item_id=item.item_id,
+            lease_id=lease.lease_id,
+            allocated_gpus=lease.allocated_gpus,
+            pool_task_id=lease.pool_task_id,
+        )
 
         self.pool.submit_task(
             item.command,
@@ -145,6 +153,13 @@ class GPUBroker:
             lease_id=lease.lease_id,
             allocated_gpus=lease.allocated_gpus,
         )
+        self.store.idea_event(
+            item.idea_id,
+            "gpu_driver_lease_admitted",
+            item_id=item.item_id,
+            lease_id=lease.lease_id,
+            allocated_gpus=lease.allocated_gpus,
+        )
         return True, lease.allocated_gpus, "DRIVER_LEASE_ADMITTED"
 
     def release_driver(self, item_id: str) -> None:
@@ -161,6 +176,13 @@ class GPUBroker:
         if changed:
             self.store.save_leases(leases)
             self.store.event("gpu_driver_lease_released", item_id=item_id)
+            item = self.store.get_work_item(item_id)
+            if item is not None:
+                self.store.idea_event(
+                    item.idea_id,
+                    "gpu_driver_lease_released",
+                    item_id=item_id,
+                )
 
     def reconcile(self) -> list[WorkItem]:
         changed: list[WorkItem] = []
@@ -188,6 +210,13 @@ class GPUBroker:
                     "gpu_task_probe_failed",
                     idea_id=lease.idea_id,
                     item_id=lease.item_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                self.store.idea_event(
+                    lease.idea_id,
+                    "gpu_task_probe_failed",
+                    item_id=lease.item_id,
+                    pool_task_id=lease.pool_task_id,
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 continue

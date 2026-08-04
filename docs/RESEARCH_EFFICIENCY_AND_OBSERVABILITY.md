@@ -100,6 +100,37 @@ fallback models, retry/fallback counts, elapsed time, token usage, finish and
 truncation status, generation controls, and a SHA-256 request fingerprint.
 Prompt bodies, API keys, and chain-of-thought are not stored.
 
+At the end of each pipeline invocation, the raw journals are aggregated into:
+
+```text
+<run>/observability_summary.json
+```
+
+The summary contains stage count/failures/elapsed time, cache and literature
+memory activity, plus per-role LLM call count, latency, token usage, retries,
+fallbacks, truncation, errors, and model distribution. It is derived data only;
+the append-only JSONL files remain authoritative.
+
+The RSI dashboard can review:
+
+- human-readable Pipeline/Supervisor/experiment logs;
+- `pipeline_events.jsonl`;
+- the latest or role-specific `audit/llm-<role>.jsonl`; and
+- `observability_summary.json`.
+
+Factory mode additionally writes:
+
+```text
+<factory>/events.jsonl
+<factory>/ideas/<idea_id>/events.jsonl
+```
+
+The Idea-local journal records every status transition, Work Item attempt,
+resource request, gate decision, lease allocation/release, result, repair, and
+exit reason. The Factory dashboard exposes this as an itemized per-Idea
+timeline, so a failed or slow Idea can be reconstructed without parsing worker
+stdout.
+
 Campaign events include:
 
 - cycle start/completion;
@@ -114,6 +145,10 @@ These logs support retrospective metrics such as:
 - number of external literature refreshes and InfoHub reuse rate;
 - repeated retries without input changes;
 - time from Idea creation to first GPU pilot and evidence gate.
+- Idea conversion and early-exit rates by family, tier, and reason;
+- GPU-hours spent on promoted, repaired, parked, rejected, and negative-result
+  Ideas; and
+- queue/lease latency and utilization by Work Item profile.
 
 Do not store API keys, prompts containing secrets, or full model reasoning in
 these logs.

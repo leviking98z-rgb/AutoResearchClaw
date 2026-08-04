@@ -34,8 +34,40 @@ function card(idea) {
   work.textContent = Object.entries(idea.work_items || {})
     .map(([key, value]) => `${key}:${value}`)
     .join(" · ") || idea.primary_metric || "";
-  node.append(title, meta, status, work);
+  const timeline = document.createElement("button");
+  timeline.type = "button";
+  timeline.className = "timeline-button";
+  timeline.textContent = "查看日志";
+  timeline.addEventListener("click", () => loadIdeaEvents(idea));
+  node.append(title, meta, status, work, timeline);
   return node;
+}
+
+function eventSummary(event) {
+  return Object.entries(event)
+    .filter(([key]) => !["timestamp", "type", "factory_id", "idea_id"].includes(key))
+    .map(([key, value]) => `${key}=${typeof value === "object" ? JSON.stringify(value) : value}`)
+    .join(" · ");
+}
+
+async function loadIdeaEvents(idea) {
+  const title = $("timeline-title");
+  const root = $("timeline");
+  title.textContent = `${idea.title} · ${idea.idea_id}`;
+  root.textContent = "加载中…";
+  try {
+    const payload = await api(`/api/ideas/${encodeURIComponent(idea.idea_id)}/events?limit=200`);
+    root.replaceChildren();
+    (payload.events || []).slice().reverse().forEach((event) => {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.textContent = `${event.timestamp || ""} · ${event.type || "event"} · ${eventSummary(event)}`;
+      root.appendChild(row);
+    });
+    if (!(payload.events || []).length) root.textContent = "暂无 Idea 日志。";
+  } catch (error) {
+    root.textContent = `读取失败: ${error.message}`;
+  }
 }
 
 function render(data) {

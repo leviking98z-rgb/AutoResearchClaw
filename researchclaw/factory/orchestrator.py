@@ -408,6 +408,26 @@ class FactoryOrchestrator:
             decision=decision.decision.value,
             reason_code=decision.reason_code,
         )
+        self.store.idea_event(
+            idea.idea_id,
+            "gate_decided",
+            item_id=item.item_id,
+            decision=decision.decision.value,
+            reason_code=decision.reason_code,
+            current_tier=decision.current_tier.value,
+            next_tier=(
+                decision.next_tier.value
+                if decision.next_tier is not None
+                else None
+            ),
+            next_status=(
+                decision.next_status.value
+                if decision.next_status is not None
+                else None
+            ),
+            evidence_refs=list(decision.evidence_refs),
+            details=decision.details,
+        )
         if decision.decision is GateAction.REPAIR:
             ledger.record_repair()
         if decision.next_tier is not None:
