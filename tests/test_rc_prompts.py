@@ -136,6 +136,28 @@ class TestPromptManagerDefaults:
         assert pm.max_tokens("paper_draft") == 16384
         assert pm.max_tokens("topic_init") is None
 
+    def test_experiment_design_renders_dynamic_gpu_guidance(self) -> None:
+        pm = PromptManager()
+        prompt = pm.for_stage(
+            "experiment_design",
+            preamble="context",
+            hypotheses="hypothesis",
+            dataset_guidance="",
+            domain_design_context="",
+            time_budget_sec=3600,
+            metric_key="accuracy",
+            metric_direction="maximize",
+            hardware_profile="- Pool capacity: 32 GPUs",
+            gpu_execution_guidance=(
+                "- Current Idea allocation: 4 GPUs via Ray."
+            ),
+            per_condition_budget_sec=420,
+            available_tier1_datasets="dataset",
+        )
+        assert "Pool capacity: 32 GPUs" in prompt.user
+        assert "Current Idea allocation: 4 GPUs via Ray" in prompt.user
+        assert "exactly ONE GPU" not in prompt.user
+
     def test_block_topic_constraint(self) -> None:
         pm = PromptManager()
         block = pm.block("topic_constraint", topic="Neural Architecture Search")

@@ -63,3 +63,28 @@ def test_scheduler_fair_share_and_backfill() -> None:
     )
     assert scheduler.allocate_gpu(small, leases=[existing]).admitted is False
     assert scheduler.allocate_gpu(large, leases=[existing]).allocated_gpus == 4
+
+
+def test_scheduler_enforces_profile_and_single_node_caps() -> None:
+    config = FactoryConfig.from_mapping(
+        {
+            "factory": {
+                "scheduler": {
+                    "reserved_gpus": 0,
+                    "pilot_max_gpus_per_idea": 4,
+                    "validation_max_gpus_per_idea": 8,
+                    "max_gpu_share_per_idea": 1.0,
+                }
+            }
+        }
+    )
+    scheduler = FactoryScheduler(config, total_gpus=32)
+    scheduler.max_gpus_per_node = 8
+    pilot = _item("pilot-large", "a", 16)
+    pilot.resources.min_gpus = 1
+    assert scheduler.allocate_gpu(pilot, leases=[]).allocated_gpus == 4
+
+    validation = _item("validation-large", "b", 16)
+    validation.profile = "validation"
+    validation.resources.min_gpus = 9
+    assert scheduler.allocate_gpu(validation, leases=[]).admitted is False

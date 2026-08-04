@@ -123,6 +123,8 @@ Factory mode additionally writes:
 ```text
 <factory>/events.jsonl
 <factory>/ideas/<idea_id>/events.jsonl
+<factory>/ideas/<idea_id>/operational_events.jsonl
+<factory>/observability_summary.json
 ```
 
 The Idea-local journal records every status transition, Work Item attempt,
@@ -130,6 +132,78 @@ resource request, gate decision, lease allocation/release, result, repair, and
 exit reason. The Factory dashboard exposes this as an itemized per-Idea
 timeline, so a failed or slow Idea can be reconstructed without parsing worker
 stdout.
+
+The exact selected-topic contract and generated pipeline config are preserved
+per Work Item attempt under
+`ideas/<idea_id>/contract/<work_item_id>/attempt-NN/`, so a retrospective can
+replay the prompt/config inputs that produced a particular log and result.
+
+`operational_events.jsonl` is the cross-layer replay journal. Factory workers
+propagate the same Factory/Idea/Work Item/attempt identifiers into the pipeline,
+which records worker launch/exit, pipeline start/end, stage start/end, elapsed
+time, outcome, reason code, and artifact names. It intentionally stores
+metadata rather than prompt bodies or model reasoning. Obvious credential keys
+(`api_key`, authorization, passwords, secrets, and credential-bearing access,
+auth, bearer, or refresh token fields) are recursively redacted before any
+structured JSONL event is appended. Usage counters such as `total_tokens` and
+`completion_tokens` remain visible for cost and efficiency analysis.
+
+The Factory dashboard `/health` response also reports Factory status, tick age,
+running Work Item count, and active Lease count. A Factory that still claims
+`running` but has not refreshed its state within the configured threshold is
+reported as `degraded` with `factory_tick_stale`.
+
+High-frequency JSON snapshots use atomic rename without forcing a CephFS
+`fsync` on every tick. Factory event journals are flushed on every append and
+remain append-only; LLM audit rows additionally use `fsync` because they are
+low-frequency and expensive to reproduce. This keeps retrospective evidence
+authoritative at the application level without making filesystem durability
+barriers the scheduler bottleneck.
+
+The Factory summary is regenerated from the durable journal and state on every
+tick/dashboard refresh. It reports event/failure/gate counts, queue and runtime
+p50/p95, Factory tick p50/p95, throughput, screen conversion/terminal yield,
+retries, aggregate GPU-hours, LLM calls, and engineering repairs. Candidate
+de-duplication is also journaled, rather than silently dropping repeated
+generator output. Dashboard event APIs read a bounded tail rather than loading
+an unbounded 24-hour JSONL file into memory.
+
+If the aggregation window reaches its configured event cap,
+`events.window_truncated` is true. Lifetime counters remain available, but
+per-hour rates are withheld rather than dividing lifetime outcomes by a
+truncated time window.
+
+Queue wait and runtime metrics are correlated by `(item_id, attempt)`, so a
+failed attempt followed by a retry does not merge two queue intervals into one
+inflated latency sample. Terminal `work_item_failed` rows carry the structured
+`failure_reason`, `profile`, and `kind`. Research yield counts only
+`COMPLETED` and `COMPLETED_NEGATIVE`; rejected, parked, and failed Ideas are
+reported as exits rather than successful scientific output.
+
+Stage 10 also writes:
+
+```text
+<run>/stage-10/scientific_code_alignment.json
+```
+
+For an authoritative selected-topic contract, this fail-closed gate verifies
+that generated code contains executable paths for the declared real
+model/dataset and does not replace the experiment with a synthetic DGP,
+simulated trajectory, mock inference, random scientific outcomes, or a
+"production will replace this" placeholder. Normal random seeds and legitimate
+Monte Carlo methods are not rejected merely for using randomness.
+
+Use the append-only journals for diagnosis and the summaries for fast
+comparison. A practical retrospective loop is:
+
+1. Group failures and gate exits by `reason_code`, profile, and Idea family.
+2. Compare queue p95, runtime p95, and Factory-tick p95 before/after a change.
+3. Rank promoted and rejected Ideas by GPU-hours, LLM calls, and repair count.
+4. Open the Idea-local timeline and worker stdout/stderr only for the outliers.
+   Use `operational_events.jsonl` first when the failure crosses worker,
+   pipeline, and stage boundaries.
+5. Change one scheduler, prompt, gate, or budget policy at a time and preserve
+   the previous summary as the experiment baseline.
 
 Campaign events include:
 

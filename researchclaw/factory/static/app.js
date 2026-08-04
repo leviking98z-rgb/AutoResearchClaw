@@ -53,7 +53,24 @@ function eventSummary(event) {
 async function loadIdeaEvents(idea) {
   const title = $("timeline-title");
   const root = $("timeline");
+  const actions = $("log-actions");
   title.textContent = `${idea.title} · ${idea.idea_id}`;
+  actions.replaceChildren();
+  [
+    ["Item Timeline", "events"],
+    ["Pipeline Log", "pipeline"],
+    ["Pipeline JSONL", "pipeline_events"],
+    ["Operational JSONL", "operational_events"],
+  ].forEach(([label, source]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      if (source === "events") loadIdeaEvents(idea);
+      else loadIdeaTextLog(idea, source);
+    });
+    actions.appendChild(button);
+  });
   root.textContent = "加载中…";
   try {
     const payload = await api(`/api/ideas/${encodeURIComponent(idea.idea_id)}/events?limit=200`);
@@ -65,6 +82,23 @@ async function loadIdeaEvents(idea) {
       root.appendChild(row);
     });
     if (!(payload.events || []).length) root.textContent = "暂无 Idea 日志。";
+  } catch (error) {
+    root.textContent = `读取失败: ${error.message}`;
+  }
+}
+
+async function loadIdeaTextLog(idea, source) {
+  const root = $("timeline");
+  root.textContent = "加载中…";
+  try {
+    const response = await fetch(
+      `/api/ideas/${encodeURIComponent(idea.idea_id)}/logs?source=${encodeURIComponent(source)}&limit=600`,
+      { cache: "no-store" },
+    );
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    const pre = document.createElement("pre");
+    pre.textContent = await response.text() || "暂无日志。";
+    root.replaceChildren(pre);
   } catch (error) {
     root.textContent = `读取失败: ${error.message}`;
   }
@@ -87,6 +121,34 @@ function render(data) {
     const node = document.createElement("article");
     node.innerHTML = `<small>${label}</small><strong>${value}</strong>`;
     metrics.appendChild(node);
+  });
+
+  const observability = $("observability");
+  observability.replaceChildren();
+  const summary = data.observability || {};
+  const throughput = summary.throughput || {};
+  const latency = summary.latency || {};
+  const reliability = summary.reliability || {};
+  const outcomes = summary.outcomes || {};
+  const budgets = summary.budgets || {};
+  [
+    ["Idea / h", Number(throughput.ideas_terminal_per_hour || 0).toFixed(2)],
+    ["Yield", `${(100 * Number(outcomes.terminal_yield_rate || 0)).toFixed(1)}%`],
+    ["Tick p95", `${Number(latency.factory_tick?.p95_sec || 0).toFixed(2)}s`],
+    ["Queue p95", `${Number(latency.queue_wait?.p95_sec || 0).toFixed(1)}s`],
+    ["Runtime p95", `${Number(latency.work_item_runtime?.p95_sec || 0).toFixed(1)}s`],
+    ["Retries", reliability.retries || 0],
+    ["GPU hours", Number(budgets.gpu_hours_total || 0).toFixed(2)],
+    ["LLM calls", budgets.llm_calls_total || 0],
+    ["Repairs", budgets.engineering_repairs_total || 0],
+  ].forEach(([label, value]) => {
+    const node = document.createElement("article");
+    const key = document.createElement("small");
+    key.textContent = label;
+    const metric = document.createElement("strong");
+    metric.textContent = value;
+    node.append(key, metric);
+    observability.appendChild(node);
   });
 
   const board = $("board");

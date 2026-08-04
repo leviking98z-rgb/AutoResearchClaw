@@ -55,6 +55,7 @@ class EvidenceGate:
             return self._pipeline_gate(
                 idea,
                 run_dir=run_dir,
+                ledger=ledger,
                 expected_last_stage=8,
                 next_tier=BudgetTier.SMOKE,
                 next_status=IdeaStatus.BUILDING,
@@ -64,6 +65,7 @@ class EvidenceGate:
             return self._pipeline_gate(
                 idea,
                 run_dir=run_dir,
+                ledger=ledger,
                 expected_last_stage=11,
                 next_tier=BudgetTier.PILOT,
                 next_status=IdeaStatus.PILOT,
@@ -80,6 +82,7 @@ class EvidenceGate:
             return self._pipeline_gate(
                 idea,
                 run_dir=run_dir,
+                ledger=ledger,
                 expected_last_stage=23,
                 next_tier=BudgetTier.PAPER,
                 next_status=IdeaStatus.COMPLETED,
@@ -111,6 +114,7 @@ class EvidenceGate:
         idea: Idea,
         *,
         run_dir: Path,
+        ledger: BudgetLedger,
         expected_last_stage: int,
         next_tier: BudgetTier,
         next_status: IdeaStatus,
@@ -124,11 +128,26 @@ class EvidenceGate:
         if simulation_marker.exists():
             completed = expected_last_stage
         if completed < expected_last_stage:
+            if not repair_allowed(ledger, self.config.budgets):
+                return GateDecision(
+                    decision=GateAction.REJECT,
+                    reason_code="PIPELINE_PROFILE_RETRY_EXHAUSTED",
+                    current_tier=idea.budget_tier,
+                    next_status=IdeaStatus.FAILED,
+                    details={
+                        "expected_last_stage": expected_last_stage,
+                        "observed_last_stage": completed,
+                        "profile_status": idea.status.value,
+                    },
+                )
             return GateDecision(
+                # A bounded screen/build/paper profile that did not finish
+                # must retry that same profile.  Stage 13-15 repair is only
+                # meaningful after experiment evidence exists.
                 decision=GateAction.REPAIR,
                 reason_code="PIPELINE_PROFILE_INCOMPLETE",
                 current_tier=idea.budget_tier,
-                next_status=IdeaStatus.REPAIR,
+                next_status=idea.status,
                 details={
                     "expected_last_stage": expected_last_stage,
                     "observed_last_stage": completed,

@@ -8,9 +8,14 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+
+import yaml
+
+from researchclaw.observability import OperationalEventLogger
 
 from .config import FactoryConfig
 from .io import atomic_write_json
@@ -112,6 +117,21 @@ class IdeaWorker(Protocol):
     def cancel(self, *, item: WorkItem, idea_dir: Path) -> WorkerProbe: ...
 
 
+_TERMINAL_PROC_STATES = frozenset({"Z", "X", "x"})
+
+
+def _proc_state_and_start_ticks(pid: int) -> tuple[str, int] | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        _, separator, trailing_fields = stat.rpartition(")")
+        if not separator:
+            return None
+        fields = trailing_fields.split()
+        return fields[0], int(fields[19])
+    except (FileNotFoundError, OSError, IndexError, ValueError):
+        return None
+
+
 def _pid_matches(pid: int, start_ticks: int | None) -> bool:
     if pid <= 0:
         return False
@@ -119,22 +139,22 @@ def _pid_matches(pid: int, start_ticks: int | None) -> bool:
         os.kill(pid, 0)
     except (ProcessLookupError, PermissionError):
         return False
-    if start_ticks is None or not sys.platform.startswith("linux"):
+    if not sys.platform.startswith("linux"):
         return True
-    try:
-        observed = int(Path(f"/proc/{pid}/stat").read_text().split()[21])
-    except (FileNotFoundError, OSError, IndexError, ValueError):
+    observed = _proc_state_and_start_ticks(pid)
+    if observed is None:
         return False
-    return observed == start_ticks
+    state, observed_start_ticks = observed
+    if state in _TERMINAL_PROC_STATES:
+        return False
+    return start_ticks is None or observed_start_ticks == start_ticks
 
 
 def _start_ticks(pid: int) -> int | None:
     if not sys.platform.startswith("linux"):
         return None
-    try:
-        return int(Path(f"/proc/{pid}/stat").read_text().split()[21])
-    except (FileNotFoundError, OSError, IndexError, ValueError):
-        return None
+    observed = _proc_state_and_start_ticks(pid)
+    return observed[1] if observed is not None else None
 
 
 class PipelineIdeaWorker:
@@ -145,7 +165,117 @@ class PipelineIdeaWorker:
 
     @staticmethod
     def _worker_dir(idea_dir: Path, item: WorkItem) -> Path:
-        return idea_dir / "workers" / item.item_id / f"attempt-{item.attempt + 1:02d}"
+        attempt = max(1, int(item.attempt))
+        return idea_dir / "workers" / item.item_id / f"attempt-{attempt:02d}"
+
+    @staticmethod
+    def _selected_topic(idea: Idea) -> dict[str, object]:
+        """Build the authoritative Stage-1/Stage-9 contract for one Idea."""
+
+        candidate = dict(idea.candidate)
+        candidate.update(
+            {
+                "id": str(candidate.get("id") or idea.idea_id),
+                "idea_id": idea.idea_id,
+                "title": idea.title,
+                "research_question": idea.research_question,
+                "falsifiable_hypothesis": idea.falsifiable_hypothesis,
+                "primary_metric": idea.primary_metric,
+                "family": idea.family,
+                "source": idea.source,
+                "parent_ids": list(idea.parent_ids),
+            }
+        )
+        return candidate
+
+    def _prepare_idea_config(
+        self,
+        *,
+        idea: Idea,
+        item: WorkItem,
+        idea_dir: Path,
+    ) -> tuple[Path, Path, Path]:
+        """Materialize a config that cannot inherit another Idea's topic."""
+
+        if not self.config.worker.pipeline_config:
+            raise ValueError("factory.worker.pipeline_config is required")
+        base_config = Path(
+            self.config.worker.pipeline_config
+        ).expanduser().resolve()
+        raw = yaml.safe_load(base_config.read_text(encoding="utf-8")) or {}
+        if not isinstance(raw, Mapping):
+            raise TypeError(f"pipeline config root must be a mapping: {base_config}")
+        data = {str(key): value for key, value in raw.items()}
+
+        contract_dir = idea_dir / "contract"
+        contract_dir.mkdir(parents=True, exist_ok=True)
+        attempt = max(1, int(item.attempt))
+        attempt_dir = (
+            contract_dir / item.item_id / f"attempt-{attempt:02d}"
+        )
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        selected_topic_path = attempt_dir / "selected_topic.json"
+        atomic_write_json(selected_topic_path, self._selected_topic(idea))
+        # Stable convenience pointer for operators and downstream tooling. The
+        # worker itself always receives the immutable attempt-scoped path.
+        atomic_write_json(
+            contract_dir / "selected_topic.json",
+            self._selected_topic(idea),
+        )
+
+        research_raw = data.get("research")
+        research = (
+            {str(key): value for key, value in research_raw.items()}
+            if isinstance(research_raw, Mapping)
+            else {}
+        )
+        research.update(
+            {
+                "topic": idea.title,
+                "selected_topic_file": str(selected_topic_path),
+                "autonomous_topic_selection": False,
+            }
+        )
+        data["research"] = research
+
+        experiment_raw = data.get("experiment")
+        experiment = (
+            {str(key): value for key, value in experiment_raw.items()}
+            if isinstance(experiment_raw, Mapping)
+            else {}
+        )
+        try:
+            requested_timeout = max(
+                60,
+                int(float(item.resources.timeout_sec)),
+            )
+        except (TypeError, ValueError):
+            requested_timeout = 3600
+        existing_timeout = experiment.get("time_budget_sec")
+        try:
+            configured_timeout = max(1, int(existing_timeout))
+        except (TypeError, ValueError):
+            configured_timeout = requested_timeout
+        experiment["time_budget_sec"] = min(
+            configured_timeout,
+            requested_timeout,
+        )
+        data["experiment"] = experiment
+
+        config_path = attempt_dir / "pipeline.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                data,
+                allow_unicode=True,
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        (contract_dir / "pipeline.yaml").write_text(
+            config_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return config_path, selected_topic_path, attempt_dir
 
     def _command(
         self,
@@ -154,8 +284,6 @@ class PipelineIdeaWorker:
         item: WorkItem,
         idea_dir: Path,
     ) -> list[str]:
-        if not self.config.worker.pipeline_config:
-            raise ValueError("factory.worker.pipeline_config is required")
         from_stage, to_stage = PROFILE_STAGES[item.profile]
         run_dir = idea_dir / "runs" / "pipeline"
         if from_stage != "TOPIC_INIT" and not (
@@ -164,13 +292,27 @@ class PipelineIdeaWorker:
             raise FileNotFoundError(
                 f"{item.profile} requires prior pipeline checkpoint: {run_dir}"
             )
+        config_path, selected_topic_path, contract_attempt_dir = (
+            self._prepare_idea_config(
+                idea=idea,
+                item=item,
+                idea_dir=idea_dir,
+            )
+        )
+        item.metadata.update(
+            {
+                "pipeline_config": str(config_path),
+                "selected_topic_file": str(selected_topic_path),
+                "contract_attempt_dir": str(contract_attempt_dir),
+            }
+        )
         argv = [
             self.config.worker.python or sys.executable,
             "-m",
             "researchclaw",
             "run",
             "--config",
-            self.config.worker.pipeline_config,
+            str(config_path),
             "--topic",
             idea.title,
             "--output",
@@ -201,29 +343,52 @@ class PipelineIdeaWorker:
             if existing.state in {"running", "finished"}:
                 return existing
 
+        argv = self._command(idea=idea, item=item, idea_dir=idea_dir)
+        operational_log_path = idea_dir / "operational_events.jsonl"
+        operational_log = OperationalEventLogger(
+            operational_log_path,
+            component="factory.worker",
+            context={
+                "factory_id": self.config.factory_id,
+                "idea_id": idea.idea_id,
+                "work_item_id": item.item_id,
+                "attempt": item.attempt,
+                "profile": item.profile,
+            },
+        )
+        operational_log.emit(
+            "worker_launch_requested",
+            argv=[str(part) for part in argv],
+            worker_dir=str(worker_dir),
+            allocated_gpus=int(item.metadata.get("allocated_gpus", 0) or 0),
+        )
         stdout = (worker_dir / "stdout.log").open("ab", buffering=0)
         stderr = (worker_dir / "stderr.log").open("ab", buffering=0)
-        argv = self._command(idea=idea, item=item, idea_dir=idea_dir)
         child_env = os.environ.copy()
         child_env.update(
             {
+                "RESEARCHCLAW_FACTORY_ID": self.config.factory_id,
                 "RESEARCHCLAW_IDEA_ID": idea.idea_id,
                 "RESEARCHCLAW_WORK_ITEM_ID": item.item_id,
+                "RESEARCHCLAW_WORK_ITEM_ATTEMPT": str(item.attempt),
                 "RESEARCHCLAW_GPU_REQUEST": str(
                     int(item.metadata.get("allocated_gpus", 0) or 0)
                 ),
+                "RESEARCHCLAW_OPERATIONAL_LOG": str(operational_log_path),
             }
         )
-        process = subprocess.Popen(
-            argv,
-            cwd=Path(__file__).resolve().parents[2],
-            stdout=stdout,
-            stderr=stderr,
-            start_new_session=True,
-            env=child_env,
-        )
-        stdout.close()
-        stderr.close()
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=Path(__file__).resolve().parents[2],
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=True,
+                env=child_env,
+            )
+        finally:
+            stdout.close()
+            stderr.close()
         state = {
             "state": "running",
             "pid": process.pid,
@@ -232,6 +397,12 @@ class PipelineIdeaWorker:
             "argv": argv,
         }
         atomic_write_json(state_path, state)
+        operational_log.emit(
+            "worker_launched",
+            outcome="running",
+            pid=process.pid,
+            start_ticks=state["start_ticks"],
+        )
         return WorkerProbe(
             state="running",
             pid=process.pid,
@@ -283,6 +454,25 @@ class PipelineIdeaWorker:
             }
         )
         atomic_write_json(state_path, state)
+        OperationalEventLogger(
+            idea_dir / "operational_events.jsonl",
+            component="factory.worker",
+            context={
+                "idea_id": item.idea_id,
+                "work_item_id": item.item_id,
+                "attempt": item.attempt,
+                "profile": item.profile,
+            },
+        ).emit(
+            "worker_finished",
+            level="INFO" if returncode == 0 else "ERROR",
+            outcome="succeeded" if returncode == 0 else "failed",
+            reason_code="" if returncode == 0 else f"WORKER_EXIT_{returncode}",
+            pid=pid or None,
+            returncode=returncode,
+            started_at=str(state.get("started_at", "")),
+            finished_at=str(state["finished_at"]),
+        )
         return WorkerProbe(
             "finished",
             returncode=returncode,
@@ -319,6 +509,23 @@ class PipelineIdeaWorker:
             "finished_at": utc_now(),
         }
         atomic_write_json(state_path, state)
+        OperationalEventLogger(
+            idea_dir / "operational_events.jsonl",
+            component="factory.worker",
+            context={
+                "idea_id": item.idea_id,
+                "work_item_id": item.item_id,
+                "attempt": item.attempt,
+                "profile": item.profile,
+            },
+        ).emit(
+            "worker_cancelled",
+            level="WARNING",
+            outcome="cancelled",
+            reason_code="OPERATOR_OR_FACTORY_STOP",
+            pid=probe.pid,
+            returncode=130,
+        )
         return WorkerProbe(
             "finished",
             returncode=130,

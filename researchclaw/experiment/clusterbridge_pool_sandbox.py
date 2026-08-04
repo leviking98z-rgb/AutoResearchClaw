@@ -199,11 +199,16 @@ class ClusterBridgePoolSandbox:
             self.config.deterministic_task_namespace.strip()
             or os.environ.get("RESEARCHCLAW_WORK_ITEM_ID", "").strip()
         )
+        attempt = os.environ.get(
+            "RESEARCHCLAW_WORK_ITEM_ATTEMPT",
+            "",
+        ).strip()
         if namespace:
             digest = hashlib.sha256(
                 "|".join(
                     (
                         namespace,
+                        attempt,
                         entry_point,
                         json.dumps(entry_args or [], sort_keys=True),
                         str(self._run_counter),
@@ -238,8 +243,10 @@ class ClusterBridgePoolSandbox:
             if value and _SAFE_ENV_NAME.fullmatch(str(name))
         }
         for name in (
+            "RESEARCHCLAW_FACTORY_ID",
             "RESEARCHCLAW_IDEA_ID",
             "RESEARCHCLAW_WORK_ITEM_ID",
+            "RESEARCHCLAW_WORK_ITEM_ATTEMPT",
             "RESEARCHCLAW_GPU_REQUEST",
         ):
             if os.environ.get(name):
@@ -249,6 +256,13 @@ class ClusterBridgePoolSandbox:
             entry_point=entry_point,
             args=entry_args,
         )
+        try:
+            requested_gpus = max(
+                0,
+                int(env.get("RESEARCHCLAW_GPU_REQUEST", "0") or 0),
+            )
+        except ValueError:
+            requested_gpus = 0
         timed_out = False
         self._write_task_metadata(
             task_metadata_paths,
@@ -265,6 +279,7 @@ class ClusterBridgePoolSandbox:
                 env=env,
                 task_id=run_id,
                 require_ready=self.config.require_prepared,
+                num_gpus=requested_gpus,
             )
             returncode = task.returncode
             stdout = task.stdout

@@ -122,8 +122,10 @@ def test_factory_work_item_env_makes_pool_task_id_deterministic(
     pool_config.write_text("clusterbridge_pool: {}\n", encoding="utf-8")
     fake_pool = FakePool(tmp_path / "state")
     fake_pool.state_dir.mkdir()
+    monkeypatch.setenv("RESEARCHCLAW_FACTORY_ID", "factory-a")
     monkeypatch.setenv("RESEARCHCLAW_IDEA_ID", "idea-a")
     monkeypatch.setenv("RESEARCHCLAW_WORK_ITEM_ID", "idea-a-pilot")
+    monkeypatch.setenv("RESEARCHCLAW_WORK_ITEM_ATTEMPT", "1")
     monkeypatch.setenv("RESEARCHCLAW_GPU_REQUEST", "2")
 
     config = ClusterBridgePoolSandboxConfig(
@@ -160,8 +162,48 @@ def test_factory_work_item_env_makes_pool_task_id_deterministic(
     second.run_project(project, timeout_sec=20)
 
     assert str(fake_pool_two.calls[-1]["task_id"]) == first_task_id
+    assert first_env["RESEARCHCLAW_FACTORY_ID"] == "factory-a"
     assert first_env["RESEARCHCLAW_IDEA_ID"] == "idea-a"
+    assert first_env["RESEARCHCLAW_WORK_ITEM_ATTEMPT"] == "1"
     assert first_env["RESEARCHCLAW_GPU_REQUEST"] == "2"
+    assert fake_pool.calls[-1]["num_gpus"] == 2
+    assert fake_pool_two.calls[-1]["num_gpus"] == 2
+
+
+def test_factory_retry_attempt_uses_distinct_pool_task_id(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    pool_config = tmp_path / "pool.yaml"
+    pool_config.write_text("clusterbridge_pool: {}\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.py").write_text(
+        "print('primary_metric: 1.0')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RESEARCHCLAW_WORK_ITEM_ID", "idea-a-pilot")
+    monkeypatch.setenv("RESEARCHCLAW_GPU_REQUEST", "1")
+
+    first_pool = FakePool(tmp_path / "state-one")
+    first_pool.state_dir.mkdir()
+    monkeypatch.setenv("RESEARCHCLAW_WORK_ITEM_ATTEMPT", "1")
+    ClusterBridgePoolSandbox(
+        ClusterBridgePoolSandboxConfig(config_file=str(pool_config)),
+        tmp_path / "work-one",
+        pool_factory=lambda *_args, **_kwargs: first_pool,
+    ).run_project(project)
+
+    second_pool = FakePool(tmp_path / "state-two")
+    second_pool.state_dir.mkdir()
+    monkeypatch.setenv("RESEARCHCLAW_WORK_ITEM_ATTEMPT", "2")
+    ClusterBridgePoolSandbox(
+        ClusterBridgePoolSandboxConfig(config_file=str(pool_config)),
+        tmp_path / "work-two",
+        pool_factory=lambda *_args, **_kwargs: second_pool,
+    ).run_project(project)
+
+    assert first_pool.calls[-1]["task_id"] != second_pool.calls[-1]["task_id"]
 
 
 def test_network_isolation_does_not_sever_ray_control_plane(

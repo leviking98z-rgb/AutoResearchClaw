@@ -17,6 +17,7 @@ class BudgetLedger:
     llm_calls: int = 0
     engineering_repairs: int = 0
     no_progress_rounds: int = 0
+    usage_records: dict[str, dict[str, Any]] = field(default_factory=dict)
     started_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 
@@ -54,6 +55,44 @@ class BudgetLedger:
         self.engineering_repairs += 1
         self.updated_at = utc_now()
 
+    def record_attempt_usage(
+        self,
+        accounting_id: str,
+        tier: BudgetTier,
+        *,
+        gpu_count: int,
+        elapsed_sec: float,
+        llm_calls: int,
+    ) -> tuple[dict[str, Any], bool]:
+        """Commit one attempt exactly once and return ``(record, created)``."""
+
+        key = str(accounting_id).strip()
+        if not key:
+            raise ValueError("accounting_id is required")
+        existing = self.usage_records.get(key)
+        if isinstance(existing, Mapping):
+            return dict(existing), False
+        if gpu_count < 0 or elapsed_sec < 0 or llm_calls < 0:
+            raise ValueError("attempt usage cannot be negative")
+        gpu_seconds = self.record_gpu_seconds(
+            tier,
+            gpu_count=gpu_count,
+            elapsed_sec=elapsed_sec,
+        )
+        self.record_llm_call(llm_calls)
+        record = {
+            "accounting_id": key,
+            "budget_tier": tier.value,
+            "allocated_gpus": int(gpu_count),
+            "elapsed_sec": round(float(elapsed_sec), 6),
+            "gpu_seconds": round(float(gpu_seconds), 6),
+            "llm_calls": int(llm_calls),
+            "committed_at": utc_now(),
+        }
+        self.usage_records[key] = record
+        self.updated_at = utc_now()
+        return dict(record), True
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -70,6 +109,13 @@ class BudgetLedger:
             llm_calls=int(data.get("llm_calls", 0)),
             engineering_repairs=int(data.get("engineering_repairs", 0)),
             no_progress_rounds=int(data.get("no_progress_rounds", 0)),
+            usage_records={
+                str(key): dict(value)
+                for key, value in dict(
+                    data.get("usage_records", {}) or {}
+                ).items()
+                if isinstance(value, Mapping)
+            },
             started_at=str(data.get("started_at", utc_now())),
             updated_at=str(data.get("updated_at", utc_now())),
         )

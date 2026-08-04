@@ -14,8 +14,12 @@ button { background: #173465; color: white; border: 1px solid #31528a; border-ra
 button:disabled { opacity: .4; cursor: default; }
 main { padding: 24px; display: grid; gap: 20px; }
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-.metrics article, .lane, .lower article, .timeline-panel { background: rgba(13, 25, 48, .88); border: 1px solid #263b66; border-radius: 12px; padding: 14px; }
+.metrics article, .lane, .lower article, .timeline-panel, .observability-panel { background: rgba(13, 25, 48, .88); border: 1px solid #263b66; border-radius: 12px; padding: 14px; }
 .metrics strong { display: block; font-size: 28px; margin-top: 6px; }
+.observability-panel h2 { font-size: 16px; margin-bottom: 12px; }
+.observability { display: grid; grid-template-columns: repeat(9, minmax(100px, 1fr)); gap: 8px; }
+.observability article { padding: 9px 10px; background: #101e39; border: 1px solid #2b4779; border-radius: 9px; }
+.observability strong { display: block; margin-top: 5px; font-size: 18px; color: #77e0ff; }
 .board { display: grid; grid-template-columns: repeat(8, minmax(220px, 1fr)); gap: 12px; overflow-x: auto; padding-bottom: 8px; }
 .lane { min-height: 420px; }
 .lane h2 { font-size: 14px; color: #9eb7e9; margin-bottom: 12px; position: sticky; top: 0; }
@@ -29,8 +33,11 @@ main { padding: 24px; display: grid; gap: 20px; }
 .row { border-top: 1px solid #233858; padding: 8px 0; color: #aebddb; font: 12px ui-monospace, monospace; }
 .timeline-panel h2 { font-size: 16px; margin-bottom: 7px; }
 .timeline-panel p { color: #8fa5cc; margin-bottom: 10px; }
+.log-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
 #timeline { max-height: 380px; overflow: auto; }
+#timeline pre { margin: 0; white-space: pre-wrap; color: #b9c8e3; font: 12px/1.5 ui-monospace, monospace; }
 @media (max-width: 900px) {
   header { align-items: flex-start; gap: 18px; flex-direction: column; }
   .metrics, .lower { grid-template-columns: 1fr 1fr; }
+  .observability { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

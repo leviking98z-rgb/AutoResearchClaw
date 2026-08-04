@@ -24,6 +24,7 @@ from researchclaw.pipeline.stages import (
     Stage,
     StageStatus,
 )
+from researchclaw.observability import OperationalEventLogger
 
 
 def _utcnow_iso() -> str:
@@ -670,6 +671,22 @@ def execute_pipeline(
     results: list[StageResult] = []
     started = False
     total_stages = len(STAGE_SEQUENCE)
+    operational_log_path = os.environ.get(
+        "RESEARCHCLAW_OPERATIONAL_LOG",
+        str(run_dir / "operational_events.jsonl"),
+    )
+    operational_log = OperationalEventLogger(
+        operational_log_path,
+        component="pipeline",
+        context={"run_id": run_id},
+    )
+    operational_log.emit(
+        "pipeline_started",
+        from_stage=int(from_stage),
+        from_stage_name=from_stage.name,
+        to_stage=int(to_stage) if to_stage is not None else None,
+        total_stages=total_stages,
+    )
 
     # Force the domain detector to honor a deployed profile (if any) so
     # every stage picks the same adapter.  Safe no-op when empty.
@@ -756,6 +773,11 @@ def execute_pipeline(
             _promote_best_stage14(run_dir, config)
 
         t0 = _time.monotonic()
+        operational_log.emit(
+            "stage_started",
+            stage=int(stage),
+            stage_name=stage.name,
+        )
 
         result = execute_stage(
             stage,
@@ -766,6 +788,26 @@ def execute_pipeline(
             auto_approve_gates=auto_approve_gates,
         )
         elapsed = _time.monotonic() - t0
+        operational_log.emit(
+            "stage_finished",
+            level=(
+                "INFO"
+                if result.status == StageStatus.DONE
+                else "WARNING"
+                if result.status in {
+                    StageStatus.PAUSED,
+                    StageStatus.BLOCKED_APPROVAL,
+                }
+                else "ERROR"
+            ),
+            outcome=result.status.value,
+            reason_code=str(result.decision or ""),
+            stage=int(stage),
+            stage_name=stage.name,
+            elapsed_sec=round(elapsed, 6),
+            error=str(result.error or "")[:1000],
+            artifacts=list(result.artifacts),
+        )
 
         # ── Event log: stage end ──
         if event_log:
@@ -1143,6 +1185,20 @@ def execute_pipeline(
         run_dir=run_dir,
     )
     _write_pipeline_summary(run_dir, summary)
+    operational_log.emit(
+        "pipeline_finished",
+        level=(
+            "INFO"
+            if summary["final_status"] == StageStatus.DONE.value
+            else "WARNING"
+        ),
+        outcome=str(summary["final_status"]),
+        stages_executed=int(summary["stages_executed"]),
+        stages_done=int(summary["stages_done"]),
+        stages_failed=int(summary["stages_failed"]),
+        stages_paused=int(summary["stages_paused"]),
+        final_stage=int(summary["final_stage"]),
+    )
 
     # ── Event log: pipeline end ──
     if event_log:

@@ -112,6 +112,7 @@ def _broker(
         config,
         total_gpus=pool_summary.expected_total_gpus,
     )
+    scheduler.max_gpus_per_node = pool_summary.max_gpus_per_node
     return GPUBroker(pool=pool, store=store, scheduler=scheduler), pool
 
 

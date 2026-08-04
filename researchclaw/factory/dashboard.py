@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import argparse
-import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import FactoryConfig
+from .io import tail_jsonl, tail_text_lines
 from .models import IdeaStatus, LeaseStatus
+from .observability import build_factory_observability
 from .store import FactoryStore
 
 
@@ -75,6 +77,7 @@ class FactoryDashboard:
             values.sort(key=lambda value: (-value.get("priority", 0), value["idea_id"]))
         return {
             "factory": snapshot,
+            "observability": build_factory_observability(self.store),
             "lanes": lanes,
             "gpu": {
                 "allocated": sum(
@@ -95,20 +98,55 @@ class FactoryDashboard:
             },
         }
 
-    def events(self, limit: int = 200) -> list[dict[str, Any]]:
+    @staticmethod
+    def _timestamp_age_sec(value: object) -> float | None:
         try:
-            lines = self.store.events_path.read_text(encoding="utf-8").splitlines()
-        except (FileNotFoundError, OSError):
-            return []
-        events: list[dict[str, Any]] = []
-        for line in lines[-max(1, min(limit, 2000)) :]:
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, Mapping):
-                events.append(dict(value))
-        return events
+            observed = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=UTC)
+        return max(0.0, (datetime.now(UTC) - observed).total_seconds())
+
+    def health(self, *, stale_after_sec: float = 120.0) -> dict[str, Any]:
+        """Return an operational health verdict, not only HTTP liveness."""
+
+        state = self.store.load_state()
+        age_sec = self._timestamp_age_sec(state.get("updated_at"))
+        running_items = [
+            item
+            for item in self.store.list_work_items()
+            if item.status.value in {"admitted", "running"}
+        ]
+        active_leases = [
+            lease
+            for lease in self.store.list_leases()
+            if lease.status in {LeaseStatus.ADMITTED, LeaseStatus.RUNNING}
+        ]
+        stale = (
+            str(state.get("status", "")).casefold() == "running"
+            and (age_sec is None or age_sec > stale_after_sec)
+        )
+        reasons: list[str] = []
+        if stale:
+            reasons.append("factory_tick_stale")
+        status = "degraded" if reasons else "ok"
+        return {
+            "status": status,
+            "factory_status": str(state.get("status", "unknown")),
+            "tick": int(state.get("tick", 0) or 0),
+            "tick_age_sec": round(age_sec, 3) if age_sec is not None else None,
+            "stale_after_sec": float(stale_after_sec),
+            "running_work_items": len(running_items),
+            "active_leases": len(active_leases),
+            "reasons": reasons,
+        }
+
+    def events(self, limit: int = 200) -> list[dict[str, Any]]:
+        return tail_jsonl(
+            self.store.events_path,
+            limit=max(1, min(limit, 2000)),
+        )
 
     def idea_events(
         self,
@@ -120,19 +158,62 @@ class FactoryDashboard:
         ):
             raise ValueError("invalid idea_id")
         path = self.store.idea_dir(idea_id) / "events.jsonl"
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (FileNotFoundError, OSError):
-            return []
-        events: list[dict[str, Any]] = []
-        for line in lines[-max(1, min(limit, 2000)) :]:
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, Mapping):
-                events.append(dict(value))
-        return events
+        return tail_jsonl(path, limit=max(1, min(limit, 2000)))
+
+    def idea_log(
+        self,
+        idea_id: str,
+        source: str,
+        *,
+        item_id: str = "",
+        attempt: int = 1,
+        limit: int = 400,
+    ) -> str:
+        if not idea_id or any(
+            token in idea_id for token in ("/", "\\", "..")
+        ):
+            raise ValueError("invalid idea_id")
+        allowed = {
+            "pipeline": (
+                self.store.idea_dir(idea_id)
+                / "runs"
+                / "pipeline"
+                / "pipeline.log"
+            ),
+            "pipeline_events": (
+                self.store.idea_dir(idea_id)
+                / "runs"
+                / "pipeline"
+                / "pipeline_events.jsonl"
+            ),
+            "operational_events": (
+                self.store.idea_dir(idea_id)
+                / "operational_events.jsonl"
+            ),
+        }
+        if source in {"worker_stdout", "worker_stderr"}:
+            if not item_id or any(
+                token in item_id for token in ("/", "\\", "..")
+            ):
+                raise ValueError("invalid item_id")
+            suffix = "stdout.log" if source == "worker_stdout" else "stderr.log"
+            path = (
+                self.store.idea_dir(idea_id)
+                / "workers"
+                / item_id
+                / f"attempt-{max(1, int(attempt)):02d}"
+                / suffix
+            )
+        else:
+            path = allowed.get(source)
+            if path is None:
+                raise ValueError("invalid log source")
+        return "\n".join(
+            tail_text_lines(
+                path,
+                limit=max(1, min(limit, 5000)),
+            )
+        )
 
 
 def create_dashboard_app(
@@ -153,8 +234,10 @@ def create_dashboard_app(
         return FileResponse(static_dir / "index.html")
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health(stale_after_sec: float = 120.0) -> dict[str, Any]:
+        return dashboard.health(
+            stale_after_sec=max(1.0, min(stale_after_sec, 86_400.0))
+        )
 
     @app.get("/api/dashboard")
     def status() -> dict[str, Any]:
@@ -171,6 +254,26 @@ def create_dashboard_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"idea_id": idea_id, "events": events}
+
+    @app.get("/api/ideas/{idea_id}/logs")
+    def idea_logs(
+        idea_id: str,
+        source: str = "pipeline",
+        item_id: str = "",
+        attempt: int = 1,
+        limit: int = 400,
+    ) -> PlainTextResponse:
+        try:
+            text = dashboard.idea_log(
+                idea_id,
+                source,
+                item_id=item_id,
+                attempt=attempt,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return PlainTextResponse(text)
 
     def require_control() -> None:
         if not control_enabled:

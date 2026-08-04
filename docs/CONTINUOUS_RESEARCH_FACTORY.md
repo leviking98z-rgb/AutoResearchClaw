@@ -205,6 +205,23 @@ FAILED -> RETRY_WAIT -> READY
 
 Transitions must be idempotent and append an audit event.
 
+An attempt is consumed once dispatch reaches an actual worker or physical GPU
+submission. A transport-level GPU submission failure therefore advances the
+retry counter even if no GPU-seconds are charged. Usage accounting remains
+attempt-scoped and records only executions that acquired physical/logical GPU
+capacity, preventing both infinite hot retries and fake zero-GPU usage rows.
+
+Each worker attempt also snapshots its scientific contract under:
+
+```text
+ideas/<idea_id>/contract/<work_item_id>/attempt-NN/
+  selected_topic.json
+  pipeline.yaml
+```
+
+The stable files directly under `contract/` are latest-attempt convenience
+pointers; the attempt directories are the immutable audit records.
+
 ### 4.4 Resource request and lease
 
 An Idea requests a logical lease; it never claims physical nodes:
@@ -538,6 +555,12 @@ cancel_task(...)
 Task IDs must be deterministic per Idea, Work Item, and attempt so recovery
 does not duplicate expensive experiments.
 
+`submit_task(..., num_gpus=N, num_cpus=M)` executes the command inside a Ray
+remote task with those explicit resources. The Broker remains the only caller
+that converts a logical Lease into that physical reservation; environment
+variables such as `RESEARCHCLAW_GPU_REQUEST` are descriptive inputs, not the
+isolation mechanism.
+
 ## 10. LLM scheduling and roles
 
 Each Idea continues to use role-aware routing:
@@ -836,6 +859,13 @@ Exit criteria:
 - control operations are idempotent and auditable;
 - a restart drill restores Factory, Broker, workers, and dashboard; and
 - a 24-hour unattended soak test completes without global deadlock.
+
+The first observability slice already records append-only global/per-Idea
+events, Work Item attempts and resources, gate decisions, lease transitions,
+budget accounting, candidate de-duplication, and bounded dashboard tails.
+`observability_summary.json` derives queue/runtime/Factory-tick p50/p95,
+throughput, failure/gate reasons, retries, GPU-hours, LLM calls, and repairs.
+Raw JSONL remains authoritative for replay and optimization.
 
 ### Phase 7 — Adaptive scheduling and idea evolution
 

@@ -11,20 +11,16 @@ from typing import Any
 from researchclaw.adapters import AdapterBundle
 from researchclaw.config import RCConfig
 from researchclaw.experiment.validator import (
-    CodeValidation,
     format_issues_for_llm,
     validate_code,
 )
 from researchclaw.llm.client import LLMClient
-from researchclaw.pipeline._domain import _detect_domain
 from researchclaw.pipeline._helpers import (
     StageResult,
     _bind_stage_role,
     _chat_with_prompt,
-    _ensure_sandbox_deps,
     _extract_code_block,
     _extract_multi_file_blocks,
-    _extract_yaml_block,
     _get_evolution_overlay,
     _load_hardware_profile,
     _read_prior_artifact,
@@ -42,6 +38,433 @@ _CONTINUOUS_ENVS = {
     "swimmer", "reacher", "invertedpendulum", "inverteddoublependulum",
     "mountaincarcontinuous", "lunarlander-continuous",
 }
+
+_GENERIC_MODEL_MARKERS = (
+    "language model",
+    "llm",
+    "qwen",
+    "llama",
+    "mistral",
+    "gemma",
+    "phi-",
+    "transformers",
+    "automodelfor",
+    "autotokenizer",
+    "vllm",
+)
+_LLM_SUBJECT_MARKERS = (
+    "language model",
+    "llm",
+    "qwen",
+    "llama",
+    "mistral",
+    "gemma",
+    "phi-",
+    "transformers",
+    "vllm",
+)
+_GENERIC_DATASET_MARKERS = (
+    "dataset",
+    "benchmark",
+    "gsm8k",
+    "math",
+    "mbpp",
+    "humaneval",
+    "mmlu",
+    "arc",
+    "hellaswag",
+    "cifar",
+    "mnist",
+    "imagenet",
+    "load_dataset",
+    "torchvision.datasets",
+)
+_NAMED_BENCHMARK_MARKERS = (
+    "gsm8k",
+    "math",
+    "mbpp",
+    "humaneval",
+    "mmlu",
+    "arc",
+    "hellaswag",
+    "cifar",
+    "mnist",
+    "imagenet",
+)
+_MODEL_EXECUTION_MARKERS = (
+    "from_pretrained(",
+    "automodelfor",
+    "autotokenizer",
+    "pipeline(",
+    "generate(",
+    "vllm",
+    "litellm",
+    "openai(",
+    "anthropic(",
+)
+_DATASET_EXECUTION_MARKERS = (
+    "load_dataset(",
+    "torchvision.datasets.",
+    "datasets.",
+    "read_csv(",
+    "read_json(",
+    "json.load(",
+)
+_EXPLICIT_SIMULATION_PATTERNS = (
+    (
+        "synthetic_data_generator",
+        re.compile(
+            r"\b(?:generate|generated|generating|use|using|with)\b"
+            r".{0,80}\bsynthetic\b.{0,40}"
+            r"\b(?:data|dataset|trajectory|trace|benchmark|example|sample|dgp)\b",
+            re.IGNORECASE | re.DOTALL,
+        ),
+    ),
+    (
+        "simulated_research_subject",
+        re.compile(
+            r"\b(?:simulat(?:e|ed|ing|ion)|mock(?:ed|ing)?)\b"
+            r".{0,80}\b(?:llm|language model|model inference|self[- ]?"
+            r"(?:refinement|improvement|training)|trajectory|trace|benchmark|"
+            r"dataset|correctness|"
+            r"calibration|accuracy|reward)\b",
+            re.IGNORECASE | re.DOTALL,
+        ),
+    ),
+    (
+        "synthetic_research_subject",
+        re.compile(
+            r"\bsynthetic\b.{0,100}\b(?:llm|language model|model|self[- ]?"
+            r"(?:refinement|improvement|training)|trajectory|trace|benchmark|"
+            r"dataset|data|dgp)\b",
+            re.IGNORECASE | re.DOTALL,
+        ),
+    ),
+    (
+        "synthetic_benchmark_generator",
+        re.compile(
+            r"\bmake_(?:moons|classification|blobs|regression|circles)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "substituted_production_experiment",
+        re.compile(
+            r"\b(?:in|for)\s+(?:a\s+)?(?:real|full|actual|production)\s+"
+            r"experiment\b.{0,160}\b(?:replace|replaced|swap|use|load|run)\b",
+            re.IGNORECASE | re.DOTALL,
+        ),
+    ),
+    (
+        "placeholder_or_proxy_experiment",
+        re.compile(
+            r"\b(?:placeholder|toy|proxy)\b.{0,60}"
+            r"\b(?:experiment|metric|dataset|trajectory|model|benchmark)\b",
+            re.IGNORECASE | re.DOTALL,
+        ),
+    ),
+    (
+        "random_scientific_outcomes",
+        re.compile(
+            r"\b(?:rng|random|np\.random|torch\.rand)\b.{0,180}"
+            r"\b(?:accuracy|correctness|calibration|ece|reward|score|"
+            r"regression|collapse|confidence|prediction)\b",
+            re.IGNORECASE | re.DOTALL,
+        ),
+    ),
+)
+
+
+def _normalize_contract_values(value: Any) -> list[str]:
+    """Extract searchable contract values without assuming one schema."""
+
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, dict):
+        values: list[str] = []
+        for key, item in value.items():
+            if str(key).strip():
+                values.append(str(key))
+            values.extend(_normalize_contract_values(item))
+        return values
+    if isinstance(value, (list, tuple, set)):
+        values = []
+        for item in value:
+            values.extend(_normalize_contract_values(item))
+        return values
+    return [str(value)]
+
+
+def _contract_markers(values: Any) -> list[str]:
+    """Return distinctive declared model/dataset markers for code search."""
+
+    markers: list[str] = []
+    seen: set[str] = set()
+    ignored = {
+        "development",
+        "held-out",
+        "held out",
+        "family",
+        "open",
+        "checkpoint",
+        "where",
+        "license",
+        "permits",
+        "class",
+        "model",
+        "dataset",
+        "benchmark",
+    }
+    for raw in _normalize_contract_values(values):
+        lowered = raw.casefold()
+        candidates = [lowered]
+        candidates.extend(
+            token
+            for token in re.findall(r"[a-z][a-z0-9.+_-]{2,}", lowered)
+            if token not in ignored and len(token) >= 4
+        )
+        for candidate in candidates:
+            normalized = candidate.strip(" /,;:()[]{}")
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            markers.append(normalized)
+    return markers
+
+
+def _load_scientific_contract(
+    run_dir: Path,
+    config: RCConfig,
+) -> dict[str, Any]:
+    """Load the authoritative selected topic, with Stage-9 as fallback."""
+
+    selected = _safe_json_loads(
+        _read_prior_artifact(run_dir, "selected_topic.json") or "{}",
+        {},
+    )
+    if not isinstance(selected, dict):
+        selected = {}
+    try:
+        import yaml
+
+        plan = yaml.safe_load(
+            _read_prior_artifact(run_dir, "exp_plan.yaml") or ""
+        )
+    except Exception:  # noqa: BLE001
+        plan = None
+    if not isinstance(plan, dict):
+        plan = {}
+    embedded = plan.get("selected_topic_contract")
+    if isinstance(embedded, dict):
+        for key, value in embedded.items():
+            selected.setdefault(key, value)
+    for key in (
+        "title",
+        "research_question",
+        "falsifiable_hypothesis",
+        "datasets",
+        "models",
+        "primary_metric",
+        "cheap_pilot",
+    ):
+        if selected.get(key) in (None, "", [], {}):
+            value = plan.get(key)
+            if value not in (None, "", [], {}):
+                selected[key] = value
+    selected.setdefault("title", config.research.topic)
+    return selected
+
+
+def _assess_scientific_code_alignment(
+    files: dict[str, str],
+    selected_topic: dict[str, Any],
+    fallback_topic: str,
+) -> dict[str, Any]:
+    """Detect code that replaces the declared experiment with a simulation.
+
+    Random seeds and Monte Carlo procedures are not rejected by themselves.
+    The fail-closed decision requires explicit replacement/simulation language
+    or random generation of scientific outcomes, plus missing evidence that the
+    declared model/dataset is actually loaded or executed.
+    """
+
+    code_files = {
+        name: code
+        for name, code in files.items()
+        if name.endswith(".py")
+    }
+    combined = "\n\n".join(
+        f"# --- {name} ---\n{code}"
+        for name, code in sorted(code_files.items())
+    )
+    lowered = combined.casefold()
+    authoritative = bool(str(selected_topic.get("id", "") or "").strip())
+    declared_models = _contract_markers(selected_topic.get("models"))
+    declared_datasets = _contract_markers(selected_topic.get("datasets"))
+    contract_text = " ".join(
+        _normalize_contract_values(
+            {
+                "title": selected_topic.get("title", fallback_topic),
+                "research_question": selected_topic.get("research_question"),
+                "hypothesis": selected_topic.get("falsifiable_hypothesis"),
+                "models": selected_topic.get("models"),
+                "datasets": selected_topic.get("datasets"),
+                "cheap_pilot": selected_topic.get("cheap_pilot"),
+            }
+        )
+    ).casefold()
+    requires_model = bool(
+        declared_models
+        or any(marker in contract_text for marker in _GENERIC_MODEL_MARKERS)
+    )
+    requires_dataset = bool(
+        declared_datasets
+        or any(marker in contract_text for marker in _GENERIC_DATASET_MARKERS)
+    )
+    requires_llm_subject = any(
+        marker in contract_text for marker in _LLM_SUBJECT_MARKERS
+    )
+    requires_named_benchmark = any(
+        marker in contract_text for marker in _NAMED_BENCHMARK_MARKERS
+    )
+
+    model_markers_found = sorted(
+        marker for marker in declared_models if marker in lowered
+    )
+    dataset_markers_found = sorted(
+        marker for marker in declared_datasets if marker in lowered
+    )
+    model_execution_markers = sorted(
+        marker for marker in _MODEL_EXECUTION_MARKERS if marker in lowered
+    )
+    dataset_execution_markers = sorted(
+        marker for marker in _DATASET_EXECUTION_MARKERS if marker in lowered
+    )
+    generic_model_subject_found = any(
+        marker in lowered for marker in _GENERIC_MODEL_MARKERS
+    )
+    generic_dataset_subject_found = any(
+        marker in lowered for marker in _GENERIC_DATASET_MARKERS
+    )
+    simulation_hits = [
+        {
+            "kind": kind,
+            "match": " ".join(match.group(0).split())[:240],
+        }
+        for kind, pattern in _EXPLICIT_SIMULATION_PATTERNS
+        if (match := pattern.search(combined)) is not None
+    ]
+    fallback_source = bool(
+        "fallback experiment: parameter sweep on a synthetic objective"
+        in lowered
+    )
+    missing_model_execution = bool(
+        authoritative
+        and requires_model
+        and not (
+            model_execution_markers
+            and (model_markers_found or generic_model_subject_found)
+        )
+    )
+    missing_dataset_execution = bool(
+        authoritative
+        and requires_dataset
+        and not (
+            dataset_execution_markers
+            and (dataset_markers_found or generic_dataset_subject_found)
+        )
+    )
+
+    reasons: list[str] = []
+    if fallback_source:
+        reasons.append(
+            "generic synthetic fallback code was generated instead of the "
+            "authoritative experiment"
+        )
+    if authoritative and simulation_hits and (
+        missing_model_execution or missing_dataset_execution
+    ):
+        reasons.append(
+            "generated code explicitly simulates or proxies the scientific "
+            "subject while omitting executable paths for declared real "
+            "models or datasets"
+        )
+    if authoritative and requires_llm_subject and missing_model_execution:
+        reasons.append(
+            "authoritative LLM experiment declares a real checkpoint/API but "
+            "generated code has no executable model loading or inference path"
+        )
+    if (
+        authoritative
+        and requires_named_benchmark
+        and missing_dataset_execution
+    ):
+        reasons.append(
+            "authoritative experiment declares a named real benchmark but "
+            "generated code has no executable benchmark loading path"
+        )
+
+    return {
+        "aligned": not reasons,
+        "authoritative_contract": authoritative,
+        "selected_topic_id": str(selected_topic.get("id", "") or ""),
+        "selected_topic_title": str(
+            selected_topic.get("title", fallback_topic) or fallback_topic
+        ),
+        "requires_real_model": requires_model,
+        "requires_real_dataset": requires_dataset,
+        "requires_llm_subject": requires_llm_subject,
+        "requires_named_benchmark": requires_named_benchmark,
+        "declared_model_markers": declared_models,
+        "declared_dataset_markers": declared_datasets,
+        "model_markers_found": model_markers_found,
+        "dataset_markers_found": dataset_markers_found,
+        "model_execution_markers": model_execution_markers,
+        "dataset_execution_markers": dataset_execution_markers,
+        "generic_model_subject_found": generic_model_subject_found,
+        "generic_dataset_subject_found": generic_dataset_subject_found,
+        "missing_model_execution": missing_model_execution,
+        "missing_dataset_execution": missing_dataset_execution,
+        "simulation_hits": simulation_hits,
+        "generic_fallback_source": fallback_source,
+        "reasons": reasons,
+        "checked_files": sorted(code_files),
+        "generated_at": _utcnow_iso(),
+    }
+
+
+def _scientific_code_alignment_result(
+    stage_dir: Path,
+    report: dict[str, Any],
+) -> StageResult | None:
+    """Persist the Stage-10 scientific code gate and fail closed on drift."""
+
+    report_path = stage_dir / "scientific_code_alignment.json"
+    report_path.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    if report.get("aligned", False):
+        return None
+    logger.error(
+        "Stage 10 BLOCKED: generated code is not an authentic implementation "
+        "of selected topic %r: %s",
+        report.get("selected_topic_title"),
+        "; ".join(str(reason) for reason in report.get("reasons", ())),
+    )
+    return StageResult(
+        stage=Stage.CODE_GENERATION,
+        status=StageStatus.PAUSED,
+        artifacts=("experiment/", "scientific_code_alignment.json"),
+        error=(
+            "Generated code substitutes synthetic/simulated evidence for the "
+            "authoritative selected-topic experiment"
+        ),
+        decision="scientific_code_misalignment",
+        evidence_refs=("stage-10/scientific_code_alignment.json",),
+    )
 
 
 def _execute_collider_plan_generation(
@@ -1520,6 +1943,16 @@ def _execute_code_generation(
             logger.debug("Ablation validation skipped: %s", exc)
 
     # --- Write spec ---
+    scientific_report = _assess_scientific_code_alignment(
+        files,
+        _load_scientific_contract(run_dir, config),
+        config.research.topic,
+    )
+    scientific_gate = _scientific_code_alignment_result(
+        stage_dir,
+        scientific_report,
+    )
+
     file_list = ", ".join(f"`{f}`" for f in sorted(files.keys()))
     main_validation = validate_code(files.get("main.py", ""))
     _align_status = "ALIGNED" if alignment_ok else f"MISALIGNED: {alignment_note}"
@@ -1552,9 +1985,23 @@ Multi-file experiment project with {len(files)} file(s): {file_list}
 """
     (stage_dir / "experiment_spec.md").write_text(spec, encoding="utf-8")
 
-    artifacts = ["experiment/", "experiment_spec.md"]
+    artifacts = [
+        "experiment/",
+        "experiment_spec.md",
+        "scientific_code_alignment.json",
+    ]
     if (stage_dir / "validation_report.md").exists():
         artifacts.append("validation_report.md")
+
+    if scientific_gate is not None:
+        return StageResult(
+            stage=scientific_gate.stage,
+            status=scientific_gate.status,
+            artifacts=tuple(artifacts),
+            error=scientific_gate.error,
+            decision=scientific_gate.decision,
+            evidence_refs=scientific_gate.evidence_refs,
+        )
 
     # BUG-R6-01: Fail stage if alignment check detected persistent mismatch
     # after all regen attempts, instead of silently proceeding.

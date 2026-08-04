@@ -14,6 +14,7 @@ import yaml
 class PoolConfigSummary:
     config_path: Path
     expected_total_gpus: int
+    max_gpus_per_node: int
 
     @classmethod
     def from_file(cls, path: str | Path) -> PoolConfigSummary:
@@ -26,14 +27,19 @@ class PoolConfigSummary:
             raw = value["clusterbridge_pool"]
         elif isinstance(value.get("cluster_pool"), Mapping):
             raw = value["cluster_pool"]
+        nodes = raw.get("nodes", ())
+        if not isinstance(nodes, list):
+            raise TypeError("pool nodes must be a list")
+        node_gpu_counts = [
+            len(node.get("gpu_ids", ()))
+            for node in nodes
+            if isinstance(node, Mapping)
+        ]
         expected = raw.get("expected_total_gpus")
         if expected is None:
-            nodes = raw.get("nodes", ())
-            if not isinstance(nodes, list):
-                raise TypeError("pool nodes must be a list")
-            expected = sum(
-                len(node.get("gpu_ids", ()))
-                for node in nodes
-                if isinstance(node, Mapping)
-            )
-        return cls(config_path=config_path, expected_total_gpus=int(expected))
+            expected = sum(node_gpu_counts)
+        return cls(
+            config_path=config_path,
+            expected_total_gpus=int(expected),
+            max_gpus_per_node=max(node_gpu_counts, default=int(expected)),
+        )

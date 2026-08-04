@@ -438,6 +438,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     done = sum(1 for r in results if r.status.value == "done")
     paused = sum(1 for r in results if r.status.value == "paused")
+    blocked = sum(
+        1 for r in results if r.status.value == "blocked_approval"
+    )
+    rejected = sum(1 for r in results if r.status.value == "rejected")
     failed = sum(1 for r in results if r.status.value == "failed")
 
     # --- Complete HITL session ---
@@ -456,7 +460,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
     else:
         print(f"\nPipeline complete: {done}/{len(results)} stages done, {failed} failed")
-    return 0 if failed == 0 else 1
+    # A pipeline subprocess is successful only when its terminal stage is
+    # actually DONE. PAUSED/BLOCKED/REJECTED are workflow outcomes, not a
+    # successfully completed Factory Work Item.
+    terminal_ok = bool(results) and results[-1].status.value == "done"
+    return 0 if terminal_ok and not (failed or paused or blocked or rejected) else 1
 
 
 def cmd_validate(args: argparse.Namespace) -> int:

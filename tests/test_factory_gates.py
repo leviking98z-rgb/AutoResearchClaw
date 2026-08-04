@@ -106,3 +106,25 @@ def test_valid_pilot_promotes_and_valid_null_completes_negative(
         ledger=BudgetLedger(validating.idea_id),
     )
     assert null.decision is GateAction.COMPLETE_NEGATIVE
+
+
+def test_incomplete_build_retries_same_profile_not_stage13(
+    tmp_path: Path,
+) -> None:
+    config = FactoryConfig.from_mapping({"factory": {}})
+    gate = EvidenceGate(config)
+    idea = _idea(IdeaStatus.BUILDING, BudgetTier.SMOKE)
+    (tmp_path / "checkpoint.json").write_text(
+        json.dumps({"last_completed_stage": 9}),
+        encoding="utf-8",
+    )
+
+    decision = gate.evaluate(
+        idea,
+        run_dir=tmp_path,
+        ledger=BudgetLedger(idea.idea_id),
+    )
+
+    assert decision.decision is GateAction.REPAIR
+    assert decision.next_status is IdeaStatus.BUILDING
+    assert decision.reason_code == "PIPELINE_PROFILE_INCOMPLETE"

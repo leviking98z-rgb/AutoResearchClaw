@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from researchclaw.config import RCConfig, RoleConfig
+from researchclaw.factory.io import append_jsonl
 from researchclaw.llm.client import LLMResponse
 from researchclaw.pipeline.stages import Stage
 
@@ -432,13 +433,13 @@ class RoleLLMClient:
         if self.audit_path is None:
             return
         try:
-            self.audit_path.parent.mkdir(parents=True, exist_ok=True)
-            line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
-            with self._audit_lock, self.audit_path.open(
-                "a", encoding="utf-8"
-            ) as handle:
-                handle.write(line)
-        except Exception:  # noqa: BLE001
+            with self._audit_lock:
+                append_jsonl(
+                    self.audit_path,
+                    record,
+                    durable=True,
+                )
+        except Exception:
             logger.warning(
                 "Could not write role LLM audit log: %s",
                 self.audit_path,

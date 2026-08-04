@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .budgets import BudgetLedger
-from .io import atomic_write_json
+from .io import append_jsonl, atomic_write_json
 from .models import (
     Idea,
     IdeaStatus,
@@ -42,8 +42,9 @@ class FactoryStore:
         self.ideas_dir = self.root / "ideas"
         self.shared_cache_dir = self.root / "shared-cache"
         self.control_dir = self.root / "control"
+        self.writer_lock_path = self.root / "factory.lock"
         self._lock = threading.RLock()
-        self._event_lock = threading.Lock()
+        self._writer_lock_stream: Any | None = None
 
     def initialize(self) -> None:
         for directory in (
@@ -81,6 +82,51 @@ class FactoryStore:
         if not self.leases_path.exists():
             atomic_write_json(self.leases_path, [])
 
+    def acquire_writer_lock(self) -> None:
+        """Acquire the process-level single-writer lock for the orchestrator."""
+
+        if self._writer_lock_stream is not None:
+            return
+        import fcntl
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        stream = self.writer_lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            stream.close()
+            raise RuntimeError(
+                f"another Factory writer holds {self.writer_lock_path}"
+            ) from None
+        stream.seek(0)
+        stream.truncate()
+        stream.write(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "factory_id": self.factory_id,
+                    "acquired_at": utc_now(),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        stream.flush()
+        os.fsync(stream.fileno())
+        self._writer_lock_stream = stream
+
+    def release_writer_lock(self) -> None:
+        stream = self._writer_lock_stream
+        if stream is None:
+            return
+        import fcntl
+
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            stream.close()
+            self._writer_lock_stream = None
+
     @staticmethod
     def _read_json(path: Path, default: Any) -> Any:
         try:
@@ -107,14 +153,7 @@ class FactoryStore:
             "factory_id": self.factory_id,
             **payload,
         }
-        line = json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n"
-        with self._event_lock, self.events_path.open(
-            "a", encoding="utf-8"
-        ) as stream:
-            stream.write(line)
-            stream.flush()
-            os.fsync(stream.fileno())
-        return value
+        return append_jsonl(self.events_path, value)
 
     def idea_dir(self, idea_id: str) -> Path:
         return self.ideas_dir / idea_id
@@ -136,12 +175,7 @@ class FactoryStore:
         }
         path = self.idea_dir(idea_id) / "events.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n"
-        with self._event_lock, path.open("a", encoding="utf-8") as stream:
-            stream.write(line)
-            stream.flush()
-            os.fsync(stream.fileno())
-        return value
+        return append_jsonl(path, value)
 
     def _idea_path(self, idea_id: str) -> Path:
         return self.idea_dir(idea_id) / "idea.json"
@@ -215,14 +249,21 @@ class FactoryStore:
     def add_candidates(self, ideas: Iterable[Idea]) -> list[Idea]:
         with self._lock:
             current = self.load_reservoir()
+            persisted = self.list_ideas()
             known_ids = {idea.idea_id for idea in current}
+            known_ids.update(idea.idea_id for idea in persisted)
             known_titles = {idea.normalized_title for idea in current}
             known_titles.update(
-                idea.normalized_title for idea in self.list_ideas()
+                idea.normalized_title for idea in persisted
             )
             added: list[Idea] = []
+            duplicates: list[tuple[Idea, str]] = []
             for idea in ideas:
-                if idea.idea_id in known_ids or idea.normalized_title in known_titles:
+                if idea.idea_id in known_ids:
+                    duplicates.append((idea, "duplicate_id"))
+                    continue
+                if idea.normalized_title in known_titles:
+                    duplicates.append((idea, "duplicate_title"))
                     continue
                 if idea.status is not IdeaStatus.CANDIDATE:
                     raise ValueError("reservoir only accepts CANDIDATE Ideas")
@@ -237,6 +278,13 @@ class FactoryStore:
                     "candidate_added",
                     idea_id=idea.idea_id,
                     priority=idea.priority,
+                )
+            for idea, reason in duplicates:
+                self.event(
+                    "candidate_deduplicated",
+                    idea_id=idea.idea_id,
+                    title=idea.title,
+                    reason_code=reason,
                 )
             return added
 
@@ -283,6 +331,7 @@ class FactoryStore:
         item: WorkItem,
         *,
         event_type: str = "work_item_saved",
+        event_payload: Mapping[str, Any] | None = None,
     ) -> WorkItem:
         with self._lock:
             items = {
@@ -300,24 +349,25 @@ class FactoryStore:
                     )
                 ],
             )
-            self.event(
-                event_type,
-                idea_id=item.idea_id,
-                item_id=item.item_id,
-                status=item.status.value,
-                attempt=item.attempt,
-            )
-            self.idea_event(
-                item.idea_id,
-                event_type,
-                item_id=item.item_id,
-                kind=item.kind.value,
-                profile=item.profile,
-                status=item.status.value,
-                attempt=item.attempt,
-                resources=asdict(item.resources),
-                result=item.result,
-            )
+            global_payload = {
+                "idea_id": item.idea_id,
+                "item_id": item.item_id,
+                "status": item.status.value,
+                "attempt": item.attempt,
+            }
+            global_payload.update(event_payload or {})
+            self.event(event_type, **global_payload)
+            local_payload = {
+                "item_id": item.item_id,
+                "kind": item.kind.value,
+                "profile": item.profile,
+                "status": item.status.value,
+                "attempt": item.attempt,
+                "resources": asdict(item.resources),
+                "result": item.result,
+            }
+            local_payload.update(event_payload or {})
+            self.idea_event(item.idea_id, event_type, **local_payload)
         return item
 
     def get_work_item(self, item_id: str) -> WorkItem | None:
@@ -338,6 +388,7 @@ class FactoryStore:
             if item.status not in {
                 WorkItemStatus.PENDING,
                 WorkItemStatus.READY,
+                WorkItemStatus.QUEUED,
                 WorkItemStatus.RETRY_WAIT,
             }:
                 continue

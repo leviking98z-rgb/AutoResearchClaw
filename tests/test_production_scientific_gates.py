@@ -14,6 +14,9 @@ from researchclaw.pipeline.stage_impls._experiment_design import (
     _execute_experiment_design,
     _selected_topic_prompt_contract,
 )
+from researchclaw.pipeline.stage_impls._code_generation import (
+    _assess_scientific_code_alignment,
+)
 from researchclaw.pipeline.stage_impls._paper_writing import (
     _collect_raw_experiment_metrics,
     _execute_paper_draft,
@@ -35,6 +38,18 @@ class _FakeLLM:
     ) -> LLMResponse:
         self.calls.append(messages)
         return LLMResponse(content=self.content, model="fake")
+
+
+class _RetryLLM(_FakeLLM):
+    def __init__(self, first: str, second: str) -> None:
+        super().__init__(first)
+        self._responses = iter((first, second))
+
+    def chat(
+        self, messages: list[dict[str, str]], **_: object
+    ) -> LLMResponse:
+        self.calls.append(messages)
+        return LLMResponse(content=next(self._responses), model="fake")
 
 
 def _config(
@@ -238,6 +253,144 @@ def test_stage9_rejects_rsi_plan_that_drifts_to_vision_domain_adaptation(
     )
 
 
+def test_stage9_rejects_raw_squad_bert_top1_replacement_before_anchoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-09"
+    stage_dir.mkdir(parents=True)
+    _write_selected_topic(run_dir)
+    (run_dir / "stage-08").mkdir()
+    (run_dir / "stage-08" / "hypotheses.md").write_text(
+        "# Hypothesis\nCalibration-aware acceptance reduces LLM regressions.",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "researchclaw.domains.detector.detect_domain",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("not needed")),
+    )
+    llm = _FakeLLM(
+        yaml.safe_dump(
+            {
+                "research_question": (
+                    "Does fine-tuning BERT improve SQuAD question answering?"
+                ),
+                "falsifiable_hypothesis": (
+                    "BERT fine-tuning increases top-1 answer accuracy on SQuAD."
+                ),
+                "primary_metric": "top-1 accuracy",
+                "objectives": ["Improve extractive question answering"],
+                "datasets": ["SQuAD"],
+                "models": ["BERT-base"],
+                "baselines": ["frozen BERT encoder"],
+                "proposed_methods": ["end-to-end BERT fine-tuning"],
+                "ablations": ["without span loss"],
+                "metrics": ["top-1 accuracy"],
+                "risks": ["answer-span leakage"],
+                "compute_budget": {"max_gpu": 1, "max_hours": 1},
+            }
+        )
+    )
+
+    result = _execute_experiment_design(
+        stage_dir,
+        run_dir,
+        _config(
+            tmp_path,
+            topic="Calibration-Aware Acceptance Gates for LLM Self-Improvement",
+        ),
+        AdapterBundle(),
+        llm=llm,
+    )
+
+    assert result.status == StageStatus.PAUSED
+    assert result.decision == "semantic_misalignment"
+    assert not (stage_dir / "exp_plan.yaml").exists()
+    report = json.loads(
+        (stage_dir / "semantic_alignment.json").read_text(encoding="utf-8")
+    )
+    assert report["phase"] == "pre_benchmark"
+    assert report["raw_plan_check"] is True
+    assert set(report["explicit_drift_fields"]) == {
+        "research_question",
+        "falsifiable_hypothesis",
+        "primary_metric",
+        "datasets",
+        "models",
+    }
+
+
+def test_stage9_accepts_compatible_raw_contract_enrichments(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-09"
+    stage_dir.mkdir(parents=True)
+    selected = _selected_topic()
+    _write_selected_topic(run_dir)
+    (run_dir / "stage-08").mkdir()
+    (run_dir / "stage-08" / "hypotheses.md").write_text(
+        "# Hypothesis\nCalibration-aware acceptance reduces LLM regressions.",
+        encoding="utf-8",
+    )
+    llm = _FakeLLM(
+        yaml.safe_dump(
+            {
+                "research_question": (
+                    f"{selected['research_question']} Analyze three random "
+                    "seeds and stratify results by benchmark."
+                ),
+                "falsifiable_hypothesis": (
+                    f"{selected['falsifiable_hypothesis']} The effect should "
+                    "also survive a rollback-policy ablation."
+                ),
+                "primary_metric": (
+                    f"{selected['primary_metric']}, reported with bootstrap "
+                    "confidence intervals"
+                ),
+                "objectives": [
+                    "Measure accepted regressions across recursive LLM updates"
+                ],
+                "datasets": ["GSM8K held-out split", "MBPP test split"],
+                "models": [
+                    "API-backed LLM agent with deterministic decoding controls"
+                ],
+                "baselines": selected["baselines"],
+                "proposed_methods": [
+                    "calibration-aware acceptance and rollback gate"
+                ],
+                "ablations": selected["ablations"],
+                "metrics": [
+                    selected["primary_metric"],
+                    "accepted-regression rate",
+                ],
+                "risks": ["benchmark leakage"],
+                "compute_budget": {"max_gpu": 1, "max_hours": 1},
+            }
+        )
+    )
+
+    result = _execute_experiment_design(
+        stage_dir,
+        run_dir,
+        _config(
+            tmp_path,
+            topic="Calibration-Aware Acceptance Gates for LLM Self-Improvement",
+        ),
+        AdapterBundle(),
+        llm=llm,
+    )
+
+    assert result.status == StageStatus.DONE
+    report = json.loads(
+        (
+            stage_dir / "semantic_alignment_pre_benchmark.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert report["aligned"] is True
+    assert report["explicit_drift_fields"] == []
+
+
 def test_stage9_accepts_generic_topic_plan_without_rsi_special_case(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -311,6 +464,53 @@ def test_stage9_rsi_prompt_uses_selected_datasets_not_cifar_tier(
     assert "MANDATORY SELECTED-TOPIC CONTRACT" in prompt
     assert "GSM8K, MATH, MBPP, HumanEval" in prompt
     assert "CIFAR-10, CIFAR-100, MNIST" not in prompt
+
+
+def test_stage9_strict_retry_accepts_selected_contract_fields_when_raw_yaml_fails(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-09"
+    stage_dir.mkdir(parents=True)
+    _write_selected_topic(run_dir)
+    (run_dir / "stage-08").mkdir()
+    (run_dir / "stage-08" / "hypotheses.md").write_text(
+        "# Hypothesis\nCalibration-aware acceptance reduces LLM regressions.",
+        encoding="utf-8",
+    )
+    llm = _RetryLLM(
+        "```yaml\ninvalid: [unterminated",
+        yaml.safe_dump(
+            {
+                "objectives": [
+                    "Measure regression across recursive LLM-agent updates"
+                ],
+                "proposed_methods": [
+                    "calibration-aware acceptance and rollback gate"
+                ],
+                "risks": ["benchmark leakage"],
+            }
+        ),
+    )
+
+    result = _execute_experiment_design(
+        stage_dir,
+        run_dir,
+        _config(
+            tmp_path,
+            topic="Calibration-Aware Acceptance Gates for LLM Self-Improvement",
+        ),
+        AdapterBundle(),
+        llm=llm,
+    )
+
+    assert result.status == StageStatus.DONE
+    plan = yaml.safe_load(
+        (stage_dir / "exp_plan.yaml").read_text(encoding="utf-8")
+    )
+    assert plan["datasets"] == _selected_topic()["datasets"]
+    assert plan["models"] == _selected_topic()["models"]
+    assert plan["baselines"][:2] == _selected_topic()["baselines"]
 
 
 def test_stage9_skips_benchmark_agent_for_authoritative_benchmarks(
@@ -515,6 +715,177 @@ def test_selected_topic_prompt_contract_includes_authoritative_fields() -> None:
     assert "GSM8K" in prompt
     assert "cheap_pilot" in prompt
     assert "pivot_policy" in prompt
+
+
+def test_stage10_scientific_gate_rejects_simulated_llm_trajectory_proxy() -> None:
+    selected = _selected_topic()
+    files = {
+        "main.py": """
+\"\"\"Synthetic trajectory study.
+In a production experiment this would be replaced with actual LLM inference
+on Qwen2.5-7B-Instruct and GSM8K/MBPP.
+\"\"\"
+from models import generate_synthetic_trajectories
+
+def main():
+    rows = generate_synthetic_trajectories()
+    print(f"calibration_error: {rows[0]['ece']}")
+
+if __name__ == "__main__":
+    main()
+""",
+        "models.py": """
+import numpy as np
+
+def generate_synthetic_trajectories():
+    rng = np.random.RandomState(42)
+    return [{"correctness": int(rng.rand() > 0.5), "ece": rng.rand()}]
+""",
+    }
+
+    report = _assess_scientific_code_alignment(
+        files,
+        selected,
+        str(selected["title"]),
+    )
+
+    assert report["aligned"] is False
+    assert report["missing_model_execution"] is True
+    assert report["missing_dataset_execution"] is True
+    assert report["simulation_hits"]
+
+
+def test_stage10_scientific_gate_rejects_synthetic_mlp_self_training_proxy() -> None:
+    selected = _selected_topic()
+    files = {
+        "main.py": """
+\"\"\"Calibration gate on a synthetic self-training loop with a small MLP.
+The model is retrained on its own predictions, simulating self-improvement.
+\"\"\"
+from sklearn.datasets import make_moons
+import torch.nn as nn
+
+class MLP(nn.Module):
+    pass
+
+def generate_dataset(seed):
+    return make_moons(n_samples=1200, noise=0.3, random_state=seed)
+
+if __name__ == "__main__":
+    print(generate_dataset(0))
+""",
+    }
+
+    report = _assess_scientific_code_alignment(
+        files,
+        selected,
+        str(selected["title"]),
+    )
+
+    assert report["aligned"] is False
+    assert report["requires_llm_subject"] is True
+    assert report["requires_named_benchmark"] is True
+    assert report["missing_model_execution"] is True
+    assert report["missing_dataset_execution"] is True
+    assert {
+        hit["kind"] for hit in report["simulation_hits"]
+    } >= {
+        "synthetic_research_subject",
+        "synthetic_benchmark_generator",
+    }
+
+
+def test_stage10_scientific_gate_accepts_real_model_and_benchmark_paths() -> None:
+    selected = _selected_topic()
+    files = {
+        "main.py": """
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+def main():
+    gsm8k = load_dataset("openai/gsm8k", "main", split="test")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+    model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen2.5-7B-Instruct"
+    )
+    batch = tokenizer(gsm8k[0]["question"], return_tensors="pt")
+    generated = model.generate(**batch, max_new_tokens=32)
+    print("held_out_accuracy: 0.0")
+
+if __name__ == "__main__":
+    main()
+""",
+    }
+
+    report = _assess_scientific_code_alignment(
+        files,
+        selected,
+        str(selected["title"]),
+    )
+
+    assert report["aligned"] is True
+    assert report["missing_model_execution"] is False
+    assert report["missing_dataset_execution"] is False
+
+
+def test_stage10_scientific_gate_does_not_treat_generic_open_as_dataset_load() -> None:
+    selected = _selected_topic()
+    files = {
+        "main.py": """
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+def main():
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+    model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen2.5-7B-Instruct"
+    )
+    with open("notes.txt", "w", encoding="utf-8") as stream:
+        stream.write("simulate the benchmark in a production experiment")
+    generated = model.generate(
+        **tokenizer("question", return_tensors="pt"),
+        max_new_tokens=8,
+    )
+    print(generated)
+""",
+    }
+
+    report = _assess_scientific_code_alignment(
+        files,
+        selected,
+        str(selected["title"]),
+    )
+
+    assert report["aligned"] is False
+    assert report["missing_model_execution"] is False
+    assert report["missing_dataset_execution"] is True
+    assert "open(" not in report["dataset_execution_markers"]
+
+
+def test_stage10_scientific_gate_does_not_ban_random_seeds_alone() -> None:
+    files = {
+        "main.py": """
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+def main():
+    rng = np.random.RandomState(7)
+    values = rng.normal(size=100)
+    train, test = train_test_split(values, random_state=7)
+    print(f"mean_shift: {float(test.mean() - train.mean())}")
+
+if __name__ == "__main__":
+    main()
+""",
+    }
+
+    report = _assess_scientific_code_alignment(
+        files,
+        {},
+        "Monte Carlo estimator variance",
+    )
+
+    assert report["aligned"] is True
+    assert report["authoritative_contract"] is False
 
 
 def test_raw_metric_collection_rejects_failed_placeholder_metrics(

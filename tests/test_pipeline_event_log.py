@@ -27,6 +27,25 @@ def test_pipeline_event_log_is_append_only_jsonl(tmp_path: Path) -> None:
     assert all("timestamp" in row for row in rows)
 
 
+def test_pipeline_event_log_redacts_credentials(tmp_path: Path) -> None:
+    log = EventLog(tmp_path)
+    log.append(
+        create_event(
+            EventType.STAGE_FAIL,
+            run_id="r1",
+            stage="LITERATURE_COLLECT",
+            api_key="secret",
+            request={"authorization": "Bearer secret"},
+        )
+    )
+
+    row = json.loads(
+        (tmp_path / "pipeline_events.jsonl").read_text(encoding="utf-8")
+    )
+    assert row["api_key"] == "[REDACTED]"
+    assert row["request"]["authorization"] == "[REDACTED]"
+
+
 def test_observability_summary_aggregates_pipeline_and_role_audits(
     tmp_path: Path,
 ) -> None:

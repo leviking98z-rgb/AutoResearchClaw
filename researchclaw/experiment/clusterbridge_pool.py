@@ -37,6 +37,7 @@ from researchclaw.cluster import (
     KeepaliveSnapshot,
     LeaseKeepalive,
 )
+from researchclaw.factory.io import append_jsonl
 
 _REMOTE_RESULT_PREFIX = "__RESEARCHCLAW_POOL_RESULT__="
 
@@ -774,6 +775,8 @@ class ClusterBridgePool:
         task_id: str | None = None,
         require_ready: bool = True,
         poll_interval_sec: float = 2.0,
+        num_gpus: int = 0,
+        num_cpus: int = 1,
     ) -> PoolTaskResult:
         """Backward-compatible blocking wrapper over the asynchronous API."""
         if poll_interval_sec <= 0:
@@ -784,6 +787,8 @@ class ClusterBridgePool:
             env=env,
             task_id=task_id,
             require_ready=require_ready,
+            num_gpus=num_gpus,
+            num_cpus=num_cpus,
         )
         while True:
             probe = self.probe_task(handle.task_id)
@@ -811,6 +816,8 @@ class ClusterBridgePool:
         env: Mapping[str, str] | None = None,
         task_id: str | None = None,
         require_ready: bool = True,
+        num_gpus: int = 0,
+        num_cpus: int = 1,
     ) -> PoolTaskHandle:
         """Submit or idempotently adopt one detached task.
 
@@ -823,6 +830,8 @@ class ClusterBridgePool:
             raise PoolNotReadyError("pool must be prepared before running a task")
         if timeout_sec <= 0:
             raise ValueError("timeout_sec must be positive")
+        if num_gpus < 0 or num_cpus < 0:
+            raise ValueError("Ray resource requests cannot be negative")
         self.assert_lease_healthy()
 
         task_id = task_id or f"task-{uuid.uuid4().hex[:12]}"
@@ -857,6 +866,8 @@ class ClusterBridgePool:
             "command": command,
             "timeout_sec": float(timeout_sec),
             "env": dict(sorted(env_values.items())),
+            "num_gpus": int(num_gpus),
+            "num_cpus": int(num_cpus),
         }
         fingerprint = _request_fingerprint(request)
         request["fingerprint"] = fingerprint
@@ -875,6 +886,8 @@ class ClusterBridgePool:
                             "command",
                             "timeout_sec",
                             "env",
+                            "num_gpus",
+                            "num_cpus",
                         )
                     }
                 )
@@ -908,10 +921,46 @@ class ClusterBridgePool:
             f"{key}={shlex.quote(value)}"
             for key, value in sorted(env_values.items())
         )
+        payload_path = task_dir / "ray_task.json"
+        task_script = task_dir / "ray_task.py"
+        ray_wrapper = (
+            "import json, os, subprocess, sys\n"
+            "import ray\n"
+            "payload=json.load(open(sys.argv[1], encoding='utf-8'))\n"
+            "ray.init(address=os.environ.get('RAY_ADDRESS', 'auto'))\n"
+            "@ray.remote(num_gpus=payload['num_gpus'], "
+            "num_cpus=payload['num_cpus'])\n"
+            "def run(command, env):\n"
+            "    child_env=os.environ.copy(); child_env.update(env)\n"
+            "    return subprocess.run(command, shell=True, executable='/bin/bash', "
+            "env=child_env).returncode\n"
+            "sys.exit(int(ray.get(run.remote(payload['command'], "
+            "payload['env']))))\n"
+        )
+        if num_gpus or num_cpus != 1:
+            _atomic_json_write(
+                payload_path,
+                {
+                    "command": command,
+                    "env": dict(sorted(env_values.items())),
+                    "num_gpus": int(num_gpus),
+                    "num_cpus": int(num_cpus),
+                },
+            )
+            task_script.write_text(ray_wrapper, encoding="utf-8")
+            execution = (
+                f"{shlex.quote(self.config.ray.python)} "
+                f"{shlex.quote(str(task_script))} "
+                f"{shlex.quote(str(payload_path))}"
+            )
+            execution_env = ""
+        else:
+            execution = f"bash -lc {shlex.quote(command)}"
+            execution_env = f"env {env_text} "
         inner = (
             "set +e; "
             "trap '' HUP; "
-            f"env {env_text} bash -lc {shlex.quote(command)} "
+            f"{execution_env}{execution} "
             f"> {shlex.quote(str(stdout_path))} "
             f"2> {shlex.quote(str(stderr_path))}; "
             "rc=$?; "
@@ -944,6 +993,8 @@ class ClusterBridgePool:
             head=head.address,
             timeout_sec=timeout_sec,
             command=command,
+            num_gpus=num_gpus,
+            num_cpus=num_cpus,
         )
         launched = self.client.run_node(
             head,
@@ -1411,9 +1462,8 @@ class ClusterBridgePool:
             **payload,
         }
         path = self._state_dir / "events.jsonl"
-        line = json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n"
-        with self._event_lock, path.open("a", encoding="utf-8") as stream:
-            stream.write(line)
+        with self._event_lock:
+            append_jsonl(path, record)
 
     def _write_operation_log(
         self,
@@ -1493,6 +1543,8 @@ def _request_fingerprint(value: Mapping[str, Any]) -> str:
             "command",
             "timeout_sec",
             "env",
+            "num_gpus",
+            "num_cpus",
         )
     }
     text = json.dumps(

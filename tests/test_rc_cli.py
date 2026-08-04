@@ -146,7 +146,7 @@ def test_cmd_run_reports_paused_pipeline(
     )
     code = rc_cli.cmd_run(args)
     captured = capsys.readouterr()
-    assert code == 0
+    assert code == 1
     assert "Pipeline paused:" in captured.out
     assert "1 paused" in captured.out
 

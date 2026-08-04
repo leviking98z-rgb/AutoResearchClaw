@@ -8,13 +8,12 @@ scraping console text.
 
 from __future__ import annotations
 
-import json
-import os
-import threading
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from researchclaw.factory.io import append_jsonl
 
 
 class EventType(str, Enum):
@@ -37,15 +36,9 @@ class EventLog:
     def __init__(self, log_dir: Path, filename: str = "pipeline_events.jsonl") -> None:
         self.path = Path(log_dir) / filename
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
 
     def append(self, event: dict[str, Any]) -> dict[str, Any]:
-        line = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str) + "\n"
-        with self._lock, self.path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-            handle.flush()
-            os.fsync(handle.fileno())
-        return event
+        return append_jsonl(self.path, event, durable=True)
 
 
 def create_event(event_type: EventType | str, **payload: Any) -> dict[str, Any]:

@@ -578,6 +578,7 @@ STAGES: dict[str, dict[str, Any]] = {
             "plot and table.\n\n"
             "COMPUTE ENVIRONMENT (your experiments run on THIS exact machine):\n"
             "{hardware_profile}\n"
+            "{gpu_execution_guidance}\n"
             "- Single CPU is sufficient; no GPU is needed for HEP "
             "phenomenology parameter scans.\n"
             "- NO external Monte Carlo programs (MadGraph, PYTHIA, Delphes, "

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +106,78 @@ _VISION_DOMAIN_ADAPTATION_MARKERS = (
     "feature alignment",
     "dann",
     "coral",
+)
+_RAW_SEMANTIC_CONTRACT_FIELDS = (
+    "research_question",
+    "falsifiable_hypothesis",
+    "primary_metric",
+    "datasets",
+    "models",
+)
+_SEMANTIC_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "can",
+        "could",
+        "data",
+        "dataset",
+        "datasets",
+        "do",
+        "does",
+        "during",
+        "for",
+        "from",
+        "has",
+        "have",
+        "how",
+        "in",
+        "is",
+        "it",
+        "its",
+        "may",
+        "metric",
+        "model",
+        "models",
+        "of",
+        "on",
+        "or",
+        "our",
+        "relative",
+        "research",
+        "than",
+        "that",
+        "the",
+        "their",
+        "this",
+        "to",
+        "using",
+        "versus",
+        "via",
+        "we",
+        "whether",
+        "which",
+        "with",
+    }
+)
+_SEMANTIC_GENERIC_OVERLAP_TOKENS = frozenset(
+    {
+        "accuracy",
+        "average",
+        "error",
+        "loss",
+        "mean",
+        "performance",
+        "rate",
+        "result",
+        "score",
+    }
 )
 
 
@@ -370,6 +444,142 @@ def _flatten_semantic_text(value: Any) -> str:
     if isinstance(value, (list, tuple, set)):
         return " ".join(_flatten_semantic_text(item) for item in value)
     return str(value or "")
+
+
+def _semantic_tokens(value: Any) -> set[str]:
+    """Return stable content tokens for a selected-topic contract field."""
+
+    text = _flatten_semantic_text(value).casefold()
+    tokens: set[str] = set()
+    for raw_token in re.findall(r"[a-z0-9]+", text):
+        if len(raw_token) <= 1 or raw_token in _SEMANTIC_STOPWORDS:
+            continue
+        token = raw_token
+        if token.startswith("calibrat"):
+            token = "calibrat"
+        elif token.startswith("accept"):
+            token = "accept"
+        elif token.startswith("regress"):
+            token = "regress"
+        elif token.startswith("iterat"):
+            token = "iterat"
+        elif token.startswith("improv"):
+            token = "improv"
+        elif token.endswith("ies") and len(token) > 5:
+            token = f"{token[:-3]}y"
+        elif token.endswith("s") and len(token) > 4:
+            token = token[:-1]
+        tokens.add(token)
+    return tokens
+
+
+def _raw_contract_field_alignment(
+    raw_value: Any,
+    selected_value: Any,
+) -> dict[str, Any]:
+    """Assess one explicitly generated field against its authoritative value.
+
+    This intentionally uses a conservative lexical contradiction test rather
+    than requiring exact copies. Compatible enrichments can add detail or a
+    subset/superset of declared datasets/models, while unrelated replacements
+    have no meaningful selected-topic tokens in common.
+    """
+
+    raw_text = _flatten_semantic_text(raw_value).strip()
+    selected_text = _flatten_semantic_text(selected_value).strip()
+    raw_tokens = _semantic_tokens(raw_value)
+    selected_tokens = _semantic_tokens(selected_value)
+    shared_tokens = raw_tokens & selected_tokens
+    shared_specific_tokens = (
+        shared_tokens - _SEMANTIC_GENERIC_OVERLAP_TOKENS
+    )
+    raw_specific_tokens = raw_tokens - _SEMANTIC_GENERIC_OVERLAP_TOKENS
+    selected_specific_tokens = (
+        selected_tokens - _SEMANTIC_GENERIC_OVERLAP_TOKENS
+    )
+    comparable = bool(raw_text and selected_text and selected_tokens)
+    raw_lower = raw_text.casefold()
+    selected_lower = selected_text.casefold()
+    contains_authoritative_text = (
+        raw_lower in selected_lower or selected_lower in raw_lower
+    )
+    compatible = (
+        not comparable
+        or contains_authoritative_text
+        or bool(shared_specific_tokens)
+        or (
+            (not raw_specific_tokens or not selected_specific_tokens)
+            and bool(shared_tokens)
+        )
+    )
+    return {
+        "explicit": bool(raw_text),
+        "comparable": comparable,
+        "compatible": compatible,
+        "shared_tokens": sorted(shared_tokens),
+        "shared_specific_tokens": sorted(shared_specific_tokens),
+        "raw_tokens": sorted(raw_tokens),
+        "selected_tokens": sorted(selected_tokens),
+    }
+
+
+def _generated_plan_drift(
+    plan: dict[str, Any],
+    selected_topic: dict[str, Any],
+    fallback_topic: str,
+) -> dict[str, Any]:
+    """Detect raw Stage-9 drift without requiring a complete raw contract.
+
+    The LLM is allowed to omit fields that the authoritative selected-topic
+    contract will fill.  It is not allowed to explicitly replace declared
+    question, hypothesis, metric, datasets, or models with an unrelated task.
+    """
+
+    validation_plan = {
+        **plan,
+        "topic": selected_topic.get("title", fallback_topic),
+        "title": selected_topic.get("title", fallback_topic),
+        "research_question": selected_topic.get("research_question", ""),
+        "falsifiable_hypothesis": selected_topic.get(
+            "falsifiable_hypothesis", ""
+        ),
+        "primary_metric": selected_topic.get("primary_metric", ""),
+    }
+
+    selected_report = _validate_experiment_semantics(
+        validation_plan,
+        selected_topic,
+        fallback_topic,
+    )
+    raw_field_alignment: dict[str, dict[str, Any]] = {}
+    explicit_drift_fields: list[str] = []
+    if _has_authoritative_selected_topic(selected_topic):
+        for field in _RAW_SEMANTIC_CONTRACT_FIELDS:
+            raw_value = plan.get(field)
+            selected_value = selected_topic.get(field)
+            if not _flatten_semantic_text(raw_value).strip():
+                continue
+            if not _flatten_semantic_text(selected_value).strip():
+                continue
+            alignment = _raw_contract_field_alignment(
+                raw_value,
+                selected_value,
+            )
+            raw_field_alignment[field] = alignment
+            if not alignment["compatible"]:
+                explicit_drift_fields.append(field)
+
+    if explicit_drift_fields:
+        selected_report["reasons"].append(
+            "Raw plan explicitly replaces authoritative selected-topic "
+            "fields with unrelated content: "
+            + ", ".join(explicit_drift_fields)
+        )
+        selected_report["aligned"] = False
+    selected_report["raw_field_alignment"] = raw_field_alignment
+    selected_report["explicit_drift_fields"] = explicit_drift_fields
+    selected_report["raw_plan_check"] = True
+    return selected_report
 
 
 def _validate_experiment_semantics(
@@ -682,12 +892,55 @@ def _execute_experiment_design(
                     _dg_block += _fw_docs
         except Exception:  # noqa: BLE001
             pass
-        # Improvement A: Compute hardware profile + per-condition budget
-        _hw_profile_str = (
-            "- GPU: NVIDIA RTX 6000 Ada (49140 MB VRAM)\n"
-            "- GPU count: 1\n"
-            "- CPU: shared server"
-        )
+        # Compute guidance must reflect the actual execution backend.  Factory
+        # mode passes the per-Idea lease through RESEARCHCLAW_GPU_REQUEST.
+        _gpu_request_raw = os.environ.get("RESEARCHCLAW_GPU_REQUEST", "")
+        try:
+            _allocated_gpus = max(0, int(_gpu_request_raw or 0))
+        except ValueError:
+            _allocated_gpus = 0
+        _experiment_mode = str(config.experiment.mode)
+        if _experiment_mode == "clusterbridge_pool":
+            try:
+                from researchclaw.cluster import ClusterBridgePoolConfig
+
+                _pool = ClusterBridgePoolConfig.from_file(
+                    config.experiment.clusterbridge_pool.config_file
+                )
+                _pool_gpus = _pool.configured_gpu_count
+                _pool_nodes = len(_pool.nodes)
+            except Exception:  # noqa: BLE001
+                _pool_gpus = _allocated_gpus or 1
+                _pool_nodes = 1
+            _idea_gpus = _allocated_gpus or min(1, _pool_gpus)
+            _hw_profile_str = (
+                f"- Backend: prepared ClusterBridge/Ray pool\n"
+                f"- Pool capacity: {_pool_gpus} GPUs across {_pool_nodes} nodes\n"
+                f"- Current Idea allocation: {_idea_gpus} GPU(s)\n"
+                "- CPU: shared cluster CPUs"
+            )
+            _gpu_execution_guidance = (
+                f"- This Idea may use at most {_idea_gpus} GPU(s); do not "
+                "assume ownership of the whole pool.\n"
+                "- Parallelize independent conditions/seeds through Ray tasks "
+                "with explicit num_gpus resource requests.\n"
+                "- Keep each individual training task single-GPU unless the "
+                "selected-topic contract explicitly requires model parallelism.\n"
+                "- Never create, stop, or reconfigure the shared Ray cluster."
+            )
+        else:
+            _idea_gpus = _allocated_gpus or 1
+            _hw_profile_str = (
+                f"- GPU allocation: {_idea_gpus} GPU(s)\n"
+                "- GPU model/VRAM: use the detected Stage-1 hardware profile\n"
+                "- CPU: local/shared server"
+            )
+            _gpu_execution_guidance = (
+                f"- Design experiments that fit the allocated {_idea_gpus} "
+                "GPU(s).\n"
+                "- Do not use multi-node execution unless the configured "
+                "experiment backend explicitly supports it."
+            )
         _per_condition_sec = int(config.experiment.time_budget_sec * 0.7 / 6)
         _selected_datasets = _plan_field_names(
             _normalize_plan_field(_selected_topic.get("datasets"))
@@ -710,6 +963,7 @@ def _execute_experiment_design(
             metric_key=config.experiment.metric_key,
             metric_direction=config.experiment.metric_direction,
             hardware_profile=_hw_profile_str,
+            gpu_execution_guidance=_gpu_execution_guidance,
             per_condition_budget_sec=_per_condition_sec,
             available_tier1_datasets=_tier1,
         )
@@ -900,41 +1154,25 @@ def _execute_experiment_design(
             decision="schema_deficient",
         )
 
-    # Reject topic drift before the multi-call BenchmarkAgent can spend several
-    # minutes acquiring code for an already invalid plan.  The authoritative
-    # contract is applied first, so this checks both the generated methods and
-    # the fixed scientific endpoints.
-    _pre_contract_plan = dict(_generated_plan)
-    if _authoritative_topic:
-        for _field in (
-            "topic",
-            "title",
-            "research_question",
-            "falsifiable_hypothesis",
-            "datasets",
-            "models",
-            "primary_metric",
-            "baselines",
-            "ablations",
-            "metrics",
-            "cheap_pilot",
-            "failure_safety_tests",
-            "pivot_policy",
-        ):
-            _selected_value = _selected_topic.get(_field)
-            if _selected_value in (None, "", [], {}):
-                continue
-            if _field in _pre_contract_plan:
-                # Preserve what the LLM actually proposed so forbidden domain
-                # drift is caught before the authoritative contract repairs it.
-                continue
-            _pre_contract_plan[_field] = _selected_value
-    _pre_benchmark_semantic_report = _write_semantic_alignment(
-        stage_dir,
-        _pre_contract_plan,
+    # Reject explicit raw-plan drift before BenchmarkAgent or code generation
+    # can spend more calls. Missing raw fields are filled by the authoritative
+    # contract and are not themselves a reason to fail.
+    _pre_benchmark_semantic_report = _generated_plan_drift(
+        _generated_plan,
         _selected_topic,
         config.research.topic,
-        phase="pre_benchmark",
+    )
+    _pre_benchmark_semantic_report["phase"] = "pre_benchmark"
+    _pre_benchmark_semantic_report["report_path"] = (
+        "semantic_alignment_pre_benchmark.json"
+    )
+    (stage_dir / _pre_benchmark_semantic_report["report_path"]).write_text(
+        json.dumps(
+            _pre_benchmark_semantic_report,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
     )
     if not _pre_benchmark_semantic_report["aligned"]:
         return _semantic_misalignment_result(

@@ -47,6 +47,7 @@ class FactoryScheduler:
     def __init__(self, config: FactoryConfig, *, total_gpus: int = 0) -> None:
         self.config = config
         self.total_gpus = max(0, int(total_gpus))
+        self.max_gpus_per_node = self.total_gpus
 
     def active_slots_available(self, ideas: Iterable[Idea]) -> int:
         active = sum(idea.status in ACTIVE_IDEA_STATUSES for idea in ideas)
@@ -128,7 +129,23 @@ class FactoryScheduler:
             in {"admitted", "running"}
         )
         share_remaining = max(0, self.gpu_share_cap() - current_for_idea)
-        available = min(capacity, share_remaining, item.resources.max_gpus)
+        profile_cap = (
+            self.config.scheduler.validation_max_gpus_per_idea
+            if item.profile == "validation"
+            else self.config.scheduler.pilot_max_gpus_per_idea
+        )
+        placement_cap = (
+            self.max_gpus_per_node
+            if item.resources.placement == "single_node"
+            else self.total_gpus
+        )
+        available = min(
+            capacity,
+            share_remaining,
+            profile_cap,
+            placement_cap,
+            item.resources.max_gpus,
+        )
         if available < item.resources.min_gpus:
             return SchedulingDecision(
                 item.item_id,

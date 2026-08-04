@@ -665,6 +665,70 @@ def test_async_task_id_conflict_fails_closed(tmp_path: Path) -> None:
         pool.submit_task("echo different", timeout_sec=10, task_id="same-id")
 
 
+def test_async_task_uses_ray_resource_reservation(tmp_path: Path) -> None:
+    client = FakeClient()
+    pool = ClusterBridgePool(
+        _config(tmp_path, node_count=1),
+        client=client,
+    )
+    pool.claim(start_keepalive=False)
+    pool._prepared = True
+    client.run_handler = lambda node, command: (
+        _result("77\n") if "nohup setsid bash" in command else _result()
+    )
+
+    pool.submit_task(
+        "python train.py",
+        timeout_sec=10,
+        task_id="ray-reserved",
+        num_gpus=2,
+        num_cpus=4,
+        env={"EXAMPLE": "value"},
+    )
+
+    task_dir = pool.state_dir / "tasks" / "ray-reserved"
+    request = json.loads((task_dir / "request.json").read_text())
+    payload = json.loads((task_dir / "ray_task.json").read_text())
+    script = (task_dir / "ray_task.py").read_text()
+    assert request["num_gpus"] == 2
+    assert request["num_cpus"] == 4
+    assert payload["env"]["EXAMPLE"] == "value"
+    assert "@ray.remote(num_gpus=payload['num_gpus']" in script
+    assert "ray.get(run.remote" in script
+
+
+def test_async_task_resource_change_conflicts_with_existing_task(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    pool = ClusterBridgePool(
+        _config(tmp_path, node_count=1),
+        client=client,
+    )
+    pool.claim(start_keepalive=False)
+    pool._prepared = True
+    client.run_handler = lambda node, command: (
+        _result("77\n") if "nohup setsid bash" in command else _result()
+    )
+
+    pool.submit_task(
+        "python train.py",
+        timeout_sec=10,
+        task_id="resource-conflict",
+        num_gpus=1,
+        num_cpus=2,
+    )
+
+    with pytest.raises(PoolTaskConflict):
+        pool.submit_task(
+            "python train.py",
+            timeout_sec=10,
+            task_id="resource-conflict",
+            num_gpus=2,
+            num_cpus=2,
+        )
+
+
 def test_background_task_timeout_sends_term_and_kill(tmp_path: Path) -> None:
     client = FakeClient()
     ticks = iter([0.0, 0.0, 2.0, 2.0])
