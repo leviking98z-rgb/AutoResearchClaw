@@ -571,6 +571,7 @@ class CampaignSupervisor:
     def _run_cycle(self, cycle: int) -> bool | str:
         run_dir = self.store.runs_dir / f"cycle-{cycle:04d}"
         run_dir.mkdir(parents=True, exist_ok=True)
+        resumed_from_cycle = self._seed_failed_cycle_resume(run_dir, cycle)
         self._seed_run_memory(run_dir)
         campaign_brief = self._current_brief()
         effective_topic = campaign_brief
@@ -782,6 +783,8 @@ class CampaignSupervisor:
             cycle=cycle,
             run_dir=str(run_dir),
             command=command,
+            resumed_from_cycle=resumed_from_cycle,
+            resume_stage=self._checkpoint_next_stage_name(run_dir),
         )
 
         returncode = self._run_pipeline(cycle, run_dir, command)
@@ -991,6 +994,118 @@ class CampaignSupervisor:
             )
             return "paused"
         return success
+
+    @staticmethod
+    def _checkpoint_next_stage_name(run_dir: Path) -> str | None:
+        checkpoint = read_json(run_dir / "checkpoint.json", None)
+        if not isinstance(checkpoint, dict):
+            return None
+        try:
+            last_stage = int(checkpoint.get("last_completed_stage"))
+        except (TypeError, ValueError):
+            return None
+        if last_stage >= 23:
+            return None
+        from researchclaw.pipeline.stages import Stage
+
+        try:
+            return Stage(last_stage + 1).name
+        except ValueError:
+            return None
+
+    def _seed_failed_cycle_resume(self, run_dir: Path, cycle: int) -> int | None:
+        """Seed a new cycle from the last failed/paused run.
+
+        The outer RSI supervisor deliberately keeps cycle directories immutable
+        after diagnosis.  Previously this meant every failed cycle restarted at
+        Stage 1.  We now copy only the successfully checkpointed prefix into the
+        new cycle, write the checkpoint last, and let the existing ``--resume``
+        path continue from the failed stage.
+
+        A topic pivot/refinement intentionally disables this carry-forward:
+        changed scientific intent must invalidate downstream artifacts instead
+        of accidentally inheriting the previous hypothesis.
+        """
+
+        if cycle <= 1 or (run_dir / "checkpoint.json").is_file():
+            return None
+        pending = self.state.get("pending_topic_action")
+        if isinstance(pending, Mapping):
+            topic_action = normalize_topic_action(pending).get(
+                "topic_action", "keep"
+            )
+        else:
+            topic_action = "keep"
+        if topic_action != "keep":
+            return None
+        previous_raw = self.state.get("last_run_dir")
+        if not previous_raw:
+            return None
+        previous = Path(str(previous_raw))
+        if not previous.is_dir() or previous.resolve() == run_dir.resolve():
+            return None
+        summary = read_json(previous / "pipeline_summary.json", None)
+        if not isinstance(summary, dict):
+            return None
+        if str(summary.get("final_status", "")).lower() == "done":
+            return None
+        checkpoint = read_json(previous / "checkpoint.json", None)
+        if not isinstance(checkpoint, dict):
+            return None
+        try:
+            last_completed = int(checkpoint.get("last_completed_stage"))
+        except (TypeError, ValueError):
+            return None
+        if not 1 <= last_completed < 23:
+            return None
+
+        copied: list[str] = []
+        for stage_number in range(1, last_completed + 1):
+            source = previous / f"stage-{stage_number:02d}"
+            destination = run_dir / source.name
+            if not source.is_dir() or destination.exists():
+                continue
+            shutil.copytree(source, destination)
+            copied.append(source.name)
+        for filename in (
+            "analysis_best.md",
+            "topic_candidates.json",
+            "selected_topic.json",
+            "topic_selection.md",
+        ):
+            source = previous / filename
+            destination = run_dir / filename
+            if source.is_file() and not destination.exists():
+                shutil.copy2(source, destination)
+                copied.append(filename)
+
+        # Publish the checkpoint last.  A crash during copying therefore
+        # causes a safe Stage-1 restart instead of resuming from partial data.
+        try:
+            source_cycle = int(previous.name.removeprefix("cycle-"))
+        except ValueError:
+            source_cycle = cycle - 1
+        checkpoint_copy = dict(checkpoint)
+        checkpoint_copy["resumed_from_cycle"] = source_cycle
+        checkpoint_copy["resumed_from_run_dir"] = str(previous)
+        atomic_write_json(run_dir / "checkpoint.json", checkpoint_copy)
+        manifest = {
+            "source_cycle": source_cycle,
+            "source_run_dir": str(previous),
+            "target_cycle": cycle,
+            "last_completed_stage": last_completed,
+            "resume_stage": self._checkpoint_next_stage_name(run_dir),
+            "copied": copied,
+            "timestamp": utc_now(),
+        }
+        atomic_write_json(run_dir / "resume_manifest.json", manifest)
+        self.store.log.append(
+            "cycle_resume_seeded",
+            campaign_id=self.campaign_id,
+            cycle=cycle,
+            **manifest,
+        )
+        return source_cycle
 
     def _pipeline_command(self, run_dir: Path, config_path: Path) -> list[str]:
         if self.options.dry_run:

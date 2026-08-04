@@ -379,60 +379,185 @@ def _execute_literature_collect(
     candidates: list[dict[str, Any]] = []
     bibtex_entries: list[str] = []
     real_search_succeeded = False
+    infohub_meta: dict[str, Any] = {
+        "enabled": bool(config.literature_search.infohub_enabled),
+        "available": False,
+        "mode": config.literature_search.infohub_mode,
+        "memory_hits": 0,
+        "collected": 0,
+        "new_items": 0,
+        "persisted": 0,
+        "error": "",
+    }
+    papers: list[Any] = []
+    expanded_queries = _expand_search_queries(queries, config.research.topic)
 
-    try:
-        from researchclaw.literature.search import (
-            search_papers_multi_query,
-            papers_to_bibtex,
-        )
-
-        # Expand queries for broader coverage
-        expanded_queries = _expand_search_queries(queries, config.research.topic)
-        literature_config = config.literature_search
-        s2_api_key = (
-            literature_config.s2_api_key
-            or config.llm.s2_api_key
-            or os.environ.get(literature_config.s2_api_key_env, "")
-        )
-        openalex_api_key = (
-            literature_config.openalex_api_key
-            or os.environ.get(literature_config.openalex_api_key_env, "")
-        )
-        logger.info(
-            "[literature] Searching %d queries (expanded from %d) "
-            "across %s",
-            len(expanded_queries),
-            len(queries),
-            " -> ".join(literature_config.sources),
-        )
-        papers = search_papers_multi_query(
-            expanded_queries,
-            limit_per_query=literature_config.max_results_per_query,
-            sources=literature_config.sources,
-            year_min=year_min,
-            s2_api_key=s2_api_key,
-            openalex_email=literature_config.openalex_email,
-            openalex_api_key=openalex_api_key,
-            inter_query_delay=literature_config.inter_query_delay_sec,
-        )
-        if papers:
-            real_search_succeeded = True
-            # Count by source
-            src_counts: dict[str, int] = {}
-            for p in papers:
-                src_counts[p.source] = src_counts.get(p.source, 0) + 1
-                d = p.to_dict()
-                d["collected_at"] = _utcnow_iso()
-                candidates.append(d)
-                bibtex_entries.append(p.to_bibtex())
-            src_str = ", ".join(f"{s}: {n}" for s, n in src_counts.items())
-            logger.info(
-                "[literature] Found %d papers (%s)", len(papers), src_str
+    # --- Persistent memory first ---
+    # InfoHub is the durable literature layer.  A healthy local hit avoids
+    # repeatedly paying for remote academic APIs, while low coverage triggers
+    # a refresh and then falls through to the legacy sources if needed.
+    infohub_client = None
+    if config.literature_search.infohub_enabled:
+        try:
+            from researchclaw.literature.infohub import (
+                InfoHubClient,
+                deduplicate_papers,
+                query_persistent_memory,
             )
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[rate-limit] Literature search failed — falling back to LLM",
-            exc_info=True,
+
+            infohub_client = InfoHubClient.from_config(config)
+            memory_queries: list[str] = []
+            memory_seen: set[str] = set()
+            for query in (
+                *queries,
+                *_build_fallback_queries(config.research.topic),
+                *_extract_topic_keywords(
+                    config.research.topic, config.research.domains
+                )[:8],
+            ):
+                normalized = query.strip().lower()
+                if normalized and normalized not in memory_seen:
+                    memory_seen.add(normalized)
+                    memory_queries.append(query.strip())
+                if len(memory_queries) >= 12:
+                    break
+            memory = query_persistent_memory(
+                config,
+                memory_queries,
+                limit_per_query=config.literature_search.infohub_search_limit,
+            )
+            infohub_meta.update(
+                {
+                    "available": memory.available,
+                    "mode": memory.mode,
+                    "memory_hits": len(memory.papers),
+                    "error": memory.error,
+                }
+            )
+            papers.extend(memory.papers)
+            logger.info(
+                "[infohub] persistent memory returned %d papers for %d queries",
+                len(memory.papers),
+                len(memory_queries),
+            )
+            if (
+                memory.available
+                and config.literature_search.infohub_refresh
+                and len(memory.papers) < config.literature_search.infohub_min_results
+            ):
+                refreshed = infohub_client.collect(
+                    expanded_queries,
+                    limit_per_query=config.literature_search.max_results_per_query,
+                )
+                infohub_meta.update(
+                    {
+                        "collected": refreshed.total_items,
+                        "new_items": refreshed.new_items,
+                        "error": "; ".join(
+                            value
+                            for value in (infohub_meta["error"], refreshed.error)
+                            if value
+                        ),
+                    }
+                )
+                papers.extend(refreshed.papers)
+                papers = deduplicate_papers(papers)
+                logger.info(
+                    "[infohub] refreshed %d papers (%d new)",
+                    refreshed.total_items,
+                    refreshed.new_items,
+                )
+        except Exception as exc:  # noqa: BLE001
+            infohub_meta["error"] = f"{type(exc).__name__}: {exc}"
+            logger.warning("[infohub] persistent memory unavailable", exc_info=True)
+
+    # If persistent memory already has enough coverage, it becomes the primary
+    # source and remote APIs stay out of the critical path.  Otherwise query
+    # the legacy academic providers and persist their discoveries afterward.
+    if len(papers) < config.literature_search.infohub_min_results:
+        try:
+            from researchclaw.literature.search import search_papers_multi_query
+
+            literature_config = config.literature_search
+            s2_api_key = (
+                literature_config.s2_api_key
+                or config.llm.s2_api_key
+                or os.environ.get(literature_config.s2_api_key_env, "")
+            )
+            openalex_api_key = (
+                literature_config.openalex_api_key
+                or os.environ.get(literature_config.openalex_api_key_env, "")
+            )
+            logger.info(
+                "[literature] Searching %d queries (expanded from %d) "
+                "across %s",
+                len(expanded_queries),
+                len(queries),
+                " -> ".join(literature_config.sources),
+            )
+            remote_papers = search_papers_multi_query(
+                expanded_queries,
+                limit_per_query=literature_config.max_results_per_query,
+                sources=literature_config.sources,
+                year_min=year_min,
+                s2_api_key=s2_api_key,
+                openalex_email=literature_config.openalex_email,
+                openalex_api_key=openalex_api_key,
+                inter_query_delay=literature_config.inter_query_delay_sec,
+            )
+            if remote_papers:
+                papers.extend(remote_papers)
+                try:
+                    from researchclaw.literature.infohub import deduplicate_papers
+
+                    papers = deduplicate_papers(papers)
+                except Exception:  # noqa: BLE001
+                    pass
+                real_search_succeeded = True
+                if infohub_client is not None:
+                    persisted = infohub_client.ingest_papers(
+                        remote_papers,
+                        keyword=f"researchclaw:{_safe_filename(topic)[:80]}",
+                    )
+                    infohub_meta["persisted"] = persisted.total_items
+                    infohub_meta["new_items"] += persisted.new_items
+                    if persisted.error:
+                        infohub_meta["error"] = "; ".join(
+                            value
+                            for value in (infohub_meta["error"], persisted.error)
+                            if value
+                        )
+                # Count by source
+                src_counts: dict[str, int] = {}
+                for p in papers:
+                    src_counts[p.source] = src_counts.get(p.source, 0) + 1
+                    d = p.to_dict()
+                    d["collected_at"] = _utcnow_iso()
+                    candidates.append(d)
+                    bibtex_entries.append(p.to_bibtex())
+                src_str = ", ".join(
+                    f"{source}: {count}" for source, count in src_counts.items()
+                )
+                logger.info(
+                    "[literature] Found %d papers (%s)", len(papers), src_str
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[rate-limit] Literature search failed — falling back to LLM",
+                exc_info=True,
+            )
+    elif papers:
+        real_search_succeeded = True
+        src_counts: dict[str, int] = {}
+        for p in papers:
+            src_counts[p.source] = src_counts.get(p.source, 0) + 1
+            d = p.to_dict()
+            d["collected_at"] = _utcnow_iso()
+            candidates.append(d)
+            bibtex_entries.append(p.to_bibtex())
+        logger.info(
+            "[literature] InfoHub coverage satisfied threshold: %d papers",
+            len(papers),
         )
 
     # --- Inject foundational/seminal papers ---
@@ -630,6 +755,7 @@ def _execute_literature_collect(
                 "year_min": year_min,
                 "total_candidates": len(candidates),
                 "bibtex_entries": len(bibtex_entries),
+                "infohub": infohub_meta,
                 "ts": _utcnow_iso(),
             },
             indent=2,

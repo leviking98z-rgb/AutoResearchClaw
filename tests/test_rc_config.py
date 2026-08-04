@@ -336,6 +336,9 @@ def test_rcconfig_from_dict_uses_default_literature_search(tmp_path: Path):
     assert config.literature_search.max_results_per_query == 40
     assert config.literature_search.openalex_api_key_env == "OPENALEX_API_KEY"
     assert config.literature_search.s2_api_key_env == "S2_API_KEY"
+    assert config.literature_search.infohub_enabled is True
+    assert config.literature_search.infohub_mode == "http"
+    assert config.literature_search.infohub_url == "http://127.0.0.1:8077"
 
 
 def test_rcconfig_from_dict_parses_literature_search(tmp_path: Path):
@@ -349,6 +352,16 @@ def test_rcconfig_from_dict_parses_literature_search(tmp_path: Path):
         "openalex_api_key": "openalex-test-key",
         "s2_api_key_env": "CUSTOM_S2_KEY",
         "s2_api_key": "s2-test-key",
+        "infohub_enabled": True,
+        "infohub_mode": "local",
+        "infohub_url": "http://infohub.test:8077",
+        "infohub_repo": "/srv/infohub",
+        "infohub_timeout_sec": 7.5,
+        "infohub_search_limit": 99,
+        "infohub_collect_days": 4000,
+        "infohub_collect_platforms": "arxiv,scholar",
+        "infohub_min_results": 22,
+        "infohub_refresh": False,
     }
 
     config = RCConfig.from_dict(data, project_root=tmp_path, check_paths=False)
@@ -361,6 +374,17 @@ def test_rcconfig_from_dict_parses_literature_search(tmp_path: Path):
     assert config.literature_search.openalex_api_key == "openalex-test-key"
     assert config.literature_search.s2_api_key_env == "CUSTOM_S2_KEY"
     assert config.literature_search.s2_api_key == "s2-test-key"
+    assert config.literature_search.infohub_mode == "local"
+    assert config.literature_search.infohub_repo == "/srv/infohub"
+    assert config.literature_search.infohub_timeout_sec == 7.5
+    assert config.literature_search.infohub_search_limit == 99
+    assert config.literature_search.infohub_collect_days == 4000
+    assert config.literature_search.infohub_collect_platforms == (
+        "arxiv",
+        "scholar",
+    )
+    assert config.literature_search.infohub_min_results == 22
+    assert config.literature_search.infohub_refresh is False
 
 
 def test_rcconfig_from_dict_missing_fields_raises_value_error(tmp_path: Path):

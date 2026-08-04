@@ -611,6 +611,7 @@ def execute_stage(
     stage_dir.mkdir(parents=True, exist_ok=True)
     _t_health_start = _time.monotonic()
     contract: StageContract = CONTRACTS[stage]
+    cache_details: dict[str, Any] | None = None
 
     if contract.input_files:
         for input_file in contract.input_files:
@@ -625,6 +626,47 @@ def execute_stage(
                 )
                 _write_stage_meta(stage_dir, stage, run_id, result)
                 return result
+
+    try:
+        from researchclaw.pipeline.stage_cache import (
+            CACHEABLE_STAGES,
+            cached_result,
+            restore_stage_cache,
+        )
+
+        if stage in CACHEABLE_STAGES:
+            cache_details = restore_stage_cache(
+                stage=stage,
+                stage_dir=stage_dir,
+                run_dir=run_dir,
+                config=config,
+            )
+            if cache_details is not None:
+                result = cached_result(stage)
+                _write_stage_meta(stage_dir, stage, run_id, result)
+                stage_health = {
+                    "stage_id": f"{int(stage):02d}-{stage.name.lower()}",
+                    "run_id": run_id,
+                    "duration_sec": round(_time.monotonic() - _t_health_start, 2),
+                    "status": result.status.value,
+                    "artifacts_count": len(result.artifacts),
+                    "error": None,
+                    "timestamp": _utcnow_iso(),
+                    "cache": cache_details,
+                }
+                (stage_dir / "stage_health.json").write_text(
+                    json.dumps(stage_health, indent=2), encoding="utf-8"
+                )
+                logger.info(
+                    "[cache] HIT stage=%s fingerprint=%s source_run=%s",
+                    stage.name,
+                    cache_details.get("fingerprint"),
+                    cache_details.get("source_run_id"),
+                )
+                return result
+            logger.info("[cache] MISS stage=%s", stage.name)
+    except Exception:  # noqa: BLE001
+        logger.warning("Stage cache restore failed for %s", stage.name, exc_info=True)
 
     bridge = config.openclaw_bridge
     if bridge.use_message and config.notifications.on_stage_start:
@@ -734,6 +776,21 @@ def execute_stage(
                     )
                     break
 
+    if result.status == StageStatus.DONE:
+        try:
+            from researchclaw.pipeline.stage_cache import save_stage_cache
+
+            cache_details = save_stage_cache(
+                stage=stage,
+                stage_dir=stage_dir,
+                run_dir=run_dir,
+                run_id=run_id,
+                config=config,
+                artifacts=result.artifacts,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("Stage cache store failed for %s", stage.name, exc_info=True)
+
     # --- MetaClaw PRM quality gate evaluation ---
     try:
         mc_bridge = getattr(config, "metaclaw_bridge", None)
@@ -837,6 +894,7 @@ def execute_stage(
         "artifacts_count": len(result.artifacts),
         "error": result.error,
         "timestamp": _utcnow_iso(),
+        "cache": cache_details,
     }
     try:
         (stage_dir / "stage_health.json").write_text(

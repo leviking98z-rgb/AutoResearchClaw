@@ -16,6 +16,8 @@ runtime:
   max_parallel_tasks: 1
   approval_timeout_hours: 24
   retry_limit: 2
+  stage_cache_enabled: true
+  stage_cache_dir: ""
 
 notifications:
   channel: "console"
@@ -139,6 +141,19 @@ literature_search:
   openalex_api_key: ""
   s2_api_key_env: "S2_API_KEY"
   s2_api_key: ""
+  infohub_enabled: true
+  infohub_mode: "http"
+  infohub_url: "http://127.0.0.1:8077"
+  infohub_repo: "/root/servers/infohub"
+  infohub_timeout_sec: 20
+  infohub_search_limit: 60
+  infohub_collect_days: 3650
+  infohub_collect_platforms:
+    - "arxiv"
+    - "scholar"
+    - "bing"
+  infohub_min_results: 15
+  infohub_refresh: true
 
 web_search:
   enabled: true

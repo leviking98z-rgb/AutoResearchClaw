@@ -19,10 +19,9 @@ Usage
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -190,6 +189,7 @@ def check_novelty(
     max_search_results: int = 30,
     similarity_threshold: float = 0.25,
     s2_api_key: str = "",
+    config: Any | None = None,
 ) -> dict[str, Any]:
     """Check whether the proposed research has significant overlap with existing work.
 
@@ -225,16 +225,55 @@ def check_novelty(
     # Build search queries from hypotheses
     queries = _build_novelty_queries(topic, hypotheses_text)
 
+    # Reuse the durable library before issuing another remote novelty query.
+    if config is not None:
+        try:
+            from researchclaw.literature.infohub import query_persistent_memory
+
+            memory = query_persistent_memory(
+                config,
+                queries,
+                limit_per_query=max_search_results,
+            )
+            total_papers_retrieved += len(memory.papers)
+            for paper in memory.papers[:max_search_results]:
+                sim = _compute_similarity(
+                    hyp_keywords, paper.title, paper.abstract
+                )
+                if sim >= similarity_threshold:
+                    similar_papers.append(
+                        {
+                            "title": paper.title,
+                            "paper_id": paper.paper_id,
+                            "year": paper.year,
+                            "venue": paper.venue,
+                            "citation_count": paper.citation_count,
+                            "similarity": sim,
+                            "url": paper.url,
+                            "cite_key": paper.cite_key,
+                        }
+                    )
+            logger.info(
+                "Novelty InfoHub reuse: %d papers, %d above threshold %.2f",
+                len(memory.papers),
+                len(similar_papers),
+                similarity_threshold,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("InfoHub novelty reuse failed", exc_info=True)
+
     # Try real API search
     try:
         from researchclaw.literature.search import search_papers_multi_query
 
-        found = search_papers_multi_query(
-            queries,
-            limit_per_query=min(15, max_search_results),
-            s2_api_key=s2_api_key,
-        )
-        total_papers_retrieved = len(found)
+        found = []
+        if total_papers_retrieved < 5:
+            found = search_papers_multi_query(
+                queries,
+                limit_per_query=min(15, max_search_results),
+                s2_api_key=s2_api_key,
+            )
+        total_papers_retrieved += len(found)
         for paper in found[:max_search_results]:
             sim = _compute_similarity(hyp_keywords, paper.title, paper.abstract)
             if sim >= similarity_threshold:
@@ -331,7 +370,7 @@ def check_novelty(
         "similarity_threshold": similarity_threshold,
         "search_coverage": search_coverage,
         "total_papers_retrieved": total_papers_retrieved,
-        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "generated": datetime.now(UTC).isoformat(timespec="seconds"),
     }
 
 

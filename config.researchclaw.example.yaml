@@ -14,6 +14,10 @@ runtime:
   max_parallel_tasks: 3
   approval_timeout_hours: 12
   retry_limit: 2
+  # Content-addressed Stage 4-8 cache.  RSI campaigns default to
+  # <campaign>/shared/stage-cache when the path is left blank.
+  stage_cache_enabled: true
+  stage_cache_dir: ""
 
 notifications:
   channel: "console"
@@ -98,6 +102,18 @@ literature_search:
   openalex_api_key: ""
   s2_api_key_env: "S2_API_KEY"
   s2_api_key: ""
+  # Durable shared literature memory.  Search InfoHub first, refresh only when
+  # coverage is low, and persist discoveries made by other academic backends.
+  infohub_enabled: true
+  infohub_mode: "http"  # "http" (warm service) or "local" (direct Store import)
+  infohub_url: "http://127.0.0.1:8077"
+  infohub_repo: "/root/servers/infohub"
+  infohub_timeout_sec: 20
+  infohub_search_limit: 60
+  infohub_collect_days: 3650
+  infohub_collect_platforms: ["arxiv", "scholar", "bing"]
+  infohub_min_results: 15
+  infohub_refresh: true
 
 security:
   hitl_required_stages: [5, 9, 20]

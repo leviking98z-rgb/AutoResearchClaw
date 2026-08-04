@@ -1196,6 +1196,82 @@ def test_interrupted_cycle_reuses_checkpoint_with_pipeline_resume(
     assert "--resume" in command
 
 
+def test_next_failed_cycle_copies_completed_prefix_and_resumes(
+    tmp_path: Path,
+) -> None:
+    options = _options(tmp_path, single_cycle=True)
+    supervisor = CampaignSupervisor(options)
+    supervisor.initialize()
+    previous = supervisor.store.runs_dir / "cycle-0001"
+    (previous / "stage-01").mkdir(parents=True)
+    (previous / "stage-08").mkdir(parents=True)
+    (previous / "stage-09").mkdir(parents=True)
+    (previous / "stage-01" / "goal.md").write_text("goal")
+    (previous / "stage-08" / "hypotheses.md").write_text("hypothesis")
+    (previous / "stage-09" / "partial.txt").write_text("must not be copied")
+    (previous / "checkpoint.json").write_text(
+        json.dumps(
+            {
+                "last_completed_stage": 8,
+                "last_completed_name": "HYPOTHESIS_GEN",
+                "run_id": "old",
+            }
+        )
+    )
+    (previous / "pipeline_summary.json").write_text(
+        json.dumps({"final_status": "paused", "final_stage": 9})
+    )
+    supervisor.state.update(
+        {
+            "last_run_dir": str(previous),
+            "pending_topic_action": {"topic_action": "keep"},
+        }
+    )
+    supervisor.state = supervisor.store.save_state(supervisor.state)
+    target = supervisor.store.runs_dir / "cycle-0002"
+    target.mkdir()
+
+    source_cycle = supervisor._seed_failed_cycle_resume(target, 2)
+
+    assert source_cycle == 1
+    assert (target / "stage-01" / "goal.md").read_text() == "goal"
+    assert (target / "stage-08" / "hypotheses.md").read_text() == "hypothesis"
+    assert not (target / "stage-09").exists()
+    assert supervisor._checkpoint_next_stage_name(target) == "EXPERIMENT_DESIGN"
+    manifest = json.loads((target / "resume_manifest.json").read_text())
+    assert manifest["last_completed_stage"] == 8
+    command = supervisor._pipeline_command(target, _base_config(tmp_path))
+    assert "--resume" in command
+
+
+def test_topic_pivot_does_not_reuse_failed_prefix(tmp_path: Path) -> None:
+    supervisor = CampaignSupervisor(_options(tmp_path, single_cycle=True))
+    supervisor.initialize()
+    previous = supervisor.store.runs_dir / "cycle-0001"
+    previous.mkdir(parents=True)
+    (previous / "checkpoint.json").write_text(
+        json.dumps({"last_completed_stage": 8})
+    )
+    (previous / "pipeline_summary.json").write_text(
+        json.dumps({"final_status": "failed"})
+    )
+    supervisor.state.update(
+        {
+            "last_run_dir": str(previous),
+            "pending_topic_action": {
+                "topic_action": "pivot",
+                "pivot_reason": "pilot falsified the incumbent",
+            },
+        }
+    )
+    supervisor.state = supervisor.store.save_state(supervisor.state)
+    target = supervisor.store.runs_dir / "cycle-0002"
+    target.mkdir()
+
+    assert supervisor._seed_failed_cycle_resume(target, 2) is None
+    assert not (target / "checkpoint.json").exists()
+
+
 def test_dry_run_single_cycle_avoids_llm(tmp_path: Path) -> None:
     options = replace(_options(tmp_path, single_cycle=True), dry_run=True)
 

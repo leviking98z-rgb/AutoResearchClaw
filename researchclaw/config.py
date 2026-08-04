@@ -156,6 +156,8 @@ class RuntimeConfig:
     max_parallel_tasks: int = 1
     approval_timeout_hours: int = 12
     retry_limit: int = 0
+    stage_cache_enabled: bool = True
+    stage_cache_dir: str = ""
 
 
 @dataclass(frozen=True)
@@ -249,6 +251,16 @@ class LiteratureSearchConfig:
     openalex_api_key_env: str = "OPENALEX_API_KEY"
     s2_api_key: str = ""
     s2_api_key_env: str = "S2_API_KEY"
+    infohub_enabled: bool = True
+    infohub_mode: str = "http"
+    infohub_url: str = "http://127.0.0.1:8077"
+    infohub_repo: str = "/root/servers/infohub"
+    infohub_timeout_sec: float = 20.0
+    infohub_search_limit: int = 60
+    infohub_collect_days: int = 3650
+    infohub_collect_platforms: tuple[str, ...] = ("arxiv", "scholar", "bing")
+    infohub_min_results: int = 15
+    infohub_refresh: bool = True
 
 
 @dataclass(frozen=True)
@@ -1019,6 +1031,8 @@ class RCConfig:
                 max_parallel_tasks=int(runtime.get("max_parallel_tasks", 1)),
                 approval_timeout_hours=int(runtime.get("approval_timeout_hours", 12)),
                 retry_limit=int(runtime.get("retry_limit", 0)),
+                stage_cache_enabled=bool(runtime.get("stage_cache_enabled", True)),
+                stage_cache_dir=str(runtime.get("stage_cache_dir", "") or ""),
             ),
             notifications=NotificationsConfig(
                 channel=notifications["channel"],
@@ -1388,6 +1402,24 @@ def _parse_literature_search_config(data: dict[str, Any]) -> LiteratureSearchCon
         sources = tuple(str(source) for source in (sources_raw or ()))
     if not sources:
         sources = LiteratureSearchConfig.sources
+    infohub_platforms_raw = data.get(
+        "infohub_collect_platforms",
+        LiteratureSearchConfig.infohub_collect_platforms,
+    )
+    if isinstance(infohub_platforms_raw, str):
+        infohub_platforms = tuple(
+            value.strip()
+            for value in infohub_platforms_raw.split(",")
+            if value.strip()
+        )
+    else:
+        infohub_platforms = tuple(
+            str(value).strip()
+            for value in (infohub_platforms_raw or ())
+            if str(value).strip()
+        )
+    if not infohub_platforms:
+        infohub_platforms = LiteratureSearchConfig.infohub_collect_platforms
 
     return LiteratureSearchConfig(
         sources=sources,
@@ -1419,6 +1451,48 @@ def _parse_literature_search_config(data: dict[str, Any]) -> LiteratureSearchCon
         s2_api_key_env=str(
             data.get("s2_api_key_env", LiteratureSearchConfig.s2_api_key_env)
         ),
+        infohub_enabled=bool(data.get("infohub_enabled", True)),
+        infohub_mode=str(
+            data.get("infohub_mode", LiteratureSearchConfig.infohub_mode) or "http"
+        ),
+        infohub_url=str(
+            data.get("infohub_url", LiteratureSearchConfig.infohub_url)
+            or LiteratureSearchConfig.infohub_url
+        ),
+        infohub_repo=str(
+            data.get("infohub_repo", LiteratureSearchConfig.infohub_repo)
+            or LiteratureSearchConfig.infohub_repo
+        ),
+        infohub_timeout_sec=max(
+            0.1,
+            _safe_float(
+                data.get("infohub_timeout_sec"),
+                LiteratureSearchConfig.infohub_timeout_sec,
+            ),
+        ),
+        infohub_search_limit=max(
+            1,
+            _safe_int(
+                data.get("infohub_search_limit"),
+                LiteratureSearchConfig.infohub_search_limit,
+            ),
+        ),
+        infohub_collect_days=max(
+            1,
+            _safe_int(
+                data.get("infohub_collect_days"),
+                LiteratureSearchConfig.infohub_collect_days,
+            ),
+        ),
+        infohub_collect_platforms=infohub_platforms,
+        infohub_min_results=max(
+            0,
+            _safe_int(
+                data.get("infohub_min_results"),
+                LiteratureSearchConfig.infohub_min_results,
+            ),
+        ),
+        infohub_refresh=bool(data.get("infohub_refresh", True)),
     )
 
 

@@ -466,6 +466,14 @@ def execute_pipeline(
             EventType.PIPELINE_START, run_id=run_id,
             stages=total_stages, from_stage=int(from_stage),
         ))
+        if from_stage != Stage.TOPIC_INIT:
+            event_log.append(create_event(
+                EventType.RESUME,
+                run_id=run_id,
+                from_stage=int(from_stage),
+                from_stage_name=from_stage.name,
+                checkpoint_path=str(run_dir / "checkpoint.json"),
+            ))
     except Exception:
         logger.debug("Event log initialisation skipped")
 
@@ -543,8 +551,27 @@ def execute_pipeline(
                 event_log.append(create_event(
                     etype, run_id=run_id, stage=stage.name,
                     status=result.status.value, elapsed_sec=round(elapsed, 1),
-                    error=result.error,
+                    error=result.error, decision=result.decision,
+                    artifacts=list(result.artifacts),
                 ))
+                if result.decision == "cache_hit":
+                    cache_meta: dict[str, object] = {}
+                    cache_path = (
+                        run_dir / f"stage-{int(stage):02d}" / "cache_restore.json"
+                    )
+                    try:
+                        loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+                        if isinstance(loaded, dict):
+                            cache_meta = loaded
+                    except (FileNotFoundError, json.JSONDecodeError, OSError):
+                        pass
+                    event_log.append(create_event(
+                        EventType.CACHE_HIT,
+                        run_id=run_id,
+                        stage=stage.name,
+                        elapsed_sec=round(elapsed, 3),
+                        **cache_meta,
+                    ))
             except Exception:
                 pass
 
