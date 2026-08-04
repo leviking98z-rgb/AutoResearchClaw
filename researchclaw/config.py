@@ -158,6 +158,7 @@ class RuntimeConfig:
     retry_limit: int = 0
     stage_cache_enabled: bool = True
     stage_cache_dir: str = ""
+    stage_cache_literature_ttl_hours: float = 24.0
 
 
 @dataclass(frozen=True)
@@ -1033,6 +1034,10 @@ class RCConfig:
                 retry_limit=int(runtime.get("retry_limit", 0)),
                 stage_cache_enabled=bool(runtime.get("stage_cache_enabled", True)),
                 stage_cache_dir=str(runtime.get("stage_cache_dir", "") or ""),
+                stage_cache_literature_ttl_hours=max(
+                    0.0,
+                    float(runtime.get("stage_cache_literature_ttl_hours", 24.0)),
+                ),
             ),
             notifications=NotificationsConfig(
                 channel=notifications["channel"],

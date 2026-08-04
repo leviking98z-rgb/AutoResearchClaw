@@ -29,8 +29,9 @@ Stages 4 through 8 use a content-addressed cache. A fingerprint includes:
 - the relevant research, prompt, role/model, literature and web-search config;
 - a cache schema version.
 
-Outputs are copied into a shared cache only after a stage completes and passes
-its output contract. A cache hit restores all artifacts and records:
+Outputs are copied into a shared cache only after a stage completes, passes
+its output contract and PRM/approval/HITL review, and remains in `DONE` state.
+A cache hit restores all artifacts and records:
 
 - `stage-NN/cache_restore.json`;
 - `stage-NN/stage_health.json.cache`;
@@ -49,6 +50,12 @@ For an RSI campaign, the default shared cache path is:
 
 Set `runtime.stage_cache_enabled: false` to disable it or
 `runtime.stage_cache_dir` to use a different shared location.
+
+Stage 4 and Stage 8 also use
+`runtime.stage_cache_literature_ttl_hours` (24 hours by default). This prevents
+an otherwise identical topic/query from permanently hiding papers newly added
+to InfoHub. Set the value to `0` only when a permanently frozen literature
+snapshot is intentional.
 
 ## 3. Resume from the failed stage across RSI cycles
 
@@ -81,6 +88,22 @@ Pipeline events include:
 - every stage start/end/failure;
 - elapsed time, status, decision and artifacts;
 - cache hits and cache provenance.
+
+Role-level model calls are written under:
+
+```text
+<run>/audit/llm-<role>.jsonl
+```
+
+Each row records role/stage/provider, requested and response model, attempted
+fallback models, retry/fallback counts, elapsed time, token usage, finish and
+truncation status, generation controls, and a SHA-256 request fingerprint.
+Prompt bodies, API keys, and chain-of-thought are not stored.
+
+The same metadata is mirrored as `llm_call` rows in
+`<run>/pipeline_events.jsonl`, providing one chronological stream for
+stage/cache/model retrospectives while preserving the per-role audit files for
+focused debugging.
 
 Campaign events include:
 

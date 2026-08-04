@@ -64,6 +64,10 @@ class LLMResponse:
     finish_reason: str = ""
     truncated: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
+    attempts: int = 1
+    retries: int = 0
+    fallback_count: int = 0
+    attempted_models: tuple[str, ...] = ()
 
 
 @dataclass
@@ -213,10 +217,18 @@ class LLMClient:
         temp = temperature if temperature is not None else self.config.temperature
 
         last_error: Exception | None = None
+        attempted_models: list[str] = []
+        total_attempts = 0
+        total_retries = 0
 
         for m in models:
+            attempted_models.append(m)
             try:
                 resp = self._call_with_retry(m, messages, max_tok, temp, json_mode)
+                model_attempts = max(1, int(getattr(resp, "attempts", 1) or 1))
+                model_retries = max(0, int(getattr(resp, "retries", 0) or 0))
+                total_attempts += model_attempts
+                total_retries += model_retries
                 if strip_thinking:
                     from researchclaw.utils.thinking_tags import strip_thinking_tags
 
@@ -229,15 +241,31 @@ class LLMClient:
                         finish_reason=resp.finish_reason,
                         truncated=resp.truncated,
                         raw=resp.raw,
+                        attempts=total_attempts,
+                        retries=total_retries,
+                        fallback_count=max(0, len(attempted_models) - 1),
+                        attempted_models=tuple(attempted_models),
                     )
+                else:
+                    resp.attempts = total_attempts
+                    resp.retries = total_retries
+                    resp.fallback_count = max(0, len(attempted_models) - 1)
+                    resp.attempted_models = tuple(attempted_models)
                 return resp
             except Exception as exc:  # noqa: BLE001
+                attempts, retries = self._attempt_metadata(exc)
+                total_attempts += attempts
+                total_retries += retries
                 logger.warning("Model %s failed: %s. Trying next.", m, exc)
                 last_error = exc
 
-        raise RuntimeError(
+        error = RuntimeError(
             f"All models failed. Last error: {last_error}"
-        ) from last_error
+        )
+        self._set_attempt_metadata(error, total_attempts)
+        setattr(error, "_researchclaw_retries", max(0, total_retries))
+        setattr(error, "_researchclaw_attempted_models", tuple(attempted_models))
+        raise error from last_error
 
     def preflight(self) -> tuple[bool, str]:
         """Quick connectivity check - one minimal chat call.
@@ -293,9 +321,12 @@ class LLMClient:
         """Call with exponential backoff retry."""
         for attempt in range(self.config.max_retries):
             try:
-                return self._raw_call(
+                response = self._raw_call(
                     model, messages, max_tokens, temperature, json_mode
                 )
+                response.attempts = attempt + 1
+                response.retries = attempt
+                return response
             except urllib.error.HTTPError as e:
                 status = e.code
                 body = ""
@@ -306,6 +337,7 @@ class LLMClient:
 
                 # Non-retryable errors
                 if status == 403 and "not allowed to use model" in body:
+                    self._set_attempt_metadata(e, attempt + 1)
                     raise  # Model not available — let fallback handle
 
                 # 400 is normally non-retryable, but some providers
@@ -326,6 +358,7 @@ class LLMClient:
                         )
                     )
                     if not _transient_400:
+                        self._set_attempt_metadata(e, attempt + 1)
                         raise  # Genuine bad request — don't retry
 
                 # Retryable: 429 (rate limit), transient 400, 500, 502, 503, 504,
@@ -350,8 +383,9 @@ class LLMClient:
                     time.sleep(delay)
                     continue
 
+                self._set_attempt_metadata(e, attempt + 1)
                 raise  # Other HTTP errors
-            except urllib.error.URLError:
+            except urllib.error.URLError as exc:
                 if attempt < self.config.max_retries - 1:
                     delay = min(
                         self.config.retry_base_delay * (2**attempt),
@@ -359,6 +393,7 @@ class LLMClient:
                     )
                     time.sleep(delay)
                     continue
+                self._set_attempt_metadata(exc, attempt + 1)
                 raise
             except (TimeoutError, OSError) as exc:
                 # Covers TimeoutError, ConnectionResetError, IncompleteRead, etc.
@@ -374,12 +409,37 @@ class LLMClient:
                     )
                     time.sleep(delay)
                     continue
+                self._set_attempt_metadata(exc, attempt + 1)
                 raise
 
         # All retries exhausted
-        raise RuntimeError(
+        error = RuntimeError(
             f"LLM call failed after {self.config.max_retries} retries for model {model}"
         )
+        self._set_attempt_metadata(error, self.config.max_retries)
+        raise error
+
+    @staticmethod
+    def _set_attempt_metadata(exc: BaseException | None, attempts: int) -> None:
+        if exc is None:
+            return
+        try:
+            setattr(exc, "_researchclaw_attempts", max(1, attempts))
+            setattr(exc, "_researchclaw_retries", max(0, attempts - 1))
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _attempt_metadata(exc: BaseException) -> tuple[int, int]:
+        attempts = max(
+            1,
+            int(getattr(exc, "_researchclaw_attempts", 1) or 1),
+        )
+        retries = max(
+            0,
+            int(getattr(exc, "_researchclaw_retries", attempts - 1) or 0),
+        )
+        return attempts, retries
 
     def _raw_call(
         self,

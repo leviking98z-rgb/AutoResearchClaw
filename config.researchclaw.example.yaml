@@ -18,6 +18,9 @@ runtime:
   # <campaign>/shared/stage-cache when the path is left blank.
   stage_cache_enabled: true
   stage_cache_dir: ""
+  # Stage 4/8 depend on a growing literature corpus.  Expire those entries so
+  # newly ingested papers can influence later runs.  0 disables age expiry.
+  stage_cache_literature_ttl_hours: 24
 
 notifications:
   channel: "console"

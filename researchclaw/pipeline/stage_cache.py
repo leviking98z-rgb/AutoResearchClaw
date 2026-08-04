@@ -23,6 +23,7 @@ import shutil
 import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, is_dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,12 @@ CACHEABLE_STAGES = frozenset(
         Stage.LITERATURE_SCREEN,
         Stage.KNOWLEDGE_EXTRACT,
         Stage.SYNTHESIS,
+        Stage.HYPOTHESIS_GEN,
+    }
+)
+LITERATURE_FRESHNESS_STAGES = frozenset(
+    {
+        Stage.LITERATURE_COLLECT,
         Stage.HYPOTHESIS_GEN,
     }
 )
@@ -225,6 +232,36 @@ def _manifest_valid(entry: Path, manifest: Mapping[str, Any]) -> bool:
     return True
 
 
+def _entry_age_sec(entry: Path, manifest: Mapping[str, Any]) -> float:
+    created_at = str(manifest.get("created_at", "") or "").strip()
+    if created_at:
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            return max(0.0, (datetime.now(UTC) - created).total_seconds())
+        except ValueError:
+            pass
+    try:
+        return max(0.0, datetime.now(UTC).timestamp() - entry.stat().st_mtime)
+    except OSError:
+        return float("inf")
+
+
+def _freshness_ttl_hours(stage: Stage, config: Any) -> float:
+    if stage not in LITERATURE_FRESHNESS_STAGES:
+        return 0.0
+    raw = getattr(
+        getattr(config, "runtime", None),
+        "stage_cache_literature_ttl_hours",
+        24.0,
+    )
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 24.0
+
+
 def restore_stage_cache(
     *,
     stage: Stage,
@@ -249,6 +286,16 @@ def restore_stage_cache(
         return None
     if not isinstance(manifest, dict) or not _manifest_valid(entry, manifest):
         logger.warning("Invalid stage cache entry ignored: %s", entry)
+        return None
+    ttl_hours = _freshness_ttl_hours(stage, config)
+    age_sec = _entry_age_sec(entry, manifest)
+    if ttl_hours > 0 and age_sec > ttl_hours * 3600:
+        logger.info(
+            "Expired stage cache entry ignored: stage=%s age=%.1fh ttl=%.1fh",
+            stage.name,
+            age_sec / 3600,
+            ttl_hours,
+        )
         return None
     payload = entry / "payload"
     stage_dir.mkdir(parents=True, exist_ok=True)
@@ -277,6 +324,8 @@ def restore_stage_cache(
         "source_run_id": manifest.get("run_id"),
         "source_stage_dir": manifest.get("source_stage_dir"),
         "files": len(manifest["files"]),
+        "age_sec": round(age_sec, 3),
+        "ttl_hours": ttl_hours,
         "fingerprint_components": components,
     }
     (stage_dir / "cache_restore.json").write_text(
@@ -340,6 +389,7 @@ def save_stage_cache(
             return None
         manifest = {
             "schema_version": CACHE_SCHEMA_VERSION,
+            "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
             "stage": int(stage),
             "stage_name": stage.name,
             "fingerprint": fingerprint,

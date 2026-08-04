@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ def _config(cache_dir: Path, *, topic: str = "RSI") -> SimpleNamespace:
         runtime=SimpleNamespace(
             stage_cache_enabled=True,
             stage_cache_dir=str(cache_dir),
+            stage_cache_literature_ttl_hours=24,
         ),
         research=SimpleNamespace(
             topic=topic,
@@ -158,3 +160,72 @@ def test_corrupt_payload_is_cache_miss(tmp_path: Path) -> None:
         is None
     )
 
+
+def test_expired_literature_cache_is_miss(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    run_dir = tmp_path / "run"
+    _stage3(run_dir)
+    stage4 = run_dir / "stage-04"
+    stage4.mkdir()
+    (stage4 / "candidates.jsonl").write_text("{}\n")
+    config = _config(cache_dir)
+    saved = save_stage_cache(
+        stage=Stage.LITERATURE_COLLECT,
+        stage_dir=stage4,
+        run_dir=run_dir,
+        run_id="first",
+        config=config,
+        artifacts=("candidates.jsonl",),
+    )
+    assert saved is not None
+    manifest_path = Path(saved["cache_entry"]) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["created_at"] = (
+        datetime.now(UTC) - timedelta(hours=25)
+    ).isoformat(timespec="seconds")
+    manifest_path.write_text(json.dumps(manifest))
+
+    assert (
+        restore_stage_cache(
+            stage=Stage.LITERATURE_COLLECT,
+            stage_dir=tmp_path / "other" / "stage-04",
+            run_dir=run_dir,
+            config=config,
+        )
+        is None
+    )
+
+
+def test_zero_ttl_disables_literature_cache_expiry(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    run_dir = tmp_path / "run"
+    _stage3(run_dir)
+    stage4 = run_dir / "stage-04"
+    stage4.mkdir()
+    (stage4 / "candidates.jsonl").write_text("{}\n")
+    config = _config(cache_dir)
+    config.runtime.stage_cache_literature_ttl_hours = 0
+    saved = save_stage_cache(
+        stage=Stage.LITERATURE_COLLECT,
+        stage_dir=stage4,
+        run_dir=run_dir,
+        run_id="first",
+        config=config,
+        artifacts=("candidates.jsonl",),
+    )
+    assert saved is not None
+    manifest_path = Path(saved["cache_entry"]) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["created_at"] = (
+        datetime.now(UTC) - timedelta(days=365)
+    ).isoformat(timespec="seconds")
+    manifest_path.write_text(json.dumps(manifest))
+
+    hit = restore_stage_cache(
+        stage=Stage.LITERATURE_COLLECT,
+        stage_dir=tmp_path / "other" / "stage-04",
+        run_dir=run_dir,
+        config=config,
+    )
+    assert hit is not None
+    assert hit["ttl_hours"] == 0

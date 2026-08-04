@@ -328,7 +328,6 @@ def test_execute_stage_creates_stage_dir_writes_artifacts_and_meta(
     )
     assert (run_dir / "stage-01" / "hardware_profile.json").exists()
     assert len(fake_llm.calls) == 1
-
     decision = cast(
         dict[str, Any],
         json.loads(
@@ -338,6 +337,109 @@ def test_execute_stage_creates_stage_dir_writes_artifacts_and_meta(
     assert decision["run_id"] == "run-1"
     assert decision["status"] == "done"
     assert decision["output_artifacts"] == ["goal.md", "hardware_profile.json"]
+
+
+def test_stage_cache_is_not_saved_when_post_hitl_rejects(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    from researchclaw.pipeline._helpers import StageResult
+
+    config = replace(
+        rc_config,
+        security=replace(rc_config.security, hitl_required_stages=()),
+    )
+    (run_dir / "stage-07").mkdir()
+    (run_dir / "stage-07" / "synthesis.md").write_text("synthesis")
+    stage_dir = run_dir / "stage-08"
+
+    def fake_executor(*args: Any, **kwargs: Any) -> StageResult:
+        _ = (args, kwargs)
+        stage_dir.mkdir(exist_ok=True)
+        (stage_dir / "hypotheses.md").write_text("hypothesis")
+        return StageResult(
+            stage=Stage.HYPOTHESIS_GEN,
+            status=StageStatus.DONE,
+            artifacts=("hypotheses.md",),
+        )
+
+    saved: list[bool] = []
+    monkeypatch.setitem(
+        rc_executor._STAGE_EXECUTORS,
+        Stage.HYPOTHESIS_GEN,
+        fake_executor,
+    )
+    monkeypatch.setattr(
+        rc_executor,
+        "_run_hitl_post_stage",
+        lambda stage, result, run_dir, adapters, config=None: StageResult(
+            stage=stage,
+            status=StageStatus.REJECTED,
+            artifacts=result.artifacts,
+            error="rejected",
+            decision="reject",
+        ),
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_cache.restore_stage_cache",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_cache.save_stage_cache",
+        lambda **kwargs: saved.append(True),
+    )
+
+    result = rc_executor.execute_stage(
+        Stage.HYPOTHESIS_GEN,
+        run_dir=run_dir,
+        run_id="reject-cache",
+        config=config,
+        adapters=adapters,
+        auto_approve_gates=True,
+    )
+
+    assert result.status == StageStatus.REJECTED
+    assert saved == []
+
+
+def test_stage_cache_hit_skips_gates_and_post_hitl_review(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    (run_dir / "stage-04").mkdir()
+    (run_dir / "stage-04" / "candidates.jsonl").write_text("{}\n")
+    stage_dir = run_dir / "stage-05"
+    stage_dir.mkdir()
+    (stage_dir / "shortlist.jsonl").write_text("{}\n")
+    monkeypatch.setattr(
+        "researchclaw.pipeline.stage_cache.restore_stage_cache",
+        lambda **kwargs: {"hit": True, "fingerprint": "cached"},
+    )
+    monkeypatch.setattr(
+        rc_executor,
+        "_run_hitl_post_stage",
+        lambda *args, **kwargs: pytest.fail(
+            "accepted cache entries must not require another HITL review"
+        ),
+    )
+
+    result = rc_executor.execute_stage(
+        Stage.LITERATURE_SCREEN,
+        run_dir=run_dir,
+        run_id="cache-hit",
+        config=rc_config,
+        adapters=adapters,
+        auto_approve_gates=False,
+    )
+
+    assert result.status == StageStatus.DONE
+    assert result.decision == "cache_hit"
+    decision = json.loads((stage_dir / "decision.json").read_text())
+    assert decision["status"] == "done"
 
 
 def test_topic_init_copies_structured_selected_topic_into_stage_context(

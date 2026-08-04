@@ -339,6 +339,16 @@ def test_rcconfig_from_dict_uses_default_literature_search(tmp_path: Path):
     assert config.literature_search.infohub_enabled is True
     assert config.literature_search.infohub_mode == "http"
     assert config.literature_search.infohub_url == "http://127.0.0.1:8077"
+    assert config.runtime.stage_cache_literature_ttl_hours == 24.0
+
+
+def test_rcconfig_parses_stage_cache_literature_ttl(tmp_path: Path) -> None:
+    data = _valid_config_data()
+    data["runtime"]["stage_cache_literature_ttl_hours"] = 6
+
+    config = RCConfig.from_dict(data, project_root=tmp_path, check_paths=False)
+
+    assert config.runtime.stage_cache_literature_ttl_hours == 6.0
 
 
 def test_rcconfig_from_dict_parses_literature_search(tmp_path: Path):

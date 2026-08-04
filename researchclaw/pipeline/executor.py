@@ -643,28 +643,14 @@ def execute_stage(
             )
             if cache_details is not None:
                 result = cached_result(stage)
-                _write_stage_meta(stage_dir, stage, run_id, result)
-                stage_health = {
-                    "stage_id": f"{int(stage):02d}-{stage.name.lower()}",
-                    "run_id": run_id,
-                    "duration_sec": round(_time.monotonic() - _t_health_start, 2),
-                    "status": result.status.value,
-                    "artifacts_count": len(result.artifacts),
-                    "error": None,
-                    "timestamp": _utcnow_iso(),
-                    "cache": cache_details,
-                }
-                (stage_dir / "stage_health.json").write_text(
-                    json.dumps(stage_health, indent=2), encoding="utf-8"
-                )
                 logger.info(
                     "[cache] HIT stage=%s fingerprint=%s source_run=%s",
                     stage.name,
                     cache_details.get("fingerprint"),
                     cache_details.get("source_run_id"),
                 )
-                return result
-            logger.info("[cache] MISS stage=%s", stage.name)
+            else:
+                logger.info("[cache] MISS stage=%s", stage.name)
     except Exception:  # noqa: BLE001
         logger.warning("Stage cache restore failed for %s", stage.name, exc_info=True)
 
@@ -678,78 +664,79 @@ def execute_stage(
     if bridge.use_memory:
         adapters.memory.append("stages", f"{run_id}:{int(stage)}:running")
 
-    llm = None
-    try:
-        from researchclaw.llm.roles import (
-            bind_role_llm_client,
-            create_stage_llm_client,
-            role_for_stage,
-        )
-
-        role_name = role_for_stage(stage)
-        role_config = config.llm.roles.get(role_name)
-        role_has_override = role_config is not None and any(
-            (
-                role_config.provider,
-                role_config.base_url,
-                role_config.api_key_env,
-                role_config.api_key,
-                role_config.model,
-                role_config.fallback_models is not None,
-            )
-        )
-        if role_has_override or config.llm.provider == "acp":
-            llm = create_stage_llm_client(config, stage, run_dir=run_dir)
-        else:
-            candidate = LLMClient.from_rc_config(config)
-            if candidate.config.base_url and candidate.config.api_key:
-                llm = bind_role_llm_client(
-                    candidate,
-                    config,
-                    role_name,
-                    run_dir=run_dir,
-                    stage=stage,
-                )
-    except Exception as _llm_exc:  # noqa: BLE001
-        logger.warning("LLM client creation failed: %s", _llm_exc)
+    if cache_details is None:
         llm = None
-
-    try:
-        _ = advance(stage, StageStatus.PENDING, TransitionEvent.START)
-        executor = _STAGE_EXECUTORS[stage]
-        prompts = PromptManager(
-            config.prompts.custom_file or None,  # type: ignore[attr-defined]
-            domain=_prompt_bank_domain_from_config(config),
-            extra_prompts={
-                stage_key: path_or_text
-                for stage_key, path_or_text in getattr(config.prompts, "extra_prompts", ())  # type: ignore[attr-defined]
-            } or None,
-        )
         try:
-            from researchclaw.pipeline import _helpers as _pipeline_helpers
-
-            _pipeline_helpers._get_skill_registry(config)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            result = executor(
-                stage_dir, run_dir, config, adapters, llm=llm, prompts=prompts
+            from researchclaw.llm.roles import (
+                bind_role_llm_client,
+                create_stage_llm_client,
+                role_for_stage,
             )
-        except TypeError as exc:
-            if "unexpected keyword argument 'prompts'" not in str(exc):
-                raise
-            result = executor(stage_dir, run_dir, config, adapters, llm=llm)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Stage %s failed", stage.name)
-        result = StageResult(
-            stage=stage,
-            status=StageStatus.FAILED,
-            artifacts=(),
-            error=str(exc),
-            decision="retry",
-        )
 
-    if result.status == StageStatus.DONE:
+            role_name = role_for_stage(stage)
+            role_config = config.llm.roles.get(role_name)
+            role_has_override = role_config is not None and any(
+                (
+                    role_config.provider,
+                    role_config.base_url,
+                    role_config.api_key_env,
+                    role_config.api_key,
+                    role_config.model,
+                    role_config.fallback_models is not None,
+                )
+            )
+            if role_has_override or config.llm.provider == "acp":
+                llm = create_stage_llm_client(config, stage, run_dir=run_dir)
+            else:
+                candidate = LLMClient.from_rc_config(config)
+                if candidate.config.base_url and candidate.config.api_key:
+                    llm = bind_role_llm_client(
+                        candidate,
+                        config,
+                        role_name,
+                        run_dir=run_dir,
+                        stage=stage,
+                    )
+        except Exception as _llm_exc:  # noqa: BLE001
+            logger.warning("LLM client creation failed: %s", _llm_exc)
+            llm = None
+
+        try:
+            _ = advance(stage, StageStatus.PENDING, TransitionEvent.START)
+            executor = _STAGE_EXECUTORS[stage]
+            prompts = PromptManager(
+                config.prompts.custom_file or None,  # type: ignore[attr-defined]
+                domain=_prompt_bank_domain_from_config(config),
+                extra_prompts={
+                    stage_key: path_or_text
+                    for stage_key, path_or_text in getattr(config.prompts, "extra_prompts", ())  # type: ignore[attr-defined]
+                } or None,
+            )
+            try:
+                from researchclaw.pipeline import _helpers as _pipeline_helpers
+
+                _pipeline_helpers._get_skill_registry(config)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                result = executor(
+                    stage_dir, run_dir, config, adapters, llm=llm, prompts=prompts
+                )
+            except TypeError as exc:
+                if "unexpected keyword argument 'prompts'" not in str(exc):
+                    raise
+                result = executor(stage_dir, run_dir, config, adapters, llm=llm)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Stage %s failed", stage.name)
+            result = StageResult(
+                stage=stage,
+                status=StageStatus.FAILED,
+                artifacts=(),
+                error=str(exc),
+                decision="retry",
+            )
+
+    if result.status == StageStatus.DONE and cache_details is None:
         for output_file in _select_output_files(contract, config):
             if output_file.endswith("/"):
                 path = stage_dir / output_file.rstrip("/")
@@ -776,26 +763,12 @@ def execute_stage(
                     )
                     break
 
-    if result.status == StageStatus.DONE:
-        try:
-            from researchclaw.pipeline.stage_cache import save_stage_cache
-
-            cache_details = save_stage_cache(
-                stage=stage,
-                stage_dir=stage_dir,
-                run_dir=run_dir,
-                run_id=run_id,
-                config=config,
-                artifacts=result.artifacts,
-            )
-        except Exception:  # noqa: BLE001
-            logger.warning("Stage cache store failed for %s", stage.name, exc_info=True)
-
     # --- MetaClaw PRM quality gate evaluation ---
     try:
         mc_bridge = getattr(config, "metaclaw_bridge", None)
         if (
-            mc_bridge
+            cache_details is None
+            and mc_bridge
             and getattr(mc_bridge, "enabled", False)
             and result.status == StageStatus.DONE
         ):
@@ -856,7 +829,7 @@ def execute_stage(
     profile_name = (
         getattr(getattr(config, "project", None), "profile", None) or None
     )
-    if gate_required(
+    if cache_details is None and gate_required(
         stage,
         config.security.hitl_required_stages,
         profile=profile_name,
@@ -880,6 +853,28 @@ def execute_stage(
                     f"Approval required for {stage.name}",
                 )
 
+    # --- HITL post-stage hook ---
+    if cache_details is None:
+        result = _run_hitl_post_stage(stage, result, run_dir, adapters, config=config)
+
+    # Publish only fully accepted output. Contract validation, PRM, configured
+    # approval gates, and HITL post-review must all leave the stage DONE;
+    # otherwise a rejected/blocked artifact could poison future cache hits.
+    if result.status == StageStatus.DONE and cache_details is None:
+        try:
+            from researchclaw.pipeline.stage_cache import save_stage_cache
+
+            cache_details = save_stage_cache(
+                stage=stage,
+                stage_dir=stage_dir,
+                run_dir=run_dir,
+                run_id=run_id,
+                config=config,
+                artifacts=result.artifacts,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("Stage cache store failed for %s", stage.name, exc_info=True)
+
     if bridge.use_memory:
         adapters.memory.append("stages", f"{run_id}:{int(stage)}:{result.status.value}")
 
@@ -902,8 +897,5 @@ def execute_stage(
         )
     except OSError:
         pass
-
-    # --- HITL post-stage hook ---
-    result = _run_hitl_post_stage(stage, result, run_dir, adapters, config=config)
 
     return result

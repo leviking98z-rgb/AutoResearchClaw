@@ -572,6 +572,24 @@ def execute_pipeline(
                         elapsed_sec=round(elapsed, 3),
                         **cache_meta,
                     ))
+                else:
+                    stage_health_path = (
+                        run_dir / f"stage-{int(stage):02d}" / "stage_health.json"
+                    )
+                    try:
+                        health = json.loads(
+                            stage_health_path.read_text(encoding="utf-8")
+                        )
+                    except (FileNotFoundError, json.JSONDecodeError, OSError):
+                        health = {}
+                    stored = health.get("cache") if isinstance(health, dict) else None
+                    if isinstance(stored, dict) and stored.get("saved") is not None:
+                        event_log.append(create_event(
+                            EventType.CACHE_STORE,
+                            run_id=run_id,
+                            stage=stage.name,
+                            **stored,
+                        ))
             except Exception:
                 pass
 

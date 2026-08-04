@@ -53,6 +53,24 @@ class ConfiguredRecordingBackend(RecordingBackend):
         )()
 
 
+class MetadataRecordingBackend(RecordingBackend):
+    def chat(self, messages: list[dict[str, str]], **kwargs: Any) -> LLMResponse:
+        self.calls.append({"messages": messages, **kwargs})
+        return LLMResponse(
+            content="ok",
+            model="fallback-model",
+            prompt_tokens=8,
+            completion_tokens=5,
+            total_tokens=13,
+            finish_reason="length",
+            truncated=True,
+            attempts=3,
+            retries=1,
+            fallback_count=1,
+            attempted_models=("primary-model", "fallback-model"),
+        )
+
+
 def _config(tmp_path: Path) -> RCConfig:
     data = {
         "project": {"name": "roles", "mode": "full-auto"},
@@ -249,8 +267,48 @@ def test_role_client_writes_audit_without_prompt_content(tmp_path: Path) -> None
     assert row["stage"] == int(Stage.PEER_REVIEW)
     assert row["requested_model"] == "review-model"
     assert row["total_tokens"] == 5
+    assert row["attempts"] == 1
+    assert row["retries"] == 0
+    assert row["fallback_count"] == 0
+    assert row["truncated"] is False
+    assert row["json_mode"] is False
     assert len(row["request_sha256"]) == 64
     assert secret_prompt not in audit_path.read_text(encoding="utf-8")
+    pipeline_rows = [
+        json.loads(line)
+        for line in (tmp_path / "pipeline_events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert pipeline_rows[-1]["type"] == "llm_call"
+    assert pipeline_rows[-1]["role"] == "skeptical_reviewer"
+
+
+def test_role_audit_records_retry_and_fallback_metadata(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    backend = MetadataRecordingBackend()
+    client = bind_role_llm_client(
+        backend,
+        config,
+        "idea_scientist",
+        run_dir=tmp_path,
+        stage=Stage.HYPOTHESIS_GEN,
+    )
+
+    client.chat([{"role": "user", "content": "generate"}], json_mode=True)
+
+    row = json.loads(
+        (tmp_path / "audit" / "llm-idea_scientist.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert row["attempted_models"] == ["primary-model", "fallback-model"]
+    assert row["attempts"] == 3
+    assert row["retries"] == 1
+    assert row["fallback_count"] == 1
+    assert row["response_model"] == "fallback-model"
+    assert row["truncated"] is True
+    assert row["json_mode"] is True
 
 
 def test_for_stage_rebinds_role_and_defaults(tmp_path: Path) -> None:

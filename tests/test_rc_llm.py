@@ -525,3 +525,37 @@ def test_chat_uses_fallback_after_first_model_error(monkeypatch: pytest.MonkeyPa
     response = client.chat([{"role": "user", "content": "x"}])
     assert calls == ["gpt-5.2", "gpt-5.1"]
     assert response.model == "gpt-5.1"
+    assert response.attempted_models == ("gpt-5.2", "gpt-5.1")
+    assert response.fallback_count == 1
+    assert response.attempts == 2
+
+
+def test_retry_metadata_is_recorded_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_raw_call(
+        self: LLMClient,
+        model: str,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+        json_mode: bool,
+    ) -> LLMResponse:
+        nonlocal calls
+        _ = (self, messages, max_tokens, temperature, json_mode)
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("temporary")
+        return LLMResponse(content="ok", model=model)
+
+    monkeypatch.setattr(LLMClient, "_raw_call", fake_raw_call)
+    monkeypatch.setattr("researchclaw.llm.client.time.sleep", lambda _: None)
+    client = _make_client(primary_model="gpt-5.2", fallback_models=[])
+    response = client.chat([{"role": "user", "content": "x"}])
+
+    assert response.attempts == 2
+    assert response.retries == 1
+    assert response.fallback_count == 0
+    assert response.attempted_models == ("gpt-5.2",)

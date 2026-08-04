@@ -195,6 +195,7 @@ class RoleLLMClient:
         self.audit_path = audit_path
         self.config = getattr(backend, "config", None)
         self._audit_lock = threading.Lock()
+        self._event_lock = threading.Lock()
 
     @property
     def backend(self) -> Any:
@@ -306,11 +307,27 @@ class RoleLLMClient:
                     "provider": self.resolved_role.provider,
                     "requested_model": requested_model or "",
                     "backend_model_override": effective_model or "",
+                    "configured_fallback_models": list(
+                        self.resolved_role.fallback_models
+                    ),
+                    "attempted_models": list(
+                        getattr(exc, "_researchclaw_attempted_models", ()) or ()
+                    ),
+                    "attempts": int(
+                        getattr(exc, "_researchclaw_attempts", 1) or 1
+                    ),
+                    "retries": int(
+                        getattr(exc, "_researchclaw_retries", 0) or 0
+                    ),
                     "status": "error",
                     "error_type": type(exc).__name__,
+                    "error_message": str(exc)[:500],
                     "elapsed_sec": round(time.monotonic() - started, 6),
                     "request_sha256": request_hash,
                     "message_count": len(messages),
+                    "max_tokens": effective_tokens,
+                    "temperature": effective_temperature,
+                    "json_mode": bool(json_mode),
                 }
             )
             raise
@@ -324,16 +341,31 @@ class RoleLLMClient:
                 "requested_model": requested_model or "",
                 "backend_model_override": effective_model or "",
                 "response_model": getattr(response, "model", ""),
+                "configured_fallback_models": list(
+                    self.resolved_role.fallback_models
+                ),
+                "attempted_models": list(
+                    getattr(response, "attempted_models", ()) or ()
+                ),
+                "attempts": int(getattr(response, "attempts", 1) or 1),
+                "retries": int(getattr(response, "retries", 0) or 0),
+                "fallback_count": int(
+                    getattr(response, "fallback_count", 0) or 0
+                ),
                 "status": "ok",
                 "elapsed_sec": round(time.monotonic() - started, 6),
                 "request_sha256": request_hash,
                 "message_count": len(messages),
+                "max_tokens": effective_tokens,
+                "temperature": effective_temperature,
+                "json_mode": bool(json_mode),
                 "prompt_tokens": int(getattr(response, "prompt_tokens", 0) or 0),
                 "completion_tokens": int(
                     getattr(response, "completion_tokens", 0) or 0
                 ),
                 "total_tokens": int(getattr(response, "total_tokens", 0) or 0),
                 "finish_reason": str(getattr(response, "finish_reason", "") or ""),
+                "truncated": bool(getattr(response, "truncated", False)),
             }
         )
         return response
@@ -407,7 +439,19 @@ class RoleLLMClient:
                 "a", encoding="utf-8"
             ) as handle:
                 handle.write(line)
-        except OSError:
+            event_path = self.audit_path.parent.parent / "pipeline_events.jsonl"
+            from researchclaw.pipeline.event_log import (
+                EventLog,
+                EventType,
+                create_event,
+            )
+
+            with self._event_lock:
+                EventLog(
+                    event_path.parent,
+                    filename=event_path.name,
+                ).append(create_event(EventType.LLM_CALL, **record))
+        except Exception:  # noqa: BLE001
             logger.warning(
                 "Could not write role LLM audit log: %s",
                 self.audit_path,

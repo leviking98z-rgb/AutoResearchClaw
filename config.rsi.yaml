@@ -18,6 +18,7 @@ runtime:
   retry_limit: 2
   stage_cache_enabled: true
   stage_cache_dir: ""
+  stage_cache_literature_ttl_hours: 24
 
 notifications:
   channel: "console"

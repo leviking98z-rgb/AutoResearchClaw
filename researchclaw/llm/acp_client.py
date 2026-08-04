@@ -128,6 +128,7 @@ class ACPClient:
             content=content,
             model=f"acp:{self.config.agent}",
             finish_reason="stop",
+            attempted_models=(f"acp:{self.config.agent}",),
         )
 
     def preflight(self) -> tuple[bool, str]:
