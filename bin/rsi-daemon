@@ -3,6 +3,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CB="${RSI_CB_COMMAND:-/root/shared/.clusters/.tools/clusterbridge.sh}"
+PYTHON="${RSI_PYTHON:-$ROOT/.venv/bin/python}"
+if [[ ! -x "$PYTHON" ]]; then
+  PYTHON="$(command -v python3 || true)"
+fi
+if [[ -z "$PYTHON" ]]; then
+  echo "Python 3 is required (set RSI_PYTHON to override)." >&2
+  exit 1
+fi
 
 usage() {
   cat >&2 <<'EOF'
@@ -40,7 +48,7 @@ DEFAULT_CLAIM_PURPOSE="AutoResearch RSI 32-GPU execution pool"
 
 if [[ -f "$PID_FILE" ]]; then
   read -r EXISTING_PID EXISTING_TICKS < <(
-    "$ROOT/.venv/bin/python" - "$PID_FILE" <<'PY'
+    "$PYTHON" - "$PID_FILE" <<'PY'
 import json
 import pathlib
 import sys
