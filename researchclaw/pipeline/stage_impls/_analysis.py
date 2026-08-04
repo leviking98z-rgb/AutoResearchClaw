@@ -14,6 +14,7 @@ from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._domain import _detect_domain, _is_ml_domain
 from researchclaw.pipeline._helpers import (
     StageResult,
+    _bind_stage_role,
     _build_context_preamble,
     _chat_with_prompt,
     _collect_experiment_results,
@@ -24,6 +25,10 @@ from researchclaw.pipeline._helpers import (
     _safe_json_loads,
     _synthesize_perspectives,
     _utcnow_iso,
+)
+from researchclaw.pipeline.result_validity import (
+    OVERALL_CONDITION,
+    assess_production_result,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
@@ -40,6 +45,7 @@ def _execute_result_analysis(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.RESULT_ANALYSIS)
     # --- Collect experiment data ---
     exp_data = _collect_experiment_results(
         run_dir,
@@ -64,12 +70,15 @@ def _execute_result_analysis(
             def _get_best_sandbox(it: dict) -> dict:
                 """BUG-181: Metrics may be in sandbox or sandbox_after_fix."""
                 sbx = it.get("sandbox", {})
-                if sbx.get("metrics"):
+                if sbx.get("metrics") and sbx.get("result_valid") is not False:
                     return sbx
                 sbx_fix = it.get("sandbox_after_fix", {})
-                if sbx_fix.get("metrics"):
+                if (
+                    sbx_fix.get("metrics")
+                    and sbx_fix.get("result_valid") is not False
+                ):
                     return sbx_fix
-                return sbx
+                return {}
 
             for _it in _refine_data.get("iterations", []):
                 _sbx = _get_best_sandbox(_it)
@@ -165,13 +174,39 @@ def _execute_result_analysis(
                             "run_id": "iterative-refine-best",
                             "task_id": "sandbox-main",
                             "status": "completed",
+                            "returncode": _sbx.get("returncode", 0),
                             "metrics": {
                                 k: v for k, v in _refine_metrics.items()
                             },
                             "elapsed_sec": _sbx.get("elapsed_sec", 0),
-                            "stdout": "",  # omit for brevity
+                            # Keep enough execution evidence for the production
+                            # validity gate below.  Dropping stdout here made a
+                            # refinement with explicit failure markers look
+                            # indistinguishable from a genuine successful run.
+                            "stdout": _sbx.get("stdout", ""),
                             "stderr": _sbx.get("stderr", ""),
                             "timed_out": _sbx.get("timed_out", False),
+                            "result_valid": _sbx.get("result_valid"),
+                            "partial_result_valid": _sbx.get(
+                                "partial_result_valid",
+                                False,
+                            ),
+                            "validity_reasons": _sbx.get(
+                                "validity_reasons",
+                                [],
+                            ),
+                            "valid_conditions": _sbx.get(
+                                "valid_conditions",
+                                [],
+                            ),
+                            "invalid_conditions": _sbx.get(
+                                "invalid_conditions",
+                                {},
+                            ),
+                            "successful_seed_count": _sbx.get(
+                                "successful_seed_count",
+                                0,
+                            ),
                         }
                         # Rebuild latex table
                         _ltx = [
@@ -236,11 +271,54 @@ def _execute_result_analysis(
     if exp_data.get("best_run") and isinstance(exp_data["best_run"], dict):
         _best_metrics = exp_data["best_run"].get("metrics", {})
 
+    _best_run_payload = (
+        exp_data.get("best_run")
+        if isinstance(exp_data.get("best_run"), dict)
+        else {}
+    )
+    _best_run_status = str(_best_run_payload.get("status", "") or "")
+    _best_run_returncode = _best_run_payload.get("returncode")
+    if _best_run_returncode is None:
+        _best_run_returncode = (
+            1 if _best_run_status.casefold() == "failed" else 0
+        )
+    _analysis_validity = assess_production_result(
+        returncode=int(_best_run_returncode),
+        timed_out=bool(_best_run_payload.get("timed_out", False)),
+        metrics=_best_metrics,
+        stdout=str(_best_run_payload.get("stdout", "") or ""),
+        stderr=str(_best_run_payload.get("stderr", "") or ""),
+        structured_results=exp_data.get("structured_results"),
+        status=_best_run_status,
+        declared_valid=(
+            _best_run_payload.get("result_valid")
+            if isinstance(
+                _best_run_payload.get("result_valid"),
+                bool,
+            )
+            else None
+        ),
+    )
+    if _analysis_validity.valid:
+        _best_metrics = _analysis_validity.valid_metrics
+    else:
+        _best_metrics = {}
+    _valid_condition_names = {
+        condition
+        for condition in _analysis_validity.valid_conditions
+        if condition != OVERALL_CONDITION
+    }
+
     # Group metrics by condition prefix (e.g., "ppo/primary_metric" → condition "ppo")
     for _mk, _mv in _best_metrics.items():
         parts = _mk.split("/")
         if len(parts) >= 2:
             cond = parts[0]
+            if (
+                _valid_condition_names
+                and cond not in _valid_condition_names
+            ):
+                continue
             metric_name = parts[-1]
             if cond not in _condition_summaries:
                 _condition_summaries[cond] = {"metrics": {}}
@@ -258,6 +336,11 @@ def _execute_result_analysis(
             parts = _mk.split("/")
             if len(parts) >= 2:
                 cond = parts[0]
+                if (
+                    _valid_condition_names
+                    and cond not in _valid_condition_names
+                ):
+                    continue
                 metric_name = parts[-1]
                 if cond not in _condition_summaries:
                     _condition_summaries[cond] = {"metrics": {}}
@@ -272,11 +355,22 @@ def _execute_result_analysis(
                         _condition_summaries[cond]["metrics"][metric_name] = _val
                 except (ValueError, TypeError, KeyError):
                     pass
-    if not _condition_summaries:
+    if not _condition_summaries and _analysis_validity.valid:
         # Last resort: build from structured_results condition keys
         _sr = exp_data.get("structured_results", {})
         if isinstance(_sr, dict):
-            for _sk, _sv in _sr.items():
+            _sr_conditions = _sr.get(
+                "conditions",
+                _sr.get("per_condition", _sr),
+            )
+            if not isinstance(_sr_conditions, dict):
+                _sr_conditions = {}
+            for _sk, _sv in _sr_conditions.items():
+                if (
+                    _valid_condition_names
+                    and _sk not in _valid_condition_names
+                ):
+                    continue
                 if isinstance(_sv, dict) and _sk not in ("metadata", "config"):
                     _condition_summaries[_sk] = {"metrics": {}}
                     for _smk, _smv in _sv.items():
@@ -293,7 +387,11 @@ def _execute_result_analysis(
     # stage-10/12 to ensure multi-condition execution. The resulting
     # summary is explicitly flagged so downstream readers know it's
     # degraded, not a real multi-condition ablation.
-    if not _condition_summaries and _best_metrics:
+    if (
+        not _condition_summaries
+        and _best_metrics
+        and _analysis_validity.valid
+    ):
         _default_metrics: dict[str, float] = {}
         for _mk, _mv in _best_metrics.items():
             if isinstance(_mv, (int, float)):
@@ -508,8 +606,25 @@ def _execute_result_analysis(
         "total_runs": len(exp_data["runs"]),
         "best_run": exp_data["best_run"],
         "latex_table": exp_data["latex_table"],
+        "result_valid": _analysis_validity.valid,
+        "validity_reasons": _analysis_validity.reasons,
+        "valid_conditions": sorted(_valid_condition_names),
+        "invalid_conditions": _analysis_validity.invalid_conditions,
+        "successful_seed_count": (
+            _analysis_validity.successful_seed_count
+        ),
         "generated": _utcnow_iso(),
     }
+    if isinstance(summary_payload["best_run"], dict):
+        summary_payload["best_run"]["result_valid"] = (
+            _analysis_validity.valid
+        )
+        summary_payload["best_run"]["validity_reasons"] = (
+            _analysis_validity.reasons
+        )
+        summary_payload["best_run"]["invalid_conditions"] = (
+            _analysis_validity.invalid_conditions
+        )
     if _seed_insufficiency_warnings:
         summary_payload["seed_insufficiency_warnings"] = _seed_insufficiency_warnings
     # R13-1: Detect zero-variance across conditions (all conditions identical primary metric)
@@ -608,12 +723,32 @@ def _execute_result_analysis(
             "data_context": data_context,
             "context": context,
         }
+        _campaign_analysis_guidance = _pm.for_stage(
+            "result_analysis",
+            evolution_overlay=_get_evolution_overlay(
+                run_dir,
+                "result_analysis",
+                config=config,
+                topic=config.research.topic,
+            ),
+            preamble=preamble,
+            data_context=data_context,
+            context=context,
+        ).user
         perspectives = _multi_perspective_generate(
-            llm, _analysis_roles, variables, perspectives_dir
+            llm,
+            _analysis_roles,
+            variables,
+            perspectives_dir,
+            guidance=_campaign_analysis_guidance,
         )
         # --- Synthesize into unified analysis ---
         analysis = _synthesize_perspectives(
-            llm, perspectives, "analysis_synthesize", _pm
+            llm,
+            perspectives,
+            "analysis_synthesize",
+            _pm,
+            guidance=_campaign_analysis_guidance,
         )
     else:
         # Template with real data if available
@@ -1145,6 +1280,7 @@ def _execute_research_decision(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.RESEARCH_DECISION)
     # ----------------------------------------------------------------------
     # Agent-mode requirements gate (collider_agent / biology_agent / stat_agent).
     # When the manifest declares a `requirements:` list, audit the run via

@@ -8,6 +8,7 @@ from researchclaw.config import (
     ExperimentConfig,
     LiteratureSearchConfig,
     RCConfig,
+    RoleConfig,
     SandboxConfig,
     SecurityConfig,
     ValidationResult,
@@ -162,6 +163,40 @@ def test_validate_config_rejects_invalid_llm_wire_api(tmp_path: Path):
     assert "Invalid llm.wire_api: responses_only" in result.errors
 
 
+def test_rc_config_parses_role_model_routing(tmp_path: Path):
+    data = _valid_config_data()
+    data["llm"]["roles"] = {
+        "idea_scientist": {
+            "model": "reasoning-model",
+            "fallback_models": [],
+            "temperature": 0.8,
+            "max_tokens": 12000,
+            "isolated_session": True,
+            "tools": ["literature"],
+        },
+        "coding_engineer": {
+            "provider": "openai-compatible",
+            "base_url": "https://code.example/v1",
+            "api_key_env": "CODE_KEY",
+            "model": "code-model",
+        },
+    }
+
+    config = RCConfig.from_dict(data, project_root=tmp_path, check_paths=False)
+
+    idea = config.llm.roles["idea_scientist"]
+    assert isinstance(idea, RoleConfig)
+    assert idea.model == "reasoning-model"
+    assert idea.fallback_models == ()
+    assert idea.temperature == pytest.approx(0.8)
+    assert idea.max_tokens == 12000
+    assert idea.tools == ("literature",)
+    assert config.llm.roles["coding_engineer"].base_url == (
+        "https://code.example/v1"
+    )
+    assert config.llm.roles["coding_engineer"].fallback_models is None
+
+
 @pytest.mark.parametrize("entry", [0, 24, "5", 9.1])
 def test_validate_config_rejects_invalid_hitl_required_stages_entries(
     tmp_path: Path, entry: object
@@ -202,6 +237,55 @@ def test_validate_config_accepts_docker_mode(tmp_path: Path):
     result = validate_config(data, project_root=tmp_path, check_paths=False)
 
     assert result.ok is True
+
+
+def test_validate_config_accepts_clusterbridge_mode(tmp_path: Path):
+    data = _valid_config_data()
+    data["experiment"]["mode"] = "clusterbridge"
+    data["experiment"]["clusterbridge"] = {
+        "node": "28.83.50.39",
+        "cb_command": "/root/shared/.clusters/.tools/clusterbridge.sh",
+        "shared_root": "/root/shared/.clusters/.tmp/researchclaw",
+    }
+    result = validate_config(data, project_root=tmp_path, check_paths=False)
+    assert result.ok is True
+
+
+def test_validate_config_clusterbridge_requires_node(tmp_path: Path):
+    data = _valid_config_data()
+    data["experiment"]["mode"] = "clusterbridge"
+    data["experiment"]["clusterbridge"] = {
+        "cb_command": "/root/shared/.clusters/.tools/clusterbridge.sh",
+        "shared_root": "/root/shared/.clusters/.tmp/researchclaw",
+    }
+    result = validate_config(data, project_root=tmp_path, check_paths=False)
+    assert result.ok is False
+    assert any("clusterbridge.node" in err for err in result.errors)
+
+
+def test_validate_config_accepts_clusterbridge_pool_mode(tmp_path: Path):
+    data = _valid_config_data()
+    data["experiment"]["mode"] = "clusterbridge_pool"
+    data["experiment"]["clusterbridge_pool"] = {
+        "config_file": "/tmp/config.cluster32.yaml",
+    }
+
+    result = validate_config(data, project_root=tmp_path, check_paths=False)
+
+    assert result.ok is True
+
+
+def test_validate_config_clusterbridge_pool_requires_config_file(
+    tmp_path: Path,
+):
+    data = _valid_config_data()
+    data["experiment"]["mode"] = "clusterbridge_pool"
+    data["experiment"]["clusterbridge_pool"] = {"config_file": ""}
+
+    result = validate_config(data, project_root=tmp_path, check_paths=False)
+
+    assert result.ok is False
+    assert any("clusterbridge_pool.config_file" in err for err in result.errors)
 
 
 def test_validate_config_rejects_invalid_metric_direction(tmp_path: Path):

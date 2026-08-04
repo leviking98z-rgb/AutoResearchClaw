@@ -1,0 +1,269 @@
+project:
+  name: "autoresearch-first-pipeline"
+  mode: "docs-first"
+
+research:
+  topic: "PLACEHOLDER: replace this with a concrete, falsifiable research question before the first production run."
+  domains:
+    - "computational-research"
+  daily_paper_count: 8
+  quality_threshold: 4.0
+  graceful_degradation: false
+
+runtime:
+  timezone: "Asia/Beijing"
+  max_parallel_tasks: 1
+  approval_timeout_hours: 24
+  retry_limit: 2
+
+notifications:
+  channel: "console"
+  target: ""
+  on_stage_start: true
+  on_stage_fail: true
+  on_gate_required: true
+
+knowledge_base:
+  backend: "markdown"
+  root: "workspace/kb"
+
+openclaw_bridge:
+  use_cron: false
+  use_message: false
+  use_memory: false
+  use_sessions_spawn: false
+  use_web_fetch: false
+  use_browser: false
+
+# The machine already has an authenticated Cursor Agent CLI. ResearchClaw talks
+# to it through ACP/acpx, so no API key is stored in this file.
+llm:
+  provider: "acp"
+  base_url: ""
+  api_key_env: ""
+  api_key: ""
+  primary_model: ""
+  fallback_models: []
+  timeout_sec: 1800
+  acp:
+    agent: "cursor"
+    cwd: "."
+    acpx_command: "/root/.nvm/versions/node/v22.23.1/bin/acpx"
+    session_name: "researchclaw-production"
+    timeout_sec: 1800
+
+literature_search:
+  sources:
+    - "openalex"
+    - "semantic_scholar"
+    - "arxiv"
+  max_results_per_query: 25
+  inter_query_delay_sec: 1.5
+  openalex_email: "researchclaw@users.noreply.github.com"
+  openalex_api_key_env: "OPENALEX_API_KEY"
+  openalex_api_key: ""
+  s2_api_key_env: "S2_API_KEY"
+  s2_api_key: ""
+
+web_search:
+  enabled: true
+  tavily_api_key_env: "TAVILY_API_KEY"
+  tavily_api_key: ""
+  enable_scholar: true
+  enable_crawling: true
+  enable_pdf_extraction: true
+  max_web_results: 8
+  max_scholar_results: 10
+  max_crawl_urls: 4
+
+security:
+  hitl_required_stages: [5, 9, 20]
+  allow_publish_without_approval: false
+  redact_sensitive_logs: true
+
+# CPU-safe first installation. Generated experiment code is executed inside a
+# non-root Docker container with no GPU passthrough and a hard memory/time cap.
+experiment:
+  mode: "clusterbridge"
+  time_budget_sec: 1800
+  max_iterations: 3
+  max_refine_duration_sec: 900
+  metric_key: "primary_metric"
+  metric_direction: "maximize"
+  keep_threshold: 0.0
+
+  sandbox:
+    python_path: ".venv/bin/python3"
+    gpu_required: true
+    allowed_imports:
+      - math
+      - random
+      - json
+      - csv
+      - numpy
+      - scipy
+      - pandas
+      - matplotlib
+      - sklearn
+    max_memory_mb: 4096
+
+  docker:
+    image: "researchclaw/sandbox-generic:latest"
+    gpu_enabled: false
+    memory_limit_mb: 8192
+    network_policy: "none"
+    pip_pre_install: []
+    auto_install_deps: true
+    shm_size_mb: 1024
+    keep_containers: false
+
+  # Remote H20 execution over the cluster's shared-CephFS ClusterBridge.
+  # Node leases are managed with cb claim/renew/release; no SSH is used.
+  clusterbridge:
+    node: "28.83.50.39"
+    cb_command: "/root/shared/.clusters/.tools/clusterbridge.sh"
+    shared_root: "/root/shared/.clusters/.tmp/researchclaw"
+    remote_python: "/opt/conda/envs/torch-base/bin/python3"
+    gpu_ids: [0]
+    setup_commands: []
+    network_isolation: true
+    cleanup_remote: true
+    timeout_sec: 1800
+    claim_ttl_min: 240
+
+  # ACP supplies text/reasoning for the whole pipeline. For experiment code,
+  # use Cursor Agent directly so it can create and repair a multi-file project.
+  cli_agent:
+    provider: "cursor"
+    binary_path: "/root/.local/bin/cursor-agent"
+    model: "gpt-5.3-codex"
+    max_budget_usd: 5.0
+    timeout_sec: 900
+    extra_args: []
+
+  code_agent:
+    enabled: true
+    architecture_planning: true
+    sequential_generation: true
+    hard_validation: true
+    hard_validation_max_repairs: 3
+    exec_fix_max_iterations: 2
+    exec_fix_timeout_sec: 90
+    tree_search_enabled: false
+    review_max_rounds: 2
+
+  # OpenCode is intentionally disabled: ACP + Cursor is the configured backend,
+  # and using another agent would add an unconfigured credential dependency.
+  opencode:
+    enabled: false
+    auto: false
+    complexity_threshold: 1.0
+    model: ""
+    timeout_sec: 600
+    max_retries: 0
+    workspace_cleanup: true
+
+  benchmark_agent:
+    enabled: true
+    enable_hf_search: true
+    max_hf_results: 8
+    enable_web_search: true
+    max_web_results: 5
+    web_search_min_local: 3
+    tier_limit: 1
+    min_benchmarks: 1
+    min_baselines: 2
+    prefer_cached: true
+    max_iterations: 1
+
+  figure_agent:
+    enabled: true
+    min_figures: 2
+    max_figures: 6
+    max_iterations: 2
+    render_timeout_sec: 45
+    use_docker: true
+    docker_image: "researchclaw/sandbox-generic:latest"
+    output_format: "python"
+    nano_banana_enabled: false
+    strict_mode: true
+    dpi: 300
+
+  repair:
+    enabled: true
+    max_cycles: 2
+    min_completion_rate: 0.75
+    min_conditions: 2
+    use_opencode: false
+    timeout_sec_per_cycle: 600
+
+export:
+  target_conference: "generic"
+  authors: "Anonymous"
+  bib_file: "references"
+
+prompts:
+  custom_file: ""
+  extra_prompts:
+    experiment_design: "prompts_extra/experiment_design.md"
+    result_analysis: "prompts_extra/result_analysis.md"
+    paper_draft: "prompts_extra/paper_draft.md"
+
+hitl:
+  enabled: true
+  mode: "co-pilot"
+  cost_budget_usd: 20.0
+  notifications:
+    on_pause: true
+    on_quality_drop: true
+    on_error: true
+    channels: ["terminal"]
+  collaboration:
+    max_chat_turns: 50
+    save_chat_history: true
+  timeouts:
+    default_human_timeout_sec: 86400
+    auto_proceed_on_timeout: false
+  stage_policies: {}
+
+memory:
+  enabled: true
+  store_dir: "workspace/memory"
+  max_entries_per_category: 300
+  decay_half_life_days: 90
+  confidence_threshold: 0.4
+  inject_at_stages: [1, 9, 10, 17]
+
+skills:
+  enabled: true
+  builtin_dir: ""
+  custom_dirs: []
+  external_dirs: []
+  auto_match: true
+  max_skills_per_stage: 3
+  fallback_matching: true
+
+knowledge_graph:
+  enabled: true
+  store_path: "workspace/knowledge_graph"
+  max_entities: 10000
+  auto_update: true
+
+quality_assessor:
+  enabled: true
+  min_score: 6.0
+  auto_revise: true
+  max_revisions: 2
+  criteria:
+    - novelty
+    - rigor
+    - reproducibility
+    - clarity
+    - significance
+
+metaclaw_bridge:
+  enabled: false
+  proxy_url: "http://localhost:30000"
+  skills_dir: "~/.metaclaw/skills"
+  fallback_url: ""
+  fallback_api_key: ""

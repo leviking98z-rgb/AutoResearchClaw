@@ -638,12 +638,36 @@ def execute_stage(
 
     llm = None
     try:
-        if config.llm.provider == "acp":
-            llm = create_llm_client(config)
+        from researchclaw.llm.roles import (
+            bind_role_llm_client,
+            create_stage_llm_client,
+            role_for_stage,
+        )
+
+        role_name = role_for_stage(stage)
+        role_config = config.llm.roles.get(role_name)
+        role_has_override = role_config is not None and any(
+            (
+                role_config.provider,
+                role_config.base_url,
+                role_config.api_key_env,
+                role_config.api_key,
+                role_config.model,
+                role_config.fallback_models is not None,
+            )
+        )
+        if role_has_override or config.llm.provider == "acp":
+            llm = create_stage_llm_client(config, stage, run_dir=run_dir)
         else:
             candidate = LLMClient.from_rc_config(config)
             if candidate.config.base_url and candidate.config.api_key:
-                llm = candidate
+                llm = bind_role_llm_client(
+                    candidate,
+                    config,
+                    role_name,
+                    run_dir=run_dir,
+                    stage=stage,
+                )
     except Exception as _llm_exc:  # noqa: BLE001
         logger.warning("LLM client creation failed: %s", _llm_exc)
         llm = None
@@ -659,6 +683,12 @@ def execute_stage(
                 for stage_key, path_or_text in getattr(config.prompts, "extra_prompts", ())  # type: ignore[attr-defined]
             } or None,
         )
+        try:
+            from researchclaw.pipeline import _helpers as _pipeline_helpers
+
+            _pipeline_helpers._get_skill_registry(config)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             result = executor(
                 stage_dir, run_dir, config, adapters, llm=llm, prompts=prompts

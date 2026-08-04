@@ -28,6 +28,11 @@ from researchclaw.pipeline.experiment_diagnosis import (
     assess_experiment_quality,
     diagnose_experiment,
 )
+from researchclaw.pipeline.result_validity import (
+    OVERALL_CONDITION,
+    assess_experiment_summary,
+    assess_production_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +259,9 @@ def _summary_quality_score(summary: dict) -> float:
     """
     import math
 
+    if not assess_experiment_summary(summary).valid:
+        return -1.0
+
     score = 0.0
     n_conditions = len(summary.get("condition_summaries", {}))
     score += n_conditions * 10.0
@@ -309,11 +317,16 @@ def run_repair_loop(
             success=False, total_cycles=0, final_mode=PaperMode.TECHNICAL_REPORT,
         )
 
+    initial_validity = assess_experiment_summary(summary)
+    if "result_valid" not in summary:
+        summary["result_valid"] = initial_validity.valid
+        summary["validity_reasons"] = initial_validity.reasons
+
     # Initial quality assessment — pass user-configured thresholds
     ref_log = _load_refinement_log(run_dir)
     _min_cond = getattr(repair_cfg, "min_conditions", 3)
     qa = assess_experiment_quality(summary, ref_log, min_conditions=_min_cond)
-    if qa.sufficient:
+    if qa.sufficient and initial_validity.valid:
         logger.info("[%s] Repair loop: experiment already sufficient (%s)", run_id, qa.mode.value)
         return ExperimentRepairResult(
             success=True, total_cycles=0, final_mode=qa.mode,
@@ -436,11 +449,51 @@ def run_repair_loop(
             logger.warning("[%s] Repair cycle %d: sandbox execution failed", run_id, cycle)
             continue
 
-        # 6. Build new experiment summary from sandbox results
-        new_summary = _build_experiment_summary_from_run(sandbox_result, fixed_code)
+        run_validity = assess_production_result(
+            returncode=sandbox_result.get("returncode"),
+            timed_out=bool(sandbox_result.get("timed_out", False)),
+            metrics=sandbox_result.get("metrics", {}),
+            stdout=str(sandbox_result.get("stdout", "") or ""),
+            stderr=str(sandbox_result.get("stderr", "") or ""),
+            structured_results=sandbox_result.get("structured_results"),
+        )
+
+        # 6. Build and persist a summary even for invalid runs so the next
+        # diagnosis cycle has the actual failure evidence. Invalid summaries
+        # are never eligible for success or best-result promotion.
+        new_summary = _build_experiment_summary_from_run(
+            sandbox_result,
+            fixed_code,
+            validity=run_validity,
+        )
         (repair_dir / "experiment_summary.json").write_text(
             json.dumps(new_summary, indent=2), encoding="utf-8"
         )
+
+        if not run_validity.successful:
+            validity_error = "; ".join(run_validity.reasons) or (
+                "no complete valid result was produced"
+            )
+            cycle_result = RepairCycleResult(
+                cycle=cycle,
+                diagnosis=diag,
+                repair_applied=True,
+                repair_description=f"Fixed {len(fixed_code)} files",
+                error=f"Repair rerun invalid: {validity_error}",
+            )
+            cycle_history.append(cycle_result)
+            logger.warning(
+                "[%s] Repair cycle %d: return code %s but result was invalid: %s",
+                run_id,
+                cycle,
+                sandbox_result.get("returncode"),
+                validity_error,
+            )
+            code = fixed_code
+            summary = new_summary
+            stdout = sandbox_result.get("stdout", "")
+            stderr = sandbox_result.get("stderr", "")
+            continue
 
         # 7. Re-assess quality
         new_qa = assess_experiment_quality(new_summary, min_conditions=_min_cond)
@@ -812,6 +865,16 @@ def _run_experiment_in_sandbox(
             timeout_sec=timeout_sec,
         )
 
+        structured_results = None
+        results_path = sandbox_dir / "_project" / "results.json"
+        if results_path.is_file():
+            try:
+                structured_results = json.loads(
+                    results_path.read_text(encoding="utf-8")
+                )
+            except (json.JSONDecodeError, OSError):
+                structured_results = None
+
         return {
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -819,6 +882,7 @@ def _run_experiment_in_sandbox(
             "metrics": dict(result.metrics) if result.metrics else {},
             "elapsed_sec": result.elapsed_sec,
             "timed_out": result.timed_out,
+            "structured_results": structured_results,
         }
 
     except Exception as exc:
@@ -829,12 +893,24 @@ def _run_experiment_in_sandbox(
 def _build_experiment_summary_from_run(
     run_result: dict,
     code: dict[str, str],
+    *,
+    validity: Any = None,
 ) -> dict:
     """Build an experiment_summary.json from a single sandbox run.
 
     Parses condition-level metrics from stdout and builds the standard
     summary format expected by ``assess_experiment_quality()``.
     """
+    if validity is None:
+        validity = assess_production_result(
+            returncode=run_result.get("returncode"),
+            timed_out=bool(run_result.get("timed_out", False)),
+            metrics=run_result.get("metrics", {}),
+            stdout=str(run_result.get("stdout", "") or ""),
+            stderr=str(run_result.get("stderr", "") or ""),
+            structured_results=run_result.get("structured_results"),
+        )
+
     metrics = run_result.get("metrics", {})
     stdout = run_result.get("stdout", "")
 
@@ -846,6 +922,9 @@ def _build_experiment_summary_from_run(
         except ImportError:
             pass
 
+    if validity.valid:
+        metrics = validity.valid_metrics
+
     # Group metrics by condition
     condition_summaries: dict[str, dict] = {}
     for key, value in metrics.items():
@@ -855,6 +934,11 @@ def _build_experiment_summary_from_run(
         if len(parts) >= 3:
             # Format: condition_name/seed/metric_name
             cond_name = parts[0]
+            if (
+                validity.valid_conditions
+                and cond_name not in validity.valid_conditions
+            ):
+                continue
             metric_name = parts[-1]
             if cond_name not in condition_summaries:
                 condition_summaries[cond_name] = {"metrics": {}, "seeds": {}}
@@ -866,6 +950,11 @@ def _build_experiment_summary_from_run(
             # (condition_name/metric_name) without a seed component.
             # Treat as a single-seed result.
             cond_name, metric_name = parts
+            if (
+                validity.valid_conditions
+                and cond_name not in validity.valid_conditions
+            ):
+                continue
             if cond_name not in condition_summaries:
                 condition_summaries[cond_name] = {"metrics": {}, "seeds": {}}
             condition_summaries[cond_name]["metrics"][metric_name] = value
@@ -891,14 +980,36 @@ def _build_experiment_summary_from_run(
         # Remove seeds from final output (not standard format)
         cdata.pop("seeds", None)
 
+    successful = bool(validity.successful)
+    valid_conditions = sorted(
+        condition
+        for condition in validity.valid_conditions
+        if condition != OVERALL_CONDITION
+    )
     return {
         "condition_summaries": condition_summaries,
         "best_run": {
             "metrics": metrics,
-            "status": "completed" if run_result.get("returncode") == 0 else "failed",
+            "status": "completed" if successful else "failed",
+            "returncode": run_result.get("returncode"),
+            "timed_out": bool(run_result.get("timed_out", False)),
+            "result_valid": successful,
+            "partial_result_valid": (
+                bool(validity.valid) and not successful
+            ),
+            "validity_reasons": validity.reasons,
+            "invalid_conditions": validity.invalid_conditions,
             "stdout": stdout[:5000],
             "stderr": run_result.get("stderr", "")[:2000],
         },
+        "result_valid": successful,
+        "partial_result_valid": (
+            bool(validity.valid) and not successful
+        ),
+        "validity_reasons": validity.reasons,
+        "valid_conditions": valid_conditions,
+        "invalid_conditions": validity.invalid_conditions,
+        "successful_seed_count": validity.successful_seed_count,
         "metrics_summary": {},
         "total_conditions": len(condition_summaries),
         "total_metric_keys": len(metrics),

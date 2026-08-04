@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -93,6 +95,33 @@ class TestObserve:
 
         obs = observe([], results, llm)
         assert obs == []
+
+    def test_observe_uses_low_quality_success_context(self):
+        llm = FakeLLMClient([
+            json.dumps([{
+                "obs_id": "OBS-1",
+                "category": "data_quality",
+                "root_cause": "Experiment evidence was weak",
+                "affected_stages": ["experiment_run", "quality_gate"],
+                "frequency": 2,
+                "severity": "degrading",
+                "description": "Successful pipeline had a low experiment score",
+            }])
+        ])
+        results = [_make_stage_result(23, "done")]
+
+        obs = observe(
+            [],
+            results,
+            llm,
+            quality_context={
+                "composite_score": 48.0,
+                "weak_components": {"experiment": {"score": 30.0}},
+            },
+        )
+
+        assert len(obs) == 1
+        assert obs[0].category == "data_quality"
 
     def test_observe_handles_llm_failure(self):
         llm = mock.MagicMock()
@@ -200,6 +229,29 @@ class TestGate:
 
         result = gate(mutations, llm)
         assert result[0].gate_passed is True
+
+    def test_gate_fails_closed_when_llm_unavailable(self):
+        llm = mock.MagicMock()
+        llm.chat.side_effect = RuntimeError("LLM down")
+        mutations = [Mutation(
+            mutation_type="skill", name="arc-aevolve-risky",
+            description="d", content="c", target_observation="OBS-1",
+        )]
+
+        result = gate(mutations, llm)
+        assert result[0].gate_passed is False
+        assert "failed closed" in result[0].gate_reason
+
+    def test_gate_fails_closed_when_result_is_missing(self):
+        llm = FakeLLMClient([json.dumps([])])
+        mutations = [Mutation(
+            mutation_type="skill", name="arc-aevolve-missing",
+            description="d", content="c", target_observation="OBS-1",
+        )]
+
+        result = gate(mutations, llm)
+        assert result[0].gate_passed is False
+        assert "missing" in result[0].gate_reason
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +396,48 @@ class TestRunAEvolveCycle:
 
         created = run_aevolve_cycle([], results, llm, tmp_path, tmp_path)
         assert created == []
+
+    def test_cycle_interrupts_during_observe_without_writing_mutations(
+        self,
+        tmp_path: Path,
+    ):
+        entered = threading.Event()
+        release = threading.Event()
+        cancel = threading.Event()
+
+        class BlockingLLM:
+            def chat(self, *_args, **_kwargs):
+                entered.set()
+                release.wait(timeout=2)
+                return FakeLLMResponse("[]")
+
+        result: dict[str, BaseException] = {}
+
+        def target():
+            try:
+                run_aevolve_cycle(
+                    [_make_lesson()],
+                    [_make_stage_result(12, "failed", "timeout")],
+                    BlockingLLM(),
+                    tmp_path / "skills",
+                    tmp_path / "run",
+                    cancel_event=cancel,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        thread = threading.Thread(target=target)
+        thread.start()
+        assert entered.wait(timeout=1)
+        started = time.monotonic()
+        cancel.set()
+        thread.join(timeout=1)
+        release.set()
+
+        assert not thread.is_alive()
+        assert time.monotonic() - started < 1
+        assert isinstance(result.get("error"), InterruptedError)
+        assert not (tmp_path / "run" / "evolution").exists()
 
 
 # ---------------------------------------------------------------------------

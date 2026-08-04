@@ -12,6 +12,7 @@ from researchclaw.config import RCConfig
 from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._helpers import (
     StageResult,
+    _bind_stage_role,
     _default_hypotheses,
     _get_evolution_overlay,
     _multi_perspective_generate,
@@ -35,6 +36,7 @@ def _execute_synthesis(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.SYNTHESIS)
     cards_path = _read_prior_artifact(run_dir, "cards/") or ""
     cards_context = ""
     if cards_path:
@@ -98,6 +100,7 @@ def _execute_hypothesis_gen(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.HYPOTHESIS_GEN)
     synthesis = _read_prior_artifact(run_dir, "synthesis.md") or ""
 
     if llm is not None:
@@ -110,8 +113,23 @@ def _execute_hypothesis_gen(
         # --- Multi-perspective debate ---
         perspectives_dir = stage_dir / "perspectives"
         variables = {"topic": config.research.topic, "synthesis": synthesis}
+        _campaign_hypothesis_guidance = _pm.for_stage(
+            "hypothesis_gen",
+            evolution_overlay=_get_evolution_overlay(
+                run_dir,
+                "hypothesis_gen",
+                config=config,
+                topic=config.research.topic,
+            ),
+            topic=config.research.topic,
+            synthesis=synthesis,
+        ).user
         perspectives = _multi_perspective_generate(
-            llm, _active_roles, variables, perspectives_dir
+            llm,
+            _active_roles,
+            variables,
+            perspectives_dir,
+            guidance=_campaign_hypothesis_guidance,
         )
         # BUG-S2: If all debate perspectives failed, fall back to defaults
         # instead of sending empty context to the LLM (pure hallucination).
@@ -121,7 +139,11 @@ def _execute_hypothesis_gen(
         else:
             # --- Synthesize into final hypotheses ---
             hypotheses_md = _synthesize_perspectives(
-                llm, perspectives, "hypothesis_synthesize", _pm
+                llm,
+                perspectives,
+                "hypothesis_synthesize",
+                _pm,
+                guidance=_campaign_hypothesis_guidance,
             )
     else:
         hypotheses_md = _default_hypotheses(config.research.topic)

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="/data/workspace/autoresearch-stack/AutoResearchClaw"
+cd "$ROOT"
+source "$ROOT/.venv/bin/activate"
+export RESEARCHCLAW_ACP_MODEL="${RESEARCHCLAW_ACP_MODEL:-gpt-5.3-codex[reasoning=medium,fast=false]}"
+
+echo "[1/5] Validate local smoke configuration"
+researchclaw validate --config config.local-smoke.yaml --no-check-paths
+
+echo "[2/5] Check ACP LLM and runtime"
+researchclaw doctor --config config.local-smoke.yaml
+
+echo "[3/5] Exercise Docker sandbox with a real metrics artifact"
+python scripts/local_sandbox_smoke.py
+
+echo "[4/5] Exercise Cursor's multi-file experiment code backend"
+python scripts/cursor_code_agent_smoke.py
+
+echo "[5/5] Exercise the first LLM-backed pipeline stage"
+SMOKE_OUT="artifacts/local-stage1-smoke-$(date -u +%Y%m%d-%H%M%S)"
+researchclaw run \
+  --config config.local-smoke.yaml \
+  --output "$SMOKE_OUT" \
+  --to-stage TOPIC_INIT \
+  --auto-approve
+
+echo "Smoke test complete: $ROOT/$SMOKE_OUT"

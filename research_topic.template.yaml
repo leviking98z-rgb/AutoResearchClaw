@@ -1,0 +1,49 @@
+# Copy this file, fill every field that applies, then turn the contents into a
+# precise --topic string or use it as source material for prompts.extra_prompts.
+title: ""
+research_question: ""
+hypothesis: ""
+why_it_might_be_novel: ""
+
+seed_papers:
+  - title_or_url: ""
+
+baseline_repositories:
+  - url: ""
+    commit: ""
+    run_command: ""
+
+datasets:
+  - name: ""
+    location_or_url: ""
+    license: ""
+
+primary_metric:
+  name: ""
+  direction: "maximize"  # maximize | minimize
+
+required_experiments:
+  - "main comparison"
+  - "ablation"
+  - "three or more random seeds when stochastic"
+  - "runtime and memory comparison"
+  - "error or failure-case analysis"
+
+compute_budget:
+  hardware: "CPU only on the current host"
+  max_wall_clock_hours: 6
+  max_llm_cost_usd: 20
+
+target_venue: "generic"
+
+stop_conditions:
+  - "configured time or cost budget is reached"
+  - "three consecutive refinements fail to improve the primary metric"
+  - "the evidence does not support the proposed claim"
+
+non_negotiable_rules:
+  - "Do not fabricate citations or numeric results."
+  - "Preserve raw logs, seeds, commands, and machine-readable metrics."
+  - "A null or negative result is an acceptable final outcome."
+  - "Human approval is required before presenting the draft as publishable."
+

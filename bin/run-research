@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="/data/workspace/autoresearch-stack/AutoResearchClaw"
+CONFIG="${RESEARCHCLAW_CONFIG:-$ROOT/config.arc.yaml}"
+ARTIFACT_ROOT="${RESEARCHCLAW_ARTIFACT_ROOT:-$ROOT/artifacts}"
+
+if [[ $# -lt 1 ]]; then
+  cat >&2 <<'EOF'
+Usage:
+  ./bin/run-research "A concrete, falsifiable research question"
+
+Optional environment variables:
+  RESEARCHCLAW_CONFIG         Config file to use.
+  RESEARCHCLAW_ARTIFACT_ROOT  Root directory for run artifacts.
+
+The production wrapper uses co-pilot mode and never auto-approves gates.
+EOF
+  exit 2
+fi
+
+TOPIC="$*"
+mkdir -p "$ARTIFACT_ROOT"
+cd "$ROOT"
+source "$ROOT/.venv/bin/activate"
+export RESEARCHCLAW_ACP_MODEL="${RESEARCHCLAW_ACP_MODEL:-gpt-5.3-codex[reasoning=medium,fast=false]}"
+
+STAMP="$(date -u +%Y%m%d-%H%M%S)"
+SLUG="$(printf '%s' "$TOPIC" | sha256sum | cut -c1-8)"
+OUT="$ARTIFACT_ROOT/manual-$STAMP-$SLUG"
+
+exec researchclaw run \
+  --config "$CONFIG" \
+  --topic "$TOPIC" \
+  --output "$OUT" \
+  --mode co-pilot \
+  --no-graceful-degradation

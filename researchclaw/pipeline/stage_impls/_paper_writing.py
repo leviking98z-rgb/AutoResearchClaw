@@ -17,6 +17,7 @@ from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._domain import _detect_domain, _is_ml_domain
 from researchclaw.pipeline._helpers import (
     StageResult,
+    _bind_stage_role,
     _build_context_preamble,
     _chat_with_prompt,
     _collect_experiment_results,
@@ -31,6 +32,7 @@ from researchclaw.pipeline._helpers import (
     _topic_constraint_block,
     _utcnow_iso,
 )
+from researchclaw.pipeline.result_validity import assess_run_payload
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
 
@@ -53,6 +55,209 @@ def _topic_is_literature_first(config: RCConfig) -> bool:
     return False
 
 
+def _paper_evidence_gate(
+    run_dir: Path,
+    config: RCConfig,
+) -> dict[str, Any]:
+    """Audit whether numerical experiment evidence is publication-eligible.
+
+    A numeric value is eligible only when it comes from a non-failed,
+    non-simulated, non-placeholder run with a durable artifact identity.  For
+    legacy run JSON, the file path plus run/task id is the provenance record;
+    newer producers may supply an explicit ``provenance`` object/string.
+    Summary-only values must be backed by at least one eligible run.
+    """
+    valid_statuses = {"completed", "partial", "success", "succeeded", "done"}
+    invalid_statuses = {
+        "failed",
+        "failure",
+        "error",
+        "timeout",
+        "timed_out",
+        "simulated",
+        "placeholder",
+    }
+    report: dict[str, Any] = {
+        "eligible": False,
+        "literature_first": _topic_is_literature_first(config),
+        "valid_runs": [],
+        "rejected_runs": [],
+        "summary_files": [],
+        "reasons": [],
+    }
+
+    for runs_dir in sorted(run_dir.glob("stage-*/runs")):
+        for run_file in sorted(runs_dir.glob("*.json")):
+            if run_file.name == "results.json":
+                continue
+            payload = _safe_json_loads(
+                run_file.read_text(encoding="utf-8"),
+                {},
+            )
+            if not isinstance(payload, dict):
+                continue
+            status = str(payload.get("status", "") or "").strip().casefold()
+            metrics = payload.get("metrics") or payload.get("key_metrics") or {}
+            finite_metrics: dict[str, Any] = {}
+            if isinstance(metrics, dict):
+                finite_metrics = {
+                    str(key): value
+                    for key, value in metrics.items()
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                }
+            explicit_placeholder = bool(
+                payload.get("is_placeholder")
+                or payload.get("placeholder")
+                or payload.get("synthetic")
+            )
+            production_validity = assess_run_payload(payload)
+            provenance = payload.get("provenance")
+            provenance_ref = ""
+            if isinstance(provenance, str):
+                provenance_ref = provenance.strip()
+            elif isinstance(provenance, dict):
+                provenance_ref = str(
+                    provenance.get("artifact")
+                    or provenance.get("source")
+                    or provenance.get("run_id")
+                    or ""
+                ).strip()
+            if not provenance_ref:
+                run_id = str(
+                    payload.get("run_id")
+                    or payload.get("task_id")
+                    or ""
+                ).strip()
+                if run_id:
+                    provenance_ref = (
+                        f"{run_file.relative_to(run_dir)}#{run_id}"
+                    )
+
+            rejection_reasons: list[str] = []
+            if status in invalid_statuses or status not in valid_statuses:
+                rejection_reasons.append(
+                    f"status={status or 'missing'} is not successful"
+                )
+            if not production_validity.successful:
+                rejection_reasons.extend(production_validity.reasons)
+            if explicit_placeholder:
+                rejection_reasons.append("run is marked placeholder/synthetic")
+            if not finite_metrics:
+                rejection_reasons.append("run has no finite numeric metrics")
+            if not provenance_ref:
+                rejection_reasons.append("run has no provenance identity")
+
+            record = {
+                "path": str(run_file.relative_to(run_dir)),
+                "status": status or "missing",
+                "metric_keys": sorted(finite_metrics),
+                "provenance": provenance_ref,
+                "result_valid": production_validity.successful,
+                "validity_reasons": production_validity.reasons,
+            }
+            if rejection_reasons:
+                record["reasons"] = rejection_reasons
+                report["rejected_runs"].append(record)
+            else:
+                report["valid_runs"].append(record)
+
+    summary_candidates = [
+        run_dir / "experiment_summary_best.json",
+        *sorted(run_dir.glob("stage-14*/experiment_summary.json")),
+    ]
+    for summary_path in summary_candidates:
+        if not summary_path.is_file():
+            continue
+        summary = _safe_json_loads(
+            summary_path.read_text(encoding="utf-8"),
+            {},
+        )
+        if not isinstance(summary, dict):
+            continue
+        metrics_summary = summary.get("metrics_summary")
+        condition_summaries = summary.get("condition_summaries")
+        best_run = summary.get("best_run")
+        summary_status = ""
+        if isinstance(best_run, dict):
+            summary_status = str(
+                best_run.get("status", "") or ""
+            ).casefold()
+        summary_record = {
+            "path": str(summary_path.relative_to(run_dir)),
+            "has_metrics_summary": bool(metrics_summary),
+            "has_condition_summaries": bool(condition_summaries),
+            "best_run_status": summary_status or "missing",
+        }
+        report["summary_files"].append(summary_record)
+        if summary_status in invalid_statuses:
+            report["reasons"].append(
+                f"{summary_record['path']} best_run status is {summary_status}"
+            )
+
+    selected_raw = _read_prior_artifact(run_dir, "selected_topic.json")
+    plan_raw = _read_prior_artifact(run_dir, "exp_plan.yaml")
+    if selected_raw and plan_raw:
+        selected_topic = _safe_json_loads(selected_raw, {})
+        try:
+            experiment_plan = yaml.safe_load(plan_raw)
+        except yaml.YAMLError:
+            experiment_plan = None
+        if isinstance(selected_topic, dict) and isinstance(experiment_plan, dict):
+            try:
+                from researchclaw.pipeline.stage_impls._experiment_design import (
+                    _validate_experiment_semantics,
+                )
+
+                semantic_report = _validate_experiment_semantics(
+                    experiment_plan,
+                    selected_topic,
+                    config.research.topic,
+                )
+                report["semantic_alignment"] = semantic_report
+                if not semantic_report["aligned"]:
+                    report["reasons"].extend(semantic_report["reasons"])
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Could not validate experiment/topic semantic alignment"
+                )
+
+    if report["literature_first"]:
+        report["eligible"] = True
+        report["mode"] = "literature_first"
+        return report
+
+    if not report["valid_runs"]:
+        report["reasons"].append(
+            "No successful, non-placeholder numeric run with provenance was found"
+        )
+    if any(
+        record.get("best_run_status") in invalid_statuses
+        for record in report["summary_files"]
+    ):
+        report["reasons"].append(
+            "Experiment summary promotes a failed/timeout/simulated run"
+        )
+
+    report["reasons"] = list(dict.fromkeys(report["reasons"]))
+    report["eligible"] = bool(report["valid_runs"]) and not report["reasons"]
+    return report
+
+
+def _write_paper_evidence_gate(
+    stage_dir: Path,
+    run_dir: Path,
+    config: RCConfig,
+) -> dict[str, Any]:
+    report = _paper_evidence_gate(run_dir, config)
+    (stage_dir / "evidence_gate.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return report
+
+
 def _execute_paper_outline(
     stage_dir: Path,
     run_dir: Path,
@@ -62,6 +267,29 @@ def _execute_paper_outline(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.PAPER_OUTLINE)
+    evidence_gate = _write_paper_evidence_gate(stage_dir, run_dir, config)
+    if not evidence_gate["eligible"]:
+        (stage_dir / "outline.md").write_text(
+            "# Paper Outline Blocked\n\n"
+            "Numerical experiment evidence did not pass the production "
+            "evidence gate.\n",
+            encoding="utf-8",
+        )
+        return StageResult(
+            stage=Stage.PAPER_OUTLINE,
+            status=StageStatus.PAUSED,
+            artifacts=("outline.md", "evidence_gate.json"),
+            error=(
+                "Paper outline blocked: failed, placeholder, or unprovenanced "
+                "experiment evidence cannot support a paper"
+            ),
+            evidence_refs=(
+                "stage-16/outline.md",
+                "stage-16/evidence_gate.json",
+            ),
+            decision="blocked_invalid_evidence",
+        )
     analysis = _read_best_analysis(run_dir)
     decision = _read_prior_artifact(run_dir, "decision.md") or ""
     preamble = _build_context_preamble(
@@ -142,8 +370,11 @@ def _execute_paper_outline(
     return StageResult(
         stage=Stage.PAPER_OUTLINE,
         status=StageStatus.DONE,
-        artifacts=("outline.md",),
-        evidence_refs=("stage-16/outline.md",),
+        artifacts=("outline.md", "evidence_gate.json"),
+        evidence_refs=(
+            "stage-16/outline.md",
+            "stage-16/evidence_gate.json",
+        ),
     )
 
 
@@ -169,8 +400,24 @@ def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
             if not isinstance(payload, dict):
                 continue
 
-            # R10: Skip simulated data — only collect real experiment results
-            if payload.get("status") == "simulated":
+            # Production evidence gate: failed/timeout/simulated/placeholder
+            # payloads must never seed paper numbers, even when they contain a
+            # non-empty metrics dict left behind by a partial or failed run.
+            _status = str(payload.get("status", "") or "").casefold()
+            if (
+                _status
+                and _status
+                not in {
+                    "completed",
+                    "partial",
+                    "success",
+                    "succeeded",
+                    "done",
+                }
+                or payload.get("is_placeholder")
+                or payload.get("placeholder")
+                or payload.get("synthetic")
+            ):
                 continue
 
             run_count += 1
@@ -225,6 +472,38 @@ def _collect_raw_experiment_metrics(run_dir: Path) -> tuple[str, bool]:
                 for _sbx_key in ("sandbox", "sandbox_after_fix"):
                     _sbx = _it.get(_sbx_key, {})
                     if not isinstance(_sbx, dict):
+                        continue
+                    _sbx_status = str(
+                        _sbx.get("status", "") or ""
+                    ).casefold()
+                    _sbx_explicit_invalid = (
+                        _sbx.get("result_valid") is False
+                        or _sbx.get("timed_out") is True
+                        or (
+                            isinstance(_sbx.get("returncode"), int)
+                            and _sbx.get("returncode") != 0
+                        )
+                    )
+                    if (
+                        _sbx_explicit_invalid
+                        or (
+                            _sbx_status
+                            and _sbx_status
+                            not in {
+                                "completed",
+                                "partial",
+                                "success",
+                                "succeeded",
+                                "done",
+                            }
+                        )
+                    ):
+                        continue
+                    if (
+                        _sbx.get("is_placeholder")
+                        or _sbx.get("placeholder")
+                        or _sbx.get("synthetic")
+                    ):
                         continue
                     _sbx_metrics = _sbx.get("metrics", {})
                     if not isinstance(_sbx_metrics, dict) or not _sbx_metrics:
@@ -364,7 +643,7 @@ def _write_paper_sections(
         _writing_structure = ""
 
     _overlay = _get_evolution_overlay(run_dir, "paper_draft")
-    system = pm.for_stage(
+    _paper_prompt = pm.for_stage(
         "paper_draft",
         evolution_overlay=_overlay,
         preamble=preamble,
@@ -374,7 +653,9 @@ def _write_paper_sections(
         writing_structure=_writing_structure,
         outline=outline,
         venue_guidance=venue_guidance,
-    ).system
+    )
+    system = _paper_prompt.system
+    _campaign_writing_guidance = _paper_prompt.user
 
     sections: list[str] = []
 
@@ -462,6 +743,10 @@ def _write_paper_sections(
             "data verification, condition listing, or metric enumeration before the title. "
             "The paper should read like a published manuscript, not a data report."
         )
+    call1_user += (
+        "\n\n## Campaign and Evolution Guidance\n"
+        f"{_campaign_writing_guidance}"
+    )
     # R14-1: Higher token limit for reasoning models
     _paper_max_tokens = 12000
     if any(model_name.startswith(p) for p in ("gpt-5", "o3", "o4")):
@@ -540,6 +825,10 @@ def _write_paper_sections(
             f"Outline:\n{outline}\n\n"
             "Output markdown with ## headers. Continue from where Part 1 ended."
         )
+    call2_user += (
+        "\n\n## Campaign and Evolution Guidance\n"
+        f"{_campaign_writing_guidance}"
+    )
     try:
         resp2 = _chat_with_prompt(llm, system, call2_user, max_tokens=_paper_max_tokens, retries=1)
         part2 = resp2.content.strip()
@@ -633,6 +922,10 @@ def _write_paper_sections(
             "- Use \\begin{algorithm} or pseudocode notation, NOT \\begin{verbatim}\n\n"
             "Output markdown with ## headers. Do NOT include a References section."
         )
+    call3_user += (
+        "\n\n## Campaign and Evolution Guidance\n"
+        f"{_campaign_writing_guidance}"
+    )
     try:
         resp3 = _chat_with_prompt(llm, system, call3_user, max_tokens=_paper_max_tokens, retries=1)
         part3 = resp3.content.strip()
@@ -1336,6 +1629,73 @@ def _execute_paper_draft(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.PAPER_DRAFT)
+    evidence_gate = _write_paper_evidence_gate(stage_dir, run_dir, config)
+    if not evidence_gate["eligible"]:
+        _hard_rejected_numeric = any(
+            record.get("metric_keys")
+            and record.get("status") != "simulated"
+            for record in evidence_gate["rejected_runs"]
+        )
+        # Preserve the existing, more specific simulated/no-metrics outcomes.
+        # The production evidence gate takes precedence when failed,
+        # placeholder, unprovenanced, or semantically misaligned numeric
+        # evidence would otherwise be admitted into the paper.
+        _hard_invalid = (
+            _hard_rejected_numeric
+            or bool(evidence_gate.get("semantic_alignment"))
+            and not evidence_gate["semantic_alignment"].get("aligned", True)
+        )
+        if not _hard_invalid:
+            evidence_gate = dict(evidence_gate)
+            evidence_gate["deferred_to_existing_guard"] = True
+        else:
+            (stage_dir / "paper_draft.md").write_text(
+                "# Paper Draft Blocked\n\n"
+                "**Reason**: Experiment evidence includes failed, placeholder, "
+                "unprovenanced, or semantically misaligned numerical results "
+                "and is not publication-eligible.\n",
+                encoding="utf-8",
+            )
+            (stage_dir / "paper_meta.json").write_text(
+                json.dumps(
+                    {
+                        "outcome": "blocked_invalid_evidence",
+                        "reasons": evidence_gate["reasons"],
+                        "valid_runs": evidence_gate["valid_runs"],
+                        "rejected_runs": evidence_gate["rejected_runs"],
+                        "semantic_alignment": evidence_gate.get(
+                            "semantic_alignment"
+                        ),
+                        "action_required": (
+                            "Re-run the aligned experiment successfully and "
+                            "preserve run-level provenance before drafting."
+                        ),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            return StageResult(
+                stage=Stage.PAPER_DRAFT,
+                status=StageStatus.PAUSED,
+                artifacts=(
+                    "paper_draft.md",
+                    "paper_meta.json",
+                    "evidence_gate.json",
+                ),
+                error=(
+                    "Paper draft blocked: experiment evidence failed the "
+                    "production evidence gate"
+                ),
+                evidence_refs=(
+                    "stage-17/paper_draft.md",
+                    "stage-17/paper_meta.json",
+                    "stage-17/evidence_gate.json",
+                ),
+                decision="blocked_invalid_evidence",
+            )
     outline = _read_prior_artifact(run_dir, "outline.md") or ""
     preamble = _build_context_preamble(
         config,
@@ -2303,6 +2663,9 @@ Generated: {_utcnow_iso()}
     return StageResult(
         stage=Stage.PAPER_DRAFT,
         status=StageStatus.DONE,
-        artifacts=("paper_draft.md",),
-        evidence_refs=("stage-17/paper_draft.md",),
+        artifacts=("paper_draft.md", "evidence_gate.json"),
+        evidence_refs=(
+            "stage-17/paper_draft.md",
+            "stage-17/evidence_gate.json",
+        ),
     )

@@ -15,6 +15,7 @@ from researchclaw.config import RCConfig
 from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._helpers import (
     StageResult,
+    _bind_stage_role,
     _build_context_preamble,
     _chat_with_prompt,
     _extract_yaml_block,
@@ -71,6 +72,210 @@ def _plan_field_names(items: list) -> list[str]:
     return result
 
 
+_RSI_TOPIC_MARKERS = (
+    "recursive self-improvement",
+    "self-improvement",
+    "self improvement",
+    "self-iterative",
+    "self iterative",
+    "acceptance gate",
+    "accept/reject",
+    "rollback",
+    "llm agent",
+    "language model",
+    "calibration-aware",
+    "calibration aware",
+)
+_VISION_DOMAIN_ADAPTATION_MARKERS = (
+    "cifar",
+    "imagenet",
+    "mnist",
+    "fashionmnist",
+    "svhn",
+    "office-home",
+    "office31",
+    "visda",
+    "resnet",
+    "convnet",
+    "convolutional",
+    "image classification",
+    "computer vision",
+    "domain adaptation",
+    "domain discriminator",
+    "feature alignment",
+    "dann",
+    "coral",
+)
+
+
+def _selected_topic_contract(
+    run_dir: Path,
+    config: RCConfig,
+) -> dict[str, Any]:
+    """Load the authoritative autonomous topic, if one exists."""
+    raw = _read_prior_artifact(run_dir, "selected_topic.json")
+    selected = _safe_json_loads(raw or "{}", {})
+    if not isinstance(selected, dict):
+        selected = {}
+    selected.setdefault("title", config.research.topic)
+    return selected
+
+
+def _flatten_semantic_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return " ".join(
+            f"{key} {_flatten_semantic_text(item)}"
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_flatten_semantic_text(item) for item in value)
+    return str(value or "")
+
+
+def _validate_experiment_semantics(
+    plan: dict[str, Any],
+    selected_topic: dict[str, Any],
+    fallback_topic: str,
+) -> dict[str, Any]:
+    """Hard-check that Stage 9 still tests the selected scientific question.
+
+    The special-case drift detector is intentionally narrow: it protects LLM
+    recursive-self-improvement topics from the recurrent CIFAR/DANN/CORAL
+    substitution while leaving genuinely visual/domain-adaptation topics alone.
+    Generic topics still receive a lightweight selected-field overlap check.
+    """
+    topic_fields = (
+        "title",
+        "research_question",
+        "falsifiable_hypothesis",
+        "datasets",
+        "models",
+        "primary_metric",
+        "baselines",
+        "ablations",
+    )
+    topic_text = " ".join(
+        _flatten_semantic_text(selected_topic.get(field))
+        for field in topic_fields
+    ).strip()
+    if not topic_text:
+        topic_text = fallback_topic
+    plan_text = _flatten_semantic_text(
+        {
+            key: plan.get(key)
+            for key in (
+                "topic",
+                "objectives",
+                "datasets",
+                "models",
+                "tasks",
+                "baselines",
+                "proposed_methods",
+                "ablations",
+                "metrics",
+            )
+        }
+    )
+    topic_lower = topic_text.casefold()
+    plan_lower = plan_text.casefold()
+
+    is_rsi_topic = any(marker in topic_lower for marker in _RSI_TOPIC_MARKERS)
+    topic_is_vision = any(
+        marker in topic_lower for marker in _VISION_DOMAIN_ADAPTATION_MARKERS
+    )
+    forbidden_drift_terms = sorted(
+        marker
+        for marker in _VISION_DOMAIN_ADAPTATION_MARKERS
+        if marker in plan_lower and marker not in topic_lower
+    )
+
+    anchor_groups: dict[str, tuple[str, ...]] = {}
+    if is_rsi_topic:
+        anchor_groups = {
+            "llm_or_agent_subject": (
+                "llm",
+                "language model",
+                "agent",
+                "model response",
+                "task trace",
+            ),
+            "self_improvement_process": (
+                "self-improvement",
+                "self improvement",
+                "self-iterative",
+                "recursive",
+                "iteration",
+                "mutation",
+                "candidate update",
+            ),
+            "acceptance_or_calibration_endpoint": (
+                "accept",
+                "gate",
+                "calibrat",
+                "regression",
+                "rollback",
+                "expected calibration error",
+                "ece",
+            ),
+        }
+    else:
+        for field in ("datasets", "models", "primary_metric"):
+            raw = selected_topic.get(field)
+            values = raw if isinstance(raw, list) else [raw]
+            markers = tuple(
+                str(item).strip().casefold()
+                for item in values
+                if str(item or "").strip()
+            )
+            if markers:
+                anchor_groups[field] = markers
+
+    matched_anchor_groups = sorted(
+        name
+        for name, markers in anchor_groups.items()
+        if any(marker in plan_lower for marker in markers)
+    )
+    missing_anchor_groups = sorted(
+        set(anchor_groups) - set(matched_anchor_groups)
+    )
+
+    reasons: list[str] = []
+    if is_rsi_topic and not topic_is_vision and forbidden_drift_terms:
+        reasons.append(
+            "RSI/LLM topic drifted into computer-vision or domain-adaptation "
+            "datasets, models, tasks, or metrics"
+        )
+    if is_rsi_topic and len(matched_anchor_groups) < 2:
+        reasons.append(
+            "Plan does not preserve enough LLM self-improvement, acceptance, "
+            "calibration, rollback, or regression endpoints"
+        )
+    if (
+        not is_rsi_topic
+        and selected_topic.get("id")
+        and anchor_groups
+        and not matched_anchor_groups
+    ):
+        reasons.append(
+            "Plan does not overlap the selected topic's declared datasets, "
+            "models, or primary metric"
+        )
+
+    return {
+        "aligned": not reasons,
+        "selected_topic_id": str(selected_topic.get("id", "") or ""),
+        "selected_topic_title": str(
+            selected_topic.get("title", fallback_topic) or fallback_topic
+        ),
+        "is_rsi_topic": is_rsi_topic,
+        "topic_is_vision": topic_is_vision,
+        "matched_anchor_groups": matched_anchor_groups,
+        "missing_anchor_groups": missing_anchor_groups,
+        "forbidden_drift_terms": forbidden_drift_terms,
+        "reasons": reasons,
+    }
+
+
 def _execute_experiment_design(
     stage_dir: Path,
     run_dir: Path,
@@ -80,7 +285,9 @@ def _execute_experiment_design(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.EXPERIMENT_DESIGN)
     hypotheses = _read_prior_artifact(run_dir, "hypotheses.md") or ""
+    _selected_topic = _selected_topic_contract(run_dir, config)
     preamble = _build_context_preamble(
         config, run_dir, include_goal=True, include_hypotheses=True
     )
@@ -409,7 +616,8 @@ def _execute_experiment_design(
     if (
         _ba_domain_ok
         and config.experiment.benchmark_agent.enabled
-        and config.experiment.mode in ("sandbox", "docker")
+        and config.experiment.mode
+        in ("sandbox", "docker", "clusterbridge", "clusterbridge_pool")
         and llm is not None
     ):
         try:
@@ -567,6 +775,37 @@ def _execute_experiment_design(
         except Exception:
             logger.debug("HITL guidance application failed (non-blocking)")
 
+    # Production scientific gate: the executable plan must still test the
+    # authoritative selected topic. Run after every automatic and HITL rewrite
+    # so no later mutation can reintroduce an unrelated benchmark.
+    _semantic_report = _validate_experiment_semantics(
+        plan,
+        _selected_topic,
+        config.research.topic,
+    )
+    (stage_dir / "semantic_alignment.json").write_text(
+        json.dumps(_semantic_report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    if not _semantic_report["aligned"]:
+        logger.error(
+            "Stage 9 BLOCKED: experiment plan is semantically misaligned "
+            "with selected topic %r: %s",
+            _semantic_report["selected_topic_title"],
+            "; ".join(_semantic_report["reasons"]),
+        )
+        return StageResult(
+            stage=Stage.EXPERIMENT_DESIGN,
+            status=StageStatus.PAUSED,
+            artifacts=("semantic_alignment.json",),
+            error=(
+                "Experiment plan is not semantically aligned with the "
+                "authoritative selected_topic contract"
+            ),
+            evidence_refs=("stage-09/semantic_alignment.json",),
+            decision="semantic_misalignment",
+        )
+
     # --- HITL: Baseline Navigator data persistence ---
     try:
         from researchclaw.hitl.workshops.baseline import BaselineNavigator, BaselineCandidate
@@ -597,6 +836,9 @@ def _execute_experiment_design(
     return StageResult(
         stage=Stage.EXPERIMENT_DESIGN,
         status=StageStatus.DONE,
-        artifacts=("exp_plan.yaml",),
-        evidence_refs=("stage-09/exp_plan.yaml",),
+        artifacts=("exp_plan.yaml", "semantic_alignment.json"),
+        evidence_refs=(
+            "stage-09/exp_plan.yaml",
+            "stage-09/semantic_alignment.json",
+        ),
     )

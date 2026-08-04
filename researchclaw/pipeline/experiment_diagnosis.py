@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import enum
 import logging
-import math
 import re
 from dataclasses import dataclass, field
-from typing import Any
+
+from researchclaw.pipeline.result_validity import (
+    OVERALL_CONDITION,
+    assess_experiment_summary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -270,12 +273,30 @@ def diagnose_experiment(
     diag = ExperimentDiagnosis()
 
     # Determine planned vs completed conditions
-    planned_conditions = _get_planned_conditions(experiment_plan, experiment_summary)
+    planned_conditions = _get_planned_conditions(
+        experiment_plan,
+        experiment_summary,
+    )
+    observed_conditions = _get_observed_conditions(experiment_summary)
+    denominator_conditions = planned_conditions | observed_conditions
     completed_conditions = _get_completed_conditions(experiment_summary)
-    diag.total_planned = len(planned_conditions)
+    completed_conditions &= denominator_conditions
+    diag.total_planned = len(denominator_conditions)
     diag.conditions_completed = sorted(completed_conditions)
-    diag.conditions_failed = sorted(set(planned_conditions) - completed_conditions)
-    diag.completion_rate = len(completed_conditions) / max(len(planned_conditions), 1)
+    diag.conditions_failed = sorted(
+        denominator_conditions - completed_conditions
+    )
+    diag.completion_rate = (
+        min(
+            1.0,
+            max(
+                0.0,
+                len(completed_conditions) / len(denominator_conditions),
+            ),
+        )
+        if denominator_conditions
+        else 0.0
+    )
 
     combined_output = stdout + "\n" + stderr
 
@@ -291,7 +312,12 @@ def diagnose_experiment(
     _check_gpu_oom(diag, combined_output)
 
     # 4. Time guard dominance
-    _check_time_guard(diag, combined_output, planned_conditions, completed_conditions)
+    _check_time_guard(
+        diag,
+        combined_output,
+        denominator_conditions,
+        completed_conditions,
+    )
 
     # 5. Synthetic data fallback
     _check_synthetic_data(diag, combined_output)
@@ -329,7 +355,8 @@ def diagnose_experiment(
     # Build summary
     diag.summary = (
         f"{len(diag.deficiencies)} deficiency(ies) found. "
-        f"{len(completed_conditions)}/{len(planned_conditions)} conditions completed. "
+        f"{len(completed_conditions)}/{len(denominator_conditions)} "
+        "conditions completed. "
         f"Repairable: {diag.repairable}."
     )
 
@@ -656,17 +683,28 @@ def _get_planned_conditions(plan: dict | None, summary: dict) -> set[str]:
     return set(summary.get("condition_summaries", {}).keys())
 
 
+def _get_observed_conditions(summary: dict) -> set[str]:
+    """Return every condition represented in summary metrics/artifacts."""
+
+    observed = set(summary.get("condition_summaries", {}).keys())
+    best_metrics = summary.get("best_run", {}).get("metrics", {})
+    if isinstance(best_metrics, dict):
+        for key in best_metrics:
+            parts = str(key).split("/")
+            if len(parts) >= 2 and parts[0]:
+                observed.add(parts[0])
+    return observed
+
+
 def _get_completed_conditions(summary: dict) -> set[str]:
-    """Extract conditions that actually produced metrics."""
-    completed = set()
-    cond_summaries = summary.get("condition_summaries", {})
-    for cond_name, data in cond_summaries.items():
-        metrics = data.get("metrics", {})
-        if metrics and any(
-            isinstance(v, (int, float)) and math.isfinite(v) for v in metrics.values()
-        ):
-            completed.add(cond_name)
-    return completed
+    """Extract conditions with genuine, valid production results."""
+
+    validity = assess_experiment_summary(summary)
+    return {
+        condition
+        for condition in validity.valid_conditions
+        if condition != OVERALL_CONDITION
+    }
 
 
 def _extract_stdout(summary: dict, ref_log: dict | None) -> str:

@@ -441,8 +441,8 @@ class TestFactoryIntegration:
 
 class TestAcpTimeoutFix:
     def test_timeout_passed_from_config(self):
-        from researchclaw.config import RCConfig, AcpConfig, LlmConfig
-        from researchclaw.llm.acp_client import ACPClient, ACPConfig
+        from researchclaw.config import AcpConfig, LlmConfig
+        from researchclaw.llm.acp_client import ACPClient
 
         acp_cfg = AcpConfig(agent="codex", timeout_sec=1500)
         llm_cfg = LlmConfig(provider="acp", acp=acp_cfg)
@@ -466,6 +466,20 @@ class TestAcpTimeoutFix:
 
         client = ACPClient.from_rc_config(fake_rc)
         assert client.config.timeout_sec == 600
+
+    def test_role_model_is_stored_on_acp_config(self):
+        from researchclaw.config import AcpConfig, LlmConfig
+        from researchclaw.llm.acp_client import ACPClient
+
+        fake_rc = mock.Mock()
+        fake_rc.llm = LlmConfig(
+            provider="acp",
+            primary_model="role-specific-model",
+            acp=AcpConfig(agent="codex", session_name="idea-scientist"),
+        )
+
+        client = ACPClient.from_rc_config(fake_rc)
+        assert client.config.model == "role-specific-model"
 
 
 # ===========================================================================

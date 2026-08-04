@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CB="/root/shared/.clusters/.tools/clusterbridge.sh"
+NODE="${RESEARCHCLAW_GPU_NODE:-28.83.50.39}"
+PURPOSE="AutoResearchClaw GPU experiments"
+
+usage() {
+  cat >&2 <<EOF
+Usage: ./bin/cluster-gpu {status|claim|renew|prepare|smoke|release}
+
+Environment:
+  RESEARCHCLAW_GPU_NODE   ClusterBridge node (default: 28.83.50.39)
+EOF
+  exit 2
+}
+
+case "${1:-}" in
+  status)
+    bash "$CB" list
+    ;;
+  claim)
+    bash "$CB" claim "$NODE" --purpose "$PURPOSE" --ttl 240
+    ;;
+  renew)
+    bash "$CB" renew "$NODE" --purpose "$PURPOSE" --ttl 240
+    ;;
+  prepare)
+    bash "$CB" claim "$NODE" --purpose "$PURPOSE" --ttl 240
+    bash "$CB" "$NODE" run \
+      'set -e; bash /root/shared/.clusters/.tools/node_cleanup.sh; bash /root/shared/.clusters/.tools/node_spin.sh pause; nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu --format=csv,noheader'
+    ;;
+  smoke)
+    cd /data/workspace/autoresearch-stack/AutoResearchClaw
+    source .venv/bin/activate
+    python scripts/clusterbridge_gpu_smoke.py
+    ;;
+  release)
+    bash "$CB" "$NODE" run 'bash /root/shared/.clusters/.tools/node_spin.sh spin'
+    bash "$CB" release "$NODE"
+    ;;
+  *) usage ;;
+esac

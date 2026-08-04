@@ -18,6 +18,7 @@ from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._domain import _detect_domain  # noqa: F401
 from researchclaw.pipeline._helpers import (
     StageResult,
+    _bind_stage_role,
     _build_context_preamble,
     _chat_with_prompt,
     _collect_experiment_results,  # noqa: F401
@@ -55,6 +56,64 @@ def _get_collect_raw_experiment_metrics():
 def _get_review_compiled_pdf():
     from researchclaw.pipeline.stage_impls._paper_writing import _review_compiled_pdf
     return _review_compiled_pdf
+
+
+def _get_paper_evidence_gate():
+    from researchclaw.pipeline.stage_impls._paper_writing import (
+        _paper_evidence_gate,
+    )
+
+    return _paper_evidence_gate
+
+
+def _enforce_paper_evidence_gate(
+    *,
+    stage: Stage,
+    stage_dir: Path,
+    run_dir: Path,
+    config: RCConfig,
+) -> tuple[StageResult | None, dict[str, Any]]:
+    """Block Stages 18-23 when numerical evidence is not publication-safe."""
+    report = _get_paper_evidence_gate()(run_dir, config)
+    (stage_dir / "evidence_gate.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    if report.get("eligible"):
+        return None, report
+    # Backward-compatible structural operations may run without any experiment
+    # artifacts at all (for example code-package unit tests).  There is no
+    # numerical claim to admit or reject in that case.  Once any run/summary
+    # evidence exists, however, the gate is mandatory and fail-closed.
+    if not (
+        report.get("valid_runs")
+        or report.get("rejected_runs")
+        or report.get("summary_files")
+        or report.get("semantic_alignment")
+    ):
+        report["not_applicable"] = True
+        return None, report
+    logger.error(
+        "Stage %s BLOCKED by production evidence gate: %s",
+        stage.value,
+        "; ".join(report.get("reasons", [])),
+    )
+    return (
+        StageResult(
+            stage=stage,
+            status=StageStatus.FAILED,
+            artifacts=("evidence_gate.json",),
+            error=(
+                "Paper evidence gate rejected failed, placeholder, "
+                "unprovenanced, or semantically misaligned numerical evidence"
+            ),
+            evidence_refs=(
+                f"stage-{stage.value:02d}/evidence_gate.json",
+            ),
+            decision="blocked_invalid_evidence",
+        ),
+        report,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +203,15 @@ def _execute_peer_review(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.PEER_REVIEW)
+    blocked, _ = _enforce_paper_evidence_gate(
+        stage=Stage.PEER_REVIEW,
+        stage_dir=stage_dir,
+        run_dir=run_dir,
+        config=config,
+    )
+    if blocked is not None:
+        return blocked
     draft = _read_prior_artifact(run_dir, "paper_draft.md") or ""
     experiment_evidence = _collect_experiment_evidence(run_dir)
 
@@ -204,8 +272,11 @@ def _execute_peer_review(
     return StageResult(
         stage=Stage.PEER_REVIEW,
         status=StageStatus.DONE,
-        artifacts=("reviews.md",),
-        evidence_refs=("stage-18/reviews.md",),
+        artifacts=("reviews.md", "evidence_gate.json"),
+        evidence_refs=(
+            "stage-18/reviews.md",
+            "stage-18/evidence_gate.json",
+        ),
     )
 
 
@@ -222,6 +293,15 @@ def _execute_paper_revision(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.PAPER_REVISION)
+    blocked, _ = _enforce_paper_evidence_gate(
+        stage=Stage.PAPER_REVISION,
+        stage_dir=stage_dir,
+        run_dir=run_dir,
+        config=config,
+    )
+    if blocked is not None:
+        return blocked
     draft = _read_prior_artifact(run_dir, "paper_draft.md") or ""
     reviews = _read_prior_artifact(run_dir, "reviews.md") or ""
     draft_word_count = len(draft.split())
@@ -368,8 +448,11 @@ def _execute_paper_revision(
     return StageResult(
         stage=Stage.PAPER_REVISION,
         status=StageStatus.DONE,
-        artifacts=("paper_revised.md",),
-        evidence_refs=("stage-19/paper_revised.md",),
+        artifacts=("paper_revised.md", "evidence_gate.json"),
+        evidence_refs=(
+            "stage-19/paper_revised.md",
+            "stage-19/evidence_gate.json",
+        ),
     )
 
 
@@ -386,6 +469,15 @@ def _execute_quality_gate(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.QUALITY_GATE)
+    blocked, _ = _enforce_paper_evidence_gate(
+        stage=Stage.QUALITY_GATE,
+        stage_dir=stage_dir,
+        run_dir=run_dir,
+        config=config,
+    )
+    if blocked is not None:
+        return blocked
     revised = _read_prior_artifact(run_dir, "paper_revised.md") or ""
     report: dict[str, Any] | None = None
 
@@ -586,8 +678,15 @@ def _execute_quality_gate(
         return StageResult(
             stage=Stage.QUALITY_GATE,
             status=StageStatus.FAILED,
-            artifacts=("quality_report.json", "fabrication_flags.json"),
-            evidence_refs=("stage-20/quality_report.json",),
+            artifacts=(
+                "quality_report.json",
+                "fabrication_flags.json",
+                "evidence_gate.json",
+            ),
+            evidence_refs=(
+                "stage-20/quality_report.json",
+                "stage-20/evidence_gate.json",
+            ),
             error=(
                 "Quality gate BLOCKED: VerifiedRegistry has zero real experiment "
                 "values and experiment failed. Paper contains no grounded data. "
@@ -619,8 +718,11 @@ def _execute_quality_gate(
             return StageResult(
                 stage=Stage.QUALITY_GATE,
                 status=StageStatus.DONE,
-                artifacts=("quality_report.json",),
-                evidence_refs=("stage-20/quality_report.json",),
+                artifacts=("quality_report.json", "evidence_gate.json"),
+                evidence_refs=(
+                    "stage-20/quality_report.json",
+                    "stage-20/evidence_gate.json",
+                ),
                 decision="degraded",
             )
         logger.warning(
@@ -630,8 +732,15 @@ def _execute_quality_gate(
         return StageResult(
             stage=Stage.QUALITY_GATE,
             status=StageStatus.FAILED,
-            artifacts=("quality_report.json", "fabrication_flags.json"),
-            evidence_refs=("stage-20/quality_report.json",),
+            artifacts=(
+                "quality_report.json",
+                "fabrication_flags.json",
+                "evidence_gate.json",
+            ),
+            evidence_refs=(
+                "stage-20/quality_report.json",
+                "stage-20/evidence_gate.json",
+            ),
             error=f"Quality score {score:.1f}/10 below threshold {threshold:.1f}. "
                   f"Paper needs revision before export.",
         )
@@ -643,8 +752,15 @@ def _execute_quality_gate(
     return StageResult(
         stage=Stage.QUALITY_GATE,
         status=StageStatus.DONE,
-        artifacts=("quality_report.json", "fabrication_flags.json"),
-        evidence_refs=("stage-20/quality_report.json",),
+        artifacts=(
+            "quality_report.json",
+            "fabrication_flags.json",
+            "evidence_gate.json",
+        ),
+        evidence_refs=(
+            "stage-20/quality_report.json",
+            "stage-20/evidence_gate.json",
+        ),
     )
 
 
@@ -661,6 +777,15 @@ def _execute_knowledge_archive(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.KNOWLEDGE_ARCHIVE)
+    blocked, _ = _enforce_paper_evidence_gate(
+        stage=Stage.KNOWLEDGE_ARCHIVE,
+        stage_dir=stage_dir,
+        run_dir=run_dir,
+        config=config,
+    )
+    if blocked is not None:
+        return blocked
     revised = _read_prior_artifact(run_dir, "paper_revised.md") or ""
     analysis = _read_best_analysis(run_dir)
     decision = _read_prior_artifact(run_dir, "decision.md") or ""
@@ -719,8 +844,12 @@ Generated: {_utcnow_iso()}
     return StageResult(
         stage=Stage.KNOWLEDGE_ARCHIVE,
         status=StageStatus.DONE,
-        artifacts=("archive.md", "bundle_index.json"),
-        evidence_refs=("stage-21/archive.md", "stage-21/bundle_index.json"),
+        artifacts=("archive.md", "bundle_index.json", "evidence_gate.json"),
+        evidence_refs=(
+            "stage-21/archive.md",
+            "stage-21/bundle_index.json",
+            "stage-21/evidence_gate.json",
+        ),
     )
 
 
@@ -1442,6 +1571,15 @@ def _execute_export_publish(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.EXPORT_PUBLISH)
+    blocked, _ = _enforce_paper_evidence_gate(
+        stage=Stage.EXPORT_PUBLISH,
+        stage_dir=stage_dir,
+        run_dir=run_dir,
+        config=config,
+    )
+    if blocked is not None:
+        return blocked
     revised = _read_prior_artifact(run_dir, "paper_revised.md") or ""
 
     # --- Detect domain once for export-stage formatting decisions ---
@@ -1768,7 +1906,7 @@ def _execute_export_publish(
             )
 
     # Initialize artifacts list
-    artifacts = ["paper_final.md"]
+    artifacts = ["paper_final.md", "evidence_gate.json"]
     # F2.7: Post-process citations — [cite_key] → \cite{cite_key}
     # and copy final references.bib to export stage
     _ay_map: dict[str, str] = {}  # BUG-102: author-year → cite_key map
@@ -2672,6 +2810,15 @@ def _execute_citation_verify(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.CITATION_VERIFY)
+    blocked, _ = _enforce_paper_evidence_gate(
+        stage=Stage.CITATION_VERIFY,
+        stage_dir=stage_dir,
+        run_dir=run_dir,
+        config=config,
+    )
+    if blocked is not None:
+        return blocked
     from researchclaw.literature.verify import (
         VerifyStatus,
         annotate_paper_hallucinations,
@@ -2710,10 +2857,15 @@ def _execute_citation_verify(
         return StageResult(
             stage=Stage.CITATION_VERIFY,
             status=StageStatus.DONE,
-            artifacts=("verification_report.json", "references_verified.bib"),
+            artifacts=(
+                "verification_report.json",
+                "references_verified.bib",
+                "evidence_gate.json",
+            ),
             evidence_refs=(
                 "stage-23/verification_report.json",
                 "stage-23/references_verified.bib",
+                "stage-23/evidence_gate.json",
             ),
         )
 
@@ -2851,7 +3003,11 @@ def _execute_citation_verify(
 
     (stage_dir / "references_verified.bib").write_text(verified_bib, encoding="utf-8")
 
-    artifacts = ["verification_report.json", "references_verified.bib"]
+    artifacts = [
+        "verification_report.json",
+        "references_verified.bib",
+        "evidence_gate.json",
+    ]
 
     if paper_text.strip():
         annotated = annotate_paper_hallucinations(paper_text, report)

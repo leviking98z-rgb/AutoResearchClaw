@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -337,6 +338,60 @@ def test_execute_stage_creates_stage_dir_writes_artifacts_and_meta(
     assert decision["run_id"] == "run-1"
     assert decision["status"] == "done"
     assert decision["output_artifacts"] == ["goal.md", "hardware_profile.json"]
+
+
+def test_topic_init_copies_structured_selected_topic_into_stage_context(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    selected = run_dir / "selected_topic.json"
+    selected.write_text(
+        json.dumps(
+            {
+                "id": "calibration-gate",
+                "title": "Calibration-aware acceptance gates for RSI",
+                "falsifiable_hypothesis": "The gate prevents held-out regression.",
+                "primary_metric": "held-out accuracy per token",
+            }
+        ),
+        encoding="utf-8",
+    )
+    configured = replace(
+        rc_config,
+        research=replace(
+            rc_config.research,
+            selected_topic_file=str(selected),
+            topic="Calibration-aware acceptance gates for RSI",
+        ),
+    )
+    fake_llm = FakeLLMClientWithConfig("# Goal\n\nConcrete goal")
+    monkeypatch.setattr(
+        "researchclaw.pipeline.executor.LLMClient.from_rc_config",
+        lambda _config: fake_llm,
+    )
+
+    result = rc_executor.execute_stage(
+        Stage.TOPIC_INIT,
+        run_dir=run_dir,
+        run_id="selected-topic-run",
+        config=configured,
+        adapters=adapters,
+        auto_approve_gates=True,
+    )
+
+    assert result.status == StageStatus.DONE
+    assert "selected_topic.json" in result.artifacts
+    assert "topic.md" in result.artifacts
+    assert (
+        run_dir / "stage-01" / "topic.md"
+    ).read_text(encoding="utf-8").strip() == (
+        "Calibration-aware acceptance gates for RSI"
+    )
+    goal = (run_dir / "stage-01" / "goal.md").read_text(encoding="utf-8")
+    assert "Autonomous Selection Contract" in goal
+    assert "held-out accuracy per token" in goal
 
 
 def test_execute_stage_contract_validation_missing_output_file_marks_failed(

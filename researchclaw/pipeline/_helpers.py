@@ -56,8 +56,15 @@ _METACLAW_SKILLS_DIR = str(Path.home() / ".metaclaw" / "skills")
 # User-level custom skills directory (cross-project)
 _USER_SKILLS_DIR = Path.home() / ".researchclaw" / "skills"
 
-# Lazy-initialized skill registry (singleton for the process)
-_skill_registry: object | None = None
+# Lazy-initialized skill registries keyed by their configured source set.
+#
+# Stage implementations historically call ``_get_evolution_overlay()`` without
+# passing the full RCConfig object.  Keep the registry selected by the executor
+# as the active registry for those later calls, otherwise campaign-local skill
+# directories are silently dropped and a second, default-only registry is
+# created.
+_skill_registries: dict[tuple[object, ...], object] = {}
+_active_skill_registry_key: tuple[object, ...] | None = None
 
 
 def _get_skill_registry(config: object | None = None) -> object:
@@ -70,11 +77,17 @@ def _get_skill_registry(config: object | None = None) -> object:
     4. MetaClaw cross-run skills ``~/.metaclaw/skills/``
     5. User-configured ``config.yaml → skills.custom_dirs``
     """
-    global _skill_registry  # noqa: PLW0603
-    if _skill_registry is not None:
-        return _skill_registry
+    global _active_skill_registry_key
+
     try:
         from researchclaw.skills.registry import SkillRegistry
+
+        if (
+            config is None
+            and _active_skill_registry_key is not None
+            and _active_skill_registry_key in _skill_registries
+        ):
+            return _skill_registries[_active_skill_registry_key]
 
         custom_dirs: list[str] = []
 
@@ -103,25 +116,42 @@ def _get_skill_registry(config: object | None = None) -> object:
                     if d:
                         custom_dirs.append(str(d))
 
-        _skill_registry = SkillRegistry(
+        max_skills = (
+            getattr(getattr(config, "skills", None), "max_skills_per_stage", 3)
+            if config
+            else 3
+        )
+        registry_key = (
+            tuple(custom_dirs),
+            int(max_skills),
+        )
+        if registry_key in _skill_registries:
+            registry = _skill_registries[registry_key]
+            if config is not None:
+                _active_skill_registry_key = registry_key
+            return registry
+
+        registry = SkillRegistry(
             custom_dirs=custom_dirs,
             auto_match=True,
-            max_skills_per_stage=getattr(
-                getattr(config, "skills", None), "max_skills_per_stage", 3
-            ) if config else 3,
+            max_skills_per_stage=max_skills,
             fallback_matching=True,
         )
+        _skill_registries[registry_key] = registry
+        if config is not None:
+            _active_skill_registry_key = registry_key
         logger.info(
             "Skill registry initialized: %d skills from %d sources",
-            _skill_registry.count(),
+            registry.count(),
             1 + len(custom_dirs),
         )
+        return registry
     except Exception:  # noqa: BLE001
         # Fallback: create empty registry so we never crash
         from researchclaw.skills.registry import SkillRegistry
-        _skill_registry = SkillRegistry(builtin_dir="/dev/null")
+        registry = SkillRegistry(builtin_dir="/dev/null")
         logger.debug("Skill registry init failed, using empty registry")
-    return _skill_registry
+        return registry
 
 # --- P1-1: Topic keyword extraction for domain pre-filter ---
 _STOP_WORDS = frozenset(
@@ -746,6 +776,7 @@ def _chat_with_prompt(
     system: str,
     user: str,
     *,
+    model: str | None = None,
     json_mode: bool = False,
     max_tokens: int | None = None,
     retries: int = 0,
@@ -771,12 +802,12 @@ def _chat_with_prompt(
     for attempt in range(1 + retries):
         try:
             if _effective_json_mode and max_tokens is not None:
-                return llm.chat(messages, system=system, json_mode=True, max_tokens=max_tokens, strip_thinking=strip_thinking)
+                return llm.chat(messages, system=system, model=model, json_mode=True, max_tokens=max_tokens, strip_thinking=strip_thinking)
             if _effective_json_mode:
-                return llm.chat(messages, system=system, json_mode=True, strip_thinking=strip_thinking)
+                return llm.chat(messages, system=system, model=model, json_mode=True, strip_thinking=strip_thinking)
             if max_tokens is not None:
-                return llm.chat(messages, system=system, max_tokens=max_tokens, strip_thinking=strip_thinking)
-            return llm.chat(messages, system=system, strip_thinking=strip_thinking)
+                return llm.chat(messages, system=system, model=model, max_tokens=max_tokens, strip_thinking=strip_thinking)
+            return llm.chat(messages, system=system, model=model, strip_thinking=strip_thinking)
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             # Auto-disable json_mode on HTTP 400 — likely provider incompatibility
@@ -800,6 +831,26 @@ def _chat_with_prompt(
             else:
                 raise last_exc from None
     raise last_exc  # type: ignore[misc]  # unreachable but satisfies type checker
+
+
+def _bind_stage_role(llm: Any, stage: Any) -> Any:
+    """Bind an injected LLM facade to the canonical role for ``stage``.
+
+    Direct unit/integration calls often pass a plain fake client, while normal
+    pipeline execution already supplies a role-bound client.  This helper keeps
+    both paths compatible and prevents nested/reused stage executors from
+    retaining the previous stage's role identity.
+    """
+
+    if llm is None:
+        return None
+    for_stage = getattr(llm, "for_stage", None)
+    if callable(for_stage):
+        try:
+            return for_stage(stage)
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not rebind LLM stage role", exc_info=True)
+    return llm
 
 
 def _get_evolution_overlay(
@@ -901,34 +952,57 @@ def _collect_experiment_results(
     Returns a dict with ``runs``, ``metrics_summary``, ``best_run``,
     ``latex_table``, and optionally ``structured_results``.
     """
+    from researchclaw.pipeline.result_validity import assess_run_payload
+
     runs_data: list[dict[str, Any]] = []
     structured_results: Any = None
 
     # Scan all stage dirs for runs/ subdirectory
     for stage_subdir in sorted(run_dir.glob("stage-*/runs")):
-        # Check for structured results.json first
-        results_json = stage_subdir / "results.json"
-        if results_json.exists() and structured_results is None:
-            try:
-                structured_results = json.loads(
-                    results_json.read_text(encoding="utf-8")
-                )
-            except (json.JSONDecodeError, OSError):
-                pass
-
         for run_file in sorted(stage_subdir.glob("*.json")):
             if run_file.name == "results.json":
                 continue  # Already handled above
             parsed = _safe_json_loads(run_file.read_text(encoding="utf-8"), {})
             if isinstance(parsed, dict) and "metrics" in parsed:
-                # Also check for structured_results inside run payload
-                if "structured_results" in parsed and structured_results is None:
-                    structured_results = parsed["structured_results"]
-                runs_data.append(parsed)
+                validity = assess_run_payload(parsed)
+                parsed["result_valid"] = validity.successful
+                parsed["partial_result_valid"] = (
+                    validity.valid and not validity.successful
+                )
+                parsed["validity_reasons"] = validity.reasons
+                parsed["invalid_conditions"] = validity.invalid_conditions
+                if validity.successful:
+                    parsed["metrics"] = validity.valid_metrics
+                    # Also check for structured_results inside valid run payload
+                    if (
+                        "structured_results" in parsed
+                        and structured_results is None
+                    ):
+                        structured_results = parsed["structured_results"]
+                    runs_data.append(parsed)
             elif isinstance(parsed, dict) and "key_metrics" in parsed:
                 # Simulated mode uses key_metrics
                 parsed["metrics"] = parsed.pop("key_metrics")
-                runs_data.append(parsed)
+                parsed["result_valid"] = False
+                parsed["validity_reasons"] = [
+                    "simulated results are not production experiment evidence"
+                ]
+
+        if (
+            structured_results is None
+            and any(
+                run.get("result_valid") is True
+                for run in runs_data
+            )
+        ):
+            results_json = stage_subdir / "results.json"
+            if results_json.exists():
+                try:
+                    structured_results = json.loads(
+                        results_json.read_text(encoding="utf-8")
+                    )
+                except (json.JSONDecodeError, OSError):
+                    pass
 
     if not runs_data:
         result: dict[str, Any] = {"runs": [], "metrics_summary": {}, "best_run": None, "latex_table": ""}
@@ -1051,6 +1125,9 @@ def _build_context_preamble(
         f"**Topic**: {config.research.topic}",
         f"**Domains**: {', '.join(config.research.domains) if config.research.domains else 'general'}",
     ]
+    selected_topic = _read_prior_artifact(run_dir, "selected_topic.json")
+    if selected_topic:
+        parts.append(f"\n### Autonomous Topic Selection\n{selected_topic[:2200]}")
     if include_goal:
         goal = _read_prior_artifact(run_dir, "goal.md")
         if goal:
@@ -1680,6 +1757,7 @@ def _multi_perspective_generate(
     roles: dict[str, dict[str, str]],
     variables: dict[str, str],
     perspectives_dir: Path,
+    guidance: str = "",
 ) -> dict[str, str]:
     """Generate outputs from multiple debate perspectives.
 
@@ -1703,6 +1781,8 @@ def _multi_perspective_generate(
         try:
             system = _render(role_prompts["system"], variables)
             user = _render(role_prompts["user"], variables)
+            if guidance:
+                user += "\n\n## Campaign and Evolution Guidance\n" + guidance
             resp = llm.chat(
                 [{"role": "user", "content": user}],
                 system=system,
@@ -1724,6 +1804,7 @@ def _synthesize_perspectives(
     perspectives: dict[str, str],
     sub_prompt_name: str,
     prompts: PromptManager,
+    guidance: str = "",
 ) -> str:
     """Synthesize multiple perspective outputs into a unified result."""
     parts = []
@@ -1731,8 +1812,11 @@ def _synthesize_perspectives(
         parts.append(f"### Perspective: {role_name}\n{text}")
     combined = "\n\n---\n\n".join(parts)
     sp = prompts.sub_prompt(sub_prompt_name, perspectives=combined)
+    user = sp.user
+    if guidance:
+        user += "\n\n## Campaign and Evolution Guidance\n" + guidance
     resp = llm.chat(
-        [{"role": "user", "content": sp.user}],
+        [{"role": "user", "content": user}],
         system=sp.system,
     )
     return resp.content

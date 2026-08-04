@@ -13,6 +13,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from researchclaw.adapters import AdapterBundle
+from researchclaw.config import RCConfig
 from researchclaw.literature.models import Author, Paper
 from researchclaw.literature.semantic_scholar import (
     _parse_s2_paper,
@@ -28,6 +30,9 @@ from researchclaw.literature.search import (
     papers_to_bibtex,
     search_papers,
     search_papers_multi_query,
+)
+from researchclaw.pipeline.stage_impls._literature import (
+    _execute_literature_collect,
 )
 
 
@@ -527,6 +532,99 @@ class TestSearchPapers:
         assert call_count == 3
         # All unique titles so no dedup
         assert len(papers) == 3
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Stage 4 literature collection tests
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_literature_collect_reads_api_keys_from_environment(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real API-search branch can read keys without a local ``os`` shadow."""
+    run_dir = tmp_path / "run"
+    stage_dir = run_dir / "stage-04"
+    prior_stage_dir = run_dir / "stage-03"
+    stage_dir.mkdir(parents=True)
+    prior_stage_dir.mkdir()
+    (prior_stage_dir / "queries.json").write_text(
+        json.dumps({"queries": ["environment-backed search"], "year_min": 2021}),
+        encoding="utf-8",
+    )
+
+    config = RCConfig.from_dict(
+        {
+            "project": {"name": "literature-env-regression", "mode": "docs-first"},
+            "research": {"topic": "A deliberately unmatched regression topic"},
+            "runtime": {"timezone": "UTC"},
+            "notifications": {"channel": "local"},
+            "knowledge_base": {
+                "backend": "markdown",
+                "root": str(tmp_path / "kb"),
+            },
+            "openclaw_bridge": {},
+            "llm": {
+                "provider": "openai-compatible",
+                "base_url": "http://localhost:1234/v1",
+                "api_key_env": "RC_TEST_KEY",
+                "api_key": "inline-test-key",
+            },
+            "literature_search": {
+                "sources": ["openalex", "semantic_scholar"],
+                "max_results_per_query": 7,
+                "inter_query_delay_sec": 0,
+                "openalex_api_key_env": "RC_TEST_OPENALEX_KEY",
+                "s2_api_key_env": "RC_TEST_S2_KEY",
+            },
+            "web_search": {"enabled": False},
+        },
+        project_root=tmp_path,
+        check_paths=False,
+    )
+    monkeypatch.setenv("RC_TEST_OPENALEX_KEY", "openalex-from-env")
+    monkeypatch.setenv("RC_TEST_S2_KEY", "s2-from-env")
+
+    captured: dict[str, Any] = {}
+
+    def fake_search(
+        queries: list[str], **kwargs: Any
+    ) -> list[Paper]:
+        captured["queries"] = queries
+        captured.update(kwargs)
+        return [
+            _make_paper(
+                paper_id="openalex-env-regression",
+                title="Environment-backed API Search",
+                source="openalex",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "researchclaw.literature.search.search_papers_multi_query",
+        fake_search,
+    )
+    monkeypatch.setattr("researchclaw.data.load_seminal_papers", lambda _: [])
+
+    result = _execute_literature_collect(
+        stage_dir,
+        run_dir,
+        config,
+        AdapterBundle(),
+    )
+
+    assert captured["s2_api_key"] == "s2-from-env"
+    assert captured["openalex_api_key"] == "openalex-from-env"
+    assert captured["year_min"] == 2021
+    assert captured["sources"] == ("openalex", "semantic_scholar")
+    assert captured["limit_per_query"] == 7
+    assert captured["queries"][0] == "environment-backed search"
+    assert result.status.value == "done"
+    search_meta = json.loads(
+        (stage_dir / "search_meta.json").read_text(encoding="utf-8")
+    )
+    assert search_meta["real_search"] is True
+    assert search_meta["total_candidates"] == 1
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Operate a multi-node AutoResearchClaw ClusterBridge pool."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from researchclaw.cluster import (
+    ClusterBridgeClient,
+    ClusterBridgePoolConfig,
+)
+from researchclaw.experiment.clusterbridge_pool import (
+    ClusterBridgePool,
+    ClusterPoolError,
+)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Claim, prepare, validate and run a multi-node Ray pool using only "
+            "ClusterBridge."
+        )
+    )
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="YAML/JSON ClusterBridge pool configuration",
+    )
+    sub = parser.add_subparsers(dest="action", required=True)
+
+    sub.add_parser("list", help="show raw ClusterBridge node/claim state")
+    status = sub.add_parser("status", help="show local pool state")
+    status.add_argument(
+        "--probe",
+        action="store_true",
+        help="probe claimed nodes and Ray resources",
+    )
+    claim = sub.add_parser("claim", help="claim every configured node")
+    claim.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "force claim occupied nodes; rejected unless allow_force_claim=true "
+            "in config"
+        ),
+    )
+    sub.add_parser("renew", help="renew every configured node")
+    sub.add_parser("prepare", help="cleanup, pause spin, start and validate Ray")
+    sub.add_parser("validate", help="validate assigned GPUs and Ray resources")
+    stop = sub.add_parser("stop", help="stop Ray and run node cleanup")
+    stop.add_argument(
+        "--spin",
+        action="store_true",
+        help="resume GPU keepalive after cleanup",
+    )
+    release = sub.add_parser("release", help="cleanup, resume spin, release nodes")
+    release.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "force release foreign claims; rejected unless "
+            "allow_force_claim=true in config"
+        ),
+    )
+    run = sub.add_parser(
+        "run",
+        help="run a background task on an already claimed pool, then release",
+    )
+    run.add_argument("--timeout", type=float, required=True)
+    run.add_argument("--task-id")
+    run.add_argument(
+        "--no-prepare",
+        action="store_true",
+        help="skip cleanup/Ray startup and run against an already-ready pool",
+    )
+    run.add_argument(
+        "--keep-claimed",
+        action="store_true",
+        help="do not teardown/release after the task",
+    )
+    run.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="command after '--', for example: -- python train.py",
+    )
+    keepalive = sub.add_parser(
+        "keepalive",
+        help="detached lease-renewal loop for an already claimed pool",
+    )
+    keepalive.add_argument(
+        "--foreground",
+        action="store_true",
+        help="run in this process instead of cb detach",
+    )
+    cancel = sub.add_parser(
+        "cancel-task",
+        help="idempotently terminate a detached task on the prepared pool",
+    )
+    cancel.add_argument("task_id")
+    return parser
+
+
+def _pool(config: ClusterBridgePoolConfig) -> ClusterBridgePool:
+    return ClusterBridgePool(config)
+
+
+def _restore_claimed_pool(config: ClusterBridgePoolConfig) -> ClusterBridgePool:
+    pool = ClusterBridgePool(config, initialize_state=False)
+    pool.restore_state()
+    if not pool.claimed:
+        raise RuntimeError("pool state is not claimed; run claim first")
+    pool.renew()
+    return pool
+
+
+def _command_text(parts: list[str]) -> str:
+    if parts and parts[0] == "--":
+        parts = parts[1:]
+    if not parts:
+        raise ValueError("run requires a command after '--'")
+    return (
+        subprocess.list2cmdline(parts)
+        if os.name == "nt"
+        else shlex.join(parts)
+    )
+
+
+def _keepalive_worker(config: ClusterBridgePoolConfig) -> int:
+    pool = _restore_claimed_pool(config)
+    interval = config.renew_interval_sec
+    failures = 0
+    while True:
+        time.sleep(interval)
+        try:
+            pool.renew()
+        except Exception as exc:  # noqa: BLE001
+            print(f"lease renewal failed: {exc}", file=sys.stderr, flush=True)
+            failures += 1
+            if failures >= config.max_renew_failures:
+                return 1
+        else:
+            failures = 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    config_path = Path(args.config).expanduser().resolve()
+    config = ClusterBridgePoolConfig.from_file(config_path)
+
+    if args.action == "list":
+        result = ClusterBridgeClient(
+            config.cb_command,
+            command_timeout_sec=config.command_timeout_sec,
+        ).list_nodes()
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        return 0
+
+    if args.action == "status":
+        state_path = config.state_dir / "state.json"
+        pool = ClusterBridgePool(config, initialize_state=not state_path.is_file())
+        try:
+            pool.restore_state()
+        except (ClusterPoolError, OSError, json.JSONDecodeError):
+            # A missing state file simply means the pool has not been claimed
+            # through this controller yet.
+            pass
+        print(json.dumps(pool.status(probe=args.probe), indent=2, sort_keys=True))
+        return 0
+    if args.action == "claim":
+        pool = _pool(config)
+        pool.claim(force=args.force, start_keepalive=False)
+        print(json.dumps(pool.status(), indent=2, sort_keys=True))
+        return 0
+
+    pool = _restore_claimed_pool(config)
+    if args.action == "renew":
+        pool.renew()
+    elif args.action == "prepare":
+        resources = pool.prepare()
+        print(json.dumps(asdict(resources), indent=2, sort_keys=True))
+    elif args.action == "validate":
+        node_gpus = pool.validate_node_gpus()
+        resources = pool.wait_for_ray_resources()
+        print(
+            json.dumps(
+                {"node_gpus": node_gpus, "ray": asdict(resources)},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    elif args.action == "stop":
+        pool.stop_ray(cleanup=True)
+        if args.spin:
+            pool.spin()
+    elif args.action == "release":
+        pool.release(force=args.force)
+    elif args.action == "run":
+        pool.start_keepalive()
+        try:
+            if not args.no_prepare and not pool.prepared:
+                pool.prepare()
+            result = pool.run_task(
+                _command_text(args.command),
+                timeout_sec=args.timeout,
+                task_id=args.task_id,
+                require_ready=not args.no_prepare,
+            )
+            print(json.dumps(asdict(result), indent=2, sort_keys=True))
+            return result.returncode
+        finally:
+            if args.keep_claimed:
+                pool.stop_keepalive()
+                print(
+                    "cluster-pool: pool kept claimed; start the detached "
+                    "'keepalive' command before leaving it unattended",
+                    file=sys.stderr,
+                )
+            else:
+                pool.release()
+    elif args.action == "keepalive":
+        if args.foreground:
+            return _keepalive_worker(config)
+        log_path = pool.state_dir / "keepalive.log"
+        result = pool.client.detach(
+            [
+                "bash",
+                "-lc",
+                shlex.join(
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "--config",
+                        str(config_path),
+                        "keepalive",
+                        "--foreground",
+                    ]
+                )
+                + f" >> {shlex.quote(str(log_path))} 2>&1",
+            ]
+        )
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+    elif args.action == "cancel-task":
+        result = pool.cancel_task(args.task_id)
+        print(json.dumps(asdict(result), indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+    except Exception as exc:  # noqa: BLE001
+        print(f"cluster-pool: {type(exc).__name__}: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None

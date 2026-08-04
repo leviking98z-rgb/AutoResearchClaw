@@ -12,7 +12,15 @@ logger = logging.getLogger(__name__)
 
 def _tokenize(text: str) -> set[str]:
     """Extract lowercase tokens from text."""
-    return set(re.findall(r"[a-z0-9_]+", text.lower()))
+    # Treat snake_case stage names as both the exact identifier and their
+    # component words. A-Evolve emits generic terms such as "experiment" and
+    # "quality"; without splitting underscores those skills never match real
+    # contexts such as ``experiment_design`` or ``quality_gate``.
+    tokens = set(re.findall(r"[a-z0-9_]+", text.lower()))
+    expanded = set(tokens)
+    for token in tokens:
+        expanded.update(part for part in token.split("_") if part)
+    return expanded
 
 
 def _resolve_stage(stage: int | str) -> int:

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="/data/workspace/autoresearch-stack/AutoResearchClaw"
+cd "$ROOT"
+source "$ROOT/.venv/bin/activate"
+export RESEARCHCLAW_ACP_MODEL="${RESEARCHCLAW_ACP_MODEL:-gpt-5.3-codex[reasoning=medium,fast=false]}"
+
+echo "AutoResearchClaw environment activated."
+echo "Repository: $ROOT"
+echo "Validate:   researchclaw validate --config config.arc.yaml --no-check-paths"
+echo "Doctor:     researchclaw doctor --config config.arc.yaml"
+echo "Run:        ./bin/run-research 'A concrete, falsifiable research question'"
+echo "GPU doctor: researchclaw doctor --config config.gpu.yaml"
+echo "GPU run:    ./bin/run-research-gpu 'A concrete, falsifiable GPU research question'"

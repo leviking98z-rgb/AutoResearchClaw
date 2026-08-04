@@ -21,6 +21,7 @@ from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._domain import _detect_domain
 from researchclaw.pipeline._helpers import (
     StageResult,
+    _bind_stage_role,
     _chat_with_prompt,
     _detect_runtime_issues,
     _ensure_sandbox_deps,
@@ -34,6 +35,11 @@ from researchclaw.pipeline._helpers import (
     _safe_json_loads,
     _utcnow_iso,
     _write_stage_meta,
+)
+from researchclaw.pipeline.result_validity import (
+    OVERALL_CONDITION,
+    assess_production_result,
+    assess_run_payload,
 )
 from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
@@ -50,6 +56,7 @@ def _execute_resource_planning(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.RESOURCE_PLANNING)
     exp_plan = _read_prior_artifact(run_dir, "exp_plan.yaml") or ""
     schedule: dict[str, Any] | None = None
     schedule_source = "template"
@@ -138,6 +145,7 @@ def _execute_experiment_run(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.EXPERIMENT_RUN)
     from researchclaw.experiment.factory import create_sandbox
     from researchclaw.experiment.runner import ExperimentRunner
 
@@ -266,9 +274,17 @@ def _execute_experiment_run(
             except Exception:  # noqa: BLE001
                 structured_results = None
 
-        if result.returncode == 0 and not result.timed_out:
+        result_validity = assess_production_result(
+            returncode=result.returncode,
+            timed_out=result.timed_out,
+            metrics=result.metrics,
+            stdout=result.stdout or "",
+            stderr=result.stderr or "",
+            structured_results=structured_results,
+        )
+        if result_validity.successful:
             run_status = "completed"
-        elif result.timed_out and result.metrics:
+        elif result.timed_out and result_validity.valid:
             run_status = "partial"
         else:
             run_status = "failed"
@@ -277,11 +293,28 @@ def _execute_experiment_run(
             "run_id": "run-1",
             "task_id": "collider-agent-main",
             "status": run_status,
-            "metrics": result.metrics,
+            "returncode": result.returncode,
+            "metrics": (
+                result_validity.valid_metrics
+                if result_validity.valid
+                else result.metrics
+            ),
             "elapsed_sec": result.elapsed_sec,
             "stdout": result.stdout[:4000] if result.stdout else "",
             "stderr": result.stderr[:2000] if result.stderr else "",
             "timed_out": result.timed_out,
+            "result_valid": result_validity.successful,
+            "partial_result_valid": (
+                result_validity.valid and not result_validity.successful
+            ),
+            "validity_reasons": result_validity.reasons,
+            "valid_conditions": sorted(
+                c
+                for c in result_validity.valid_conditions
+                if c != OVERALL_CONDITION
+            ),
+            "invalid_conditions": result_validity.invalid_conditions,
+            "successful_seed_count": result_validity.successful_seed_count,
             "completed_at": _utcnow_iso(),
         }
         if structured_results is not None:
@@ -292,6 +325,18 @@ def _execute_experiment_run(
             _json_io.dumps(run_payload, indent=2), encoding="utf-8"
         )
 
+        if not result_validity.successful:
+            reason = "; ".join(result_validity.reasons) or (
+                "agent execution did not produce a complete valid result"
+            )
+            return StageResult(
+                stage=Stage.EXPERIMENT_RUN,
+                status=StageStatus.FAILED,
+                artifacts=("runs/",),
+                evidence_refs=("stage-12/runs/",),
+                error=f"ColliderAgent result invalid: {reason}",
+            )
+
         return StageResult(
             stage=Stage.EXPERIMENT_RUN,
             status=StageStatus.DONE,
@@ -300,7 +345,7 @@ def _execute_experiment_run(
         )
     # ── End ColliderAgent mode ──────────────────────────────────────────
 
-    if mode in ("sandbox", "docker"):
+    if mode in ("sandbox", "docker", "clusterbridge", "clusterbridge_pool"):
         # P7: Auto-install missing dependencies before subprocess sandbox
         if mode == "sandbox":
             _all_code = code_text
@@ -344,30 +389,29 @@ def _execute_experiment_run(
         if not effective_metrics and result.stdout:
             effective_metrics = _parse_metrics_from_stdout(result.stdout)
 
-        # Determine run status: completed / partial (timed out with data) / failed
-        # R6-2: Detect stdout failure signals even when exit code is 0
-        _stdout_has_failure = bool(
-            result.stdout
-            and not effective_metrics
-            and any(
-                sig in result.stdout
-                for sig in ("FAIL:", "NaN/divergence", "Traceback (most recent")
-            )
+        result_validity = assess_production_result(
+            returncode=result.returncode,
+            timed_out=result.timed_out,
+            metrics=effective_metrics,
+            stdout=result.stdout or "",
+            stderr=result.stderr or "",
+            structured_results=structured_results,
         )
-        if result.returncode == 0 and not result.timed_out and not _stdout_has_failure:
+        if result_validity.successful:
             run_status = "completed"
-        elif result.timed_out and effective_metrics:
+        elif result.timed_out and result_validity.valid:
             run_status = "partial"
             logger.warning(
                 "Experiment timed out but captured %d partial metrics",
-                len(effective_metrics),
+                len(result_validity.valid_metrics),
             )
         else:
             run_status = "failed"
-            if _stdout_has_failure:
-                logger.warning(
-                    "Experiment exited cleanly but stdout contains failure signals"
-                )
+            logger.warning(
+                "Experiment result rejected as invalid: %s",
+                "; ".join(result_validity.reasons)
+                or "no valid condition completed",
+            )
 
         # P1: Warn if experiment completed suspiciously fast (trivially easy benchmark)
         if run_status == "completed" and result.elapsed_sec and result.elapsed_sec < 5.0:
@@ -381,18 +425,43 @@ def _execute_experiment_run(
             "run_id": "run-1",
             "task_id": "sandbox-main",
             "status": run_status,
-            "metrics": effective_metrics,
+            "returncode": result.returncode,
+            "metrics": (
+                result_validity.valid_metrics
+                if result_validity.valid
+                else effective_metrics
+            ),
             "elapsed_sec": result.elapsed_sec,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "timed_out": result.timed_out,
+            "result_valid": result_validity.successful,
+            "partial_result_valid": (
+                result_validity.valid and not result_validity.successful
+            ),
+            "validity_reasons": result_validity.reasons,
+            "valid_conditions": sorted(
+                c
+                for c in result_validity.valid_conditions
+                if c != OVERALL_CONDITION
+            ),
+            "invalid_conditions": result_validity.invalid_conditions,
+            "successful_seed_count": result_validity.successful_seed_count,
             "completed_at": _utcnow_iso(),
         }
         if structured_results is not None:
             run_payload["structured_results"] = structured_results
         # Auto-generate results.json from parsed metrics if sandbox didn't produce one
         if structured_results is None and effective_metrics:
-            auto_results = {"source": "stdout_parsed", "metrics": effective_metrics}
+            auto_results = {
+                "source": "stdout_parsed",
+                "metrics": effective_metrics,
+                "result_valid": result_validity.successful,
+                "partial_result_valid": (
+                    result_validity.valid and not result_validity.successful
+                ),
+                "validity_reasons": result_validity.reasons,
+            }
             (runs_dir / "results.json").write_text(
                 json.dumps(auto_results, indent=2), encoding="utf-8"
             )
@@ -478,93 +547,107 @@ def _execute_experiment_run(
         runner = ExperimentRunner(config.experiment, runs_dir / "workspace")
         history = runner.run_loop(code_text, run_id=f"exp-{run_dir.name}", llm=llm)
         runner.save_history(stage_dir / "experiment_history.json")
+        _runner_success_count = 0
         for item in history.results:
+            item_validity = assess_production_result(
+                returncode=0 if item.error is None else 1,
+                timed_out=bool(
+                    item.error
+                    and "timed out" in item.error.casefold()
+                ),
+                metrics=item.metrics,
+                stdout=item.stdout or "",
+                stderr=(item.stderr or item.error or ""),
+            )
+            if item_validity.successful:
+                _runner_success_count += 1
             payload = {
                 "run_id": f"run-{item.iteration}",
                 "task_id": item.run_id,
-                "status": "completed" if item.error is None else "failed",
-                "metrics": item.metrics,
+                "status": (
+                    "completed"
+                    if item_validity.successful
+                    else "failed"
+                ),
+                "returncode": 0 if item.error is None else 1,
+                "metrics": (
+                    item_validity.valid_metrics
+                    if item_validity.valid
+                    else item.metrics
+                ),
                 "primary_metric": item.primary_metric,
                 "improved": item.improved,
                 "kept": item.kept,
                 "elapsed_sec": item.elapsed_sec,
                 "error": item.error,
+                "stdout": item.stdout,
+                "stderr": item.stderr,
+                "timed_out": bool(
+                    item.error
+                    and "timed out" in item.error.casefold()
+                ),
+                "result_valid": item_validity.successful,
+                "validity_reasons": item_validity.reasons,
+                "valid_conditions": sorted(
+                    condition
+                    for condition in item_validity.valid_conditions
+                    if condition != OVERALL_CONDITION
+                ),
+                "invalid_conditions": item_validity.invalid_conditions,
+                "successful_seed_count": (
+                    item_validity.successful_seed_count
+                ),
                 "completed_at": _utcnow_iso(),
             }
             run_id = str(payload["run_id"])
             (runs_dir / f"{_safe_filename(run_id)}.json").write_text(
                 json.dumps(payload, indent=2), encoding="utf-8"
             )
-    # ---- Hard guard: block pipeline when experiment produced no real data ----
-    # Issue #165 / fabrication-guard: An experiment that completes in seconds
-    # with zero metrics (or only noise) must NOT proceed to paper writing.
-    # The old code always returned DONE, which let fabricated papers through.
-    _has_real_metrics = False
-    if mode in ("sandbox", "docker"):
-        # Check that we have at least one non-trivial float metric
-        _real_metric_count = sum(
-            1 for k, v in (effective_metrics or {}).items()
-            if isinstance(v, (int, float)) and not math.isnan(v) and not math.isinf(v)
+        if not _runner_success_count:
+            return StageResult(
+                stage=Stage.EXPERIMENT_RUN,
+                status=StageStatus.FAILED,
+                artifacts=("runs/", "experiment_history.json"),
+                evidence_refs=(
+                    "stage-12/runs/",
+                    "stage-12/experiment_history.json",
+                ),
+                error=(
+                    "ExperimentRunner produced no complete valid result; "
+                    "return codes alone are not accepted as success."
+                ),
+            )
+    # ---- Hard guard: block pipeline when experiment produced no valid data ----
+    if (
+        mode in ("sandbox", "docker", "clusterbridge", "clusterbridge_pool")
+        and not result_validity.successful
+        and not (result.timed_out and result_validity.valid)
+    ):
+        validity_reason = "; ".join(result_validity.reasons) or (
+            "no condition produced a valid result"
         )
-        _has_real_metrics = _real_metric_count > 0
-        if not _has_real_metrics and run_status == "failed":
-            logger.error(
-                "Stage 12: Experiment FAILED and produced zero real metrics. "
-                "Refusing to mark as DONE to prevent fabricated results downstream."
+        logger.error("Stage 12: Refusing invalid result: %s", validity_reason)
+        missing_metrics_hint = (
+            "zero real metrics; "
+            if any(
+                "no finite" in reason
+                for reason in result_validity.reasons
             )
-            return StageResult(
-                stage=Stage.EXPERIMENT_RUN,
-                status=StageStatus.FAILED,
-                artifacts=("runs/",),
-                evidence_refs=("stage-12/runs/",),
-                error=(
-                    f"Experiment failed with zero real metrics "
-                    f"(status={run_status}, elapsed={result.elapsed_sec:.1f}s). "
-                    f"Pipeline must not proceed to paper writing without experiment data."
-                ),
-            )
-        if not _has_real_metrics and _stdout_has_failure:
-            logger.error(
-                "Stage 12: Experiment crashed (failure signals in stdout) with zero "
-                "real metrics. Refusing to mark as DONE."
-            )
-            return StageResult(
-                stage=Stage.EXPERIMENT_RUN,
-                status=StageStatus.FAILED,
-                artifacts=("runs/",),
-                evidence_refs=("stage-12/runs/",),
-                error=(
-                    f"Experiment crashed with failure signals in stdout and zero "
-                    f"real metrics (elapsed={result.elapsed_sec:.1f}s). "
-                    f"Pipeline must not proceed without experiment data."
-                ),
-            )
-        # Anomaly detection: suspiciously fast completion with empty metrics
-        if (
-            run_status == "completed"
-            and not _has_real_metrics
-            and result.elapsed_sec is not None
-            and result.elapsed_sec < 30.0
-        ):
-            logger.error(
-                "Stage 12: Experiment 'completed' in %.1fs with zero real metrics "
-                "(time_budget=%ds). This is almost certainly a crash that was "
-                "misclassified. Refusing to mark as DONE.",
-                result.elapsed_sec,
-                config.experiment.time_budget_sec,
-            )
-            return StageResult(
-                stage=Stage.EXPERIMENT_RUN,
-                status=StageStatus.FAILED,
-                artifacts=("runs/",),
-                evidence_refs=("stage-12/runs/",),
-                error=(
-                    f"Experiment 'completed' in {result.elapsed_sec:.1f}s with zero "
-                    f"real metrics (budget was {config.experiment.time_budget_sec}s). "
-                    f"Likely a misclassified crash. Pipeline must not proceed "
-                    f"without experiment data."
-                ),
-            )
+            else ""
+        )
+        return StageResult(
+            stage=Stage.EXPERIMENT_RUN,
+            status=StageStatus.FAILED,
+            artifacts=("runs/",),
+            evidence_refs=("stage-12/runs/",),
+            error=(
+                "Experiment failed production validity checks "
+                f"(status={run_status}, elapsed={result.elapsed_sec:.1f}s): "
+                f"{missing_metrics_hint}{validity_reason}. "
+                "Pipeline must not proceed to paper "
+                "writing without genuine experiment data."
+            ),
+        )
     return StageResult(
         stage=Stage.EXPERIMENT_RUN,
         status=StageStatus.DONE,
@@ -582,6 +665,7 @@ def _execute_iterative_refine(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.ITERATIVE_REFINE)
     from researchclaw.experiment.factory import create_sandbox
 
     def _to_float(value: Any) -> float | None:
@@ -838,6 +922,8 @@ def _execute_iterative_refine(
             )
             if metric_val is None:
                 metric_val = _to_float(payload.get("primary_metric"))
+            if not assess_run_payload(payload).successful:
+                metric_val = None
             if _is_better(metric_val, baseline_metric):
                 baseline_metric = metric_val
 
@@ -1114,7 +1200,26 @@ def _execute_iterative_refine(
         )
 
         # --- Timeout-aware prompt injection ---
-        user_prompt = ip.user + _saturation_hint
+        _campaign_refine_guidance = _pm.for_stage(
+            "code_generation",
+            evolution_overlay=_get_evolution_overlay(
+                run_dir,
+                "iterative_refine",
+                config=config,
+                topic=config.research.topic,
+            ),
+            topic=config.research.topic,
+            metric=metric_key,
+            pkg_hint="",
+            exp_plan=_exp_plan_text,
+            metric_direction_hint="",
+        ).user
+        user_prompt = (
+            ip.user
+            + _saturation_hint
+            + "\n\n## Campaign and Evolution Guidance\n"
+            + _campaign_refine_guidance
+        )
         if prior_timed_out and baseline_metric is None:
             timeout_refine_attempts += 1
             timeout_hint = (
@@ -1244,7 +1349,12 @@ def _execute_iterative_refine(
             iter_record["validation_issues"] = issue_text
 
         metric_val = None  # R6-3: initialize before conditional block
-        if validation.ok and config.experiment.mode in ("sandbox", "docker"):
+        if validation.ok and config.experiment.mode in (
+            "sandbox",
+            "docker",
+            "clusterbridge",
+            "clusterbridge_pool",
+        ):
             # P7: Ensure deps for refined code (subprocess sandbox only)
             if config.experiment.mode == "sandbox":
                 _refine_code = "\n".join(candidate_files.values())
@@ -1258,16 +1368,46 @@ def _execute_iterative_refine(
                 version_dir,
                 timeout_sec=config.experiment.time_budget_sec,
             )
-            metric_val = _find_metric(rerun.metrics, metric_key)
+            rerun_metrics = dict(rerun.metrics or {})
+            if not rerun_metrics and rerun.stdout:
+                rerun_metrics = _parse_metrics_from_stdout(rerun.stdout)
+            rerun_validity = assess_production_result(
+                returncode=rerun.returncode,
+                timed_out=rerun.timed_out,
+                metrics=rerun_metrics,
+                stdout=rerun.stdout or "",
+                stderr=rerun.stderr or "",
+            )
+            metric_val = (
+                _find_metric(rerun_validity.valid_metrics, metric_key)
+                if rerun_validity.successful
+                else None
+            )
             # R19-1: Store stdout (capped) so PAIRED lines survive for Stage 14
             _stdout_cap = rerun.stdout[:50000] if rerun.stdout else ""
             iter_record["sandbox"] = {
                 "returncode": rerun.returncode,
-                "metrics": rerun.metrics,
+                "metrics": (
+                    rerun_validity.valid_metrics
+                    if rerun_validity.valid
+                    else rerun_metrics
+                ),
                 "elapsed_sec": rerun.elapsed_sec,
                 "timed_out": rerun.timed_out,
                 "stderr": rerun.stderr[:2000] if rerun.stderr else "",
                 "stdout": _stdout_cap,
+                "result_valid": rerun_validity.successful,
+                "partial_result_valid": (
+                    rerun_validity.valid and not rerun_validity.successful
+                ),
+                "validity_reasons": rerun_validity.reasons,
+                "valid_conditions": sorted(
+                    c
+                    for c in rerun_validity.valid_conditions
+                    if c != OVERALL_CONDITION
+                ),
+                "invalid_conditions": rerun_validity.invalid_conditions,
+                "successful_seed_count": rerun_validity.successful_seed_count,
             }
             iter_record["metric"] = metric_val
 
@@ -1304,19 +1444,14 @@ def _execute_iterative_refine(
                     iteration,
                     rerun.elapsed_sec,
                 )
-                # If still no metrics after timeout, use partial stdout metrics
-                if not rerun.metrics and rerun.stdout:
-                    from researchclaw.experiment.sandbox import parse_metrics as _parse_sb_metrics
-                    partial = _parse_sb_metrics(rerun.stdout)
-                    if partial:
-                        iter_record["sandbox"]["metrics"] = partial
-                        metric_val = _find_metric(partial, metric_key)
-                        iter_record["metric"] = metric_val
-                        logger.info(
-                            "Stage 13 iteration %d: recovered %d partial metrics from timeout stdout",
-                            iteration,
-                            len(partial),
-                        )
+                if rerun_validity.valid:
+                    logger.info(
+                        "Stage 13 iteration %d: retained %d valid partial "
+                        "metrics for diagnosis only; timed-out runs are not "
+                        "eligible for best-version selection",
+                        iteration,
+                        len(rerun_validity.valid_metrics),
+                    )
 
             # --- Detect runtime issues (NaN/Inf, stderr warnings) ---
             runtime_issues = _detect_runtime_issues(rerun)
@@ -1369,12 +1504,62 @@ def _execute_iterative_refine(
                         version_dir,
                         timeout_sec=config.experiment.time_budget_sec,
                     )
-                    metric_val = _find_metric(rerun2.metrics, metric_key)
+                    rerun2_metrics = dict(rerun2.metrics or {})
+                    if not rerun2_metrics and rerun2.stdout:
+                        rerun2_metrics = _parse_metrics_from_stdout(
+                            rerun2.stdout
+                        )
+                    rerun2_validity = assess_production_result(
+                        returncode=rerun2.returncode,
+                        timed_out=rerun2.timed_out,
+                        metrics=rerun2_metrics,
+                        stdout=rerun2.stdout or "",
+                        stderr=rerun2.stderr or "",
+                    )
+                    metric_val = (
+                        _find_metric(
+                            rerun2_validity.valid_metrics,
+                            metric_key,
+                        )
+                        if rerun2_validity.successful
+                        else None
+                    )
                     iter_record["sandbox_after_fix"] = {
                         "returncode": rerun2.returncode,
-                        "metrics": rerun2.metrics,
+                        "metrics": (
+                            rerun2_validity.valid_metrics
+                            if rerun2_validity.valid
+                            else rerun2_metrics
+                        ),
                         "elapsed_sec": rerun2.elapsed_sec,
                         "timed_out": rerun2.timed_out,
+                        "stdout": (
+                            rerun2.stdout[:50000]
+                            if rerun2.stdout
+                            else ""
+                        ),
+                        "stderr": (
+                            rerun2.stderr[:2000]
+                            if rerun2.stderr
+                            else ""
+                        ),
+                        "result_valid": rerun2_validity.successful,
+                        "partial_result_valid": (
+                            rerun2_validity.valid
+                            and not rerun2_validity.successful
+                        ),
+                        "validity_reasons": rerun2_validity.reasons,
+                        "valid_conditions": sorted(
+                            c
+                            for c in rerun2_validity.valid_conditions
+                            if c != OVERALL_CONDITION
+                        ),
+                        "invalid_conditions": (
+                            rerun2_validity.invalid_conditions
+                        ),
+                        "successful_seed_count": (
+                            rerun2_validity.successful_seed_count
+                        ),
                     }
                     iter_record["metric"] = metric_val
                     iter_record["runtime_repaired"] = True

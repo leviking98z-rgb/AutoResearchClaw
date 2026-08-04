@@ -19,6 +19,7 @@ from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._domain import _detect_domain
 from researchclaw.pipeline._helpers import (
     StageResult,
+    _bind_stage_role,
     _chat_with_prompt,
     _ensure_sandbox_deps,
     _extract_code_block,
@@ -62,6 +63,7 @@ def _execute_collider_plan_generation(
     directory.  Stage 12 reads this file and invokes Claude Code with the
     ColliderAgent skills to execute the full physics pipeline.
     """
+    llm = _bind_stage_role(llm, Stage.CODE_GENERATION)
     exp_plan = _read_prior_artifact(run_dir, "exp_plan.yaml") or ""
     hypothesis = _read_prior_artifact(run_dir, "hypotheses.json") or ""
     topic = config.research.topic
@@ -233,6 +235,7 @@ def _execute_code_generation(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.CODE_GENERATION)
     # ── ColliderAgent mode: generate a physics prompt instead of Python code ─
     if config.experiment.mode == "collider_agent":
         return _execute_collider_plan_generation(
@@ -251,7 +254,12 @@ def _execute_code_generation(
 
     # --- Hardware-aware package hint ---
     hw_profile = _load_hardware_profile(run_dir)
-    if config.experiment.mode in ("sandbox", "docker"):
+    if config.experiment.mode in (
+        "sandbox",
+        "docker",
+        "clusterbridge",
+        "clusterbridge_pool",
+    ):
         if config.experiment.mode == "docker":
             pkg_prefix = "docker mode"
             _net_policy = config.experiment.docker.network_policy
@@ -267,6 +275,16 @@ def _execute_code_generation(
                 pkg_extras = _base_pkgs + ", and additional pip-installable packages via requirements.txt"
             else:
                 pkg_extras = _base_pkgs + ", and additional pip-installable packages (auto-detected from imports)"
+        elif config.experiment.mode in ("clusterbridge", "clusterbridge_pool"):
+            pkg_prefix = (
+                "clusterbridge multi-node Ray GPU pool mode"
+                if config.experiment.mode == "clusterbridge_pool"
+                else "clusterbridge remote GPU mode"
+            )
+            pkg_extras = (
+                ", torchvision, torchaudio, matplotlib, scipy, pandas, tqdm, "
+                "transformers, datasets, accelerate, scikit-learn"
+            )
         else:
             pkg_prefix = "sandbox mode"
             pkg_extras = ""
@@ -314,11 +332,16 @@ def _execute_code_generation(
     # --- Dataset guidance + setup script + HP reporting (docker/sandbox modes) ---
     extra_guidance = ""
     _net_policy = getattr(getattr(config, "docker", None), "network_policy", "setup_only")
-    if config.experiment.mode in ("sandbox", "docker"):
+    if config.experiment.mode in (
+        "sandbox",
+        "docker",
+        "clusterbridge",
+        "clusterbridge_pool",
+    ):
         _net_policy = (
             config.experiment.docker.network_policy
             if config.experiment.mode == "docker"
-            else "none"  # sandbox mode has no network
+            else "none"  # sandbox/clusterbridge experiment phase has no network
         )
         if _net_policy == "none":
             # Network disabled: inject strict offline-only guidance
@@ -626,7 +649,12 @@ def _execute_code_generation(
 
         # Sandbox factory (only for sandbox/docker modes)
         _sandbox_factory = None
-        if config.experiment.mode in ("sandbox", "docker"):
+        if config.experiment.mode in (
+            "sandbox",
+            "docker",
+            "clusterbridge",
+            "clusterbridge_pool",
+        ):
             from researchclaw.experiment.factory import (
                 create_sandbox as _csb,
             )
@@ -680,11 +708,33 @@ def _execute_code_generation(
             domain_profile=_domain_profile,
             code_search_result=_code_search_result,
         )
+        _campaign_code_guidance = _pm.for_stage(
+            "code_generation",
+            evolution_overlay=_get_evolution_overlay(
+                run_dir,
+                "code_generation",
+                config=config,
+                topic=config.research.topic,
+            ),
+            topic=config.research.topic,
+            metric=metric,
+            pkg_hint=pkg_hint + "\n" + compute_budget + "\n" + extra_guidance,
+            exp_plan=exp_plan,
+            metric_direction_hint="",
+        ).user
         _agent_result = _agent.generate(
             topic=config.research.topic,
             exp_plan=exp_plan,
             metric=metric,
-            pkg_hint=pkg_hint + "\n" + compute_budget + "\n" + extra_guidance,
+            pkg_hint=(
+                pkg_hint
+                + "\n"
+                + compute_budget
+                + "\n"
+                + extra_guidance
+                + "\n\n## Campaign and Evolution Guidance\n"
+                + _campaign_code_guidance
+            ),
             max_tokens=_code_max_tokens,
         )
         files = _agent_result.files
@@ -1528,4 +1578,3 @@ Multi-file experiment project with {len(files)} file(s): {file_list}
         artifacts=tuple(artifacts),
         evidence_refs=tuple(f"stage-10/{a}" for a in artifacts),
     )
-

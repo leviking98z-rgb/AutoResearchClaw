@@ -19,8 +19,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +31,51 @@ if TYPE_CHECKING:
     from researchclaw.llm.client import LLMClient
 
 logger = logging.getLogger(__name__)
+
+
+def _check_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise InterruptedError("campaign control requested during A-Evolve")
+
+
+def _call_llm(
+    call: Callable[[], Any],
+    *,
+    cancel_event: threading.Event | None,
+) -> Any:
+    """Run one synchronous LLM request with bounded supervisor cancellation.
+
+    The transport call may still finish in its daemon worker after cancellation,
+    but no later A-Evolve phase or mutation write is allowed to run.
+    """
+
+    _check_cancelled(cancel_event)
+    if cancel_event is None:
+        return call()
+
+    result: dict[str, Any] = {}
+    finished = threading.Event()
+
+    def worker() -> None:
+        try:
+            result["value"] = call()
+        except BaseException as exc:  # noqa: BLE001
+            result["error"] = exc
+        finally:
+            finished.set()
+
+    thread = threading.Thread(
+        target=worker,
+        name="aevolve-interruptible-llm-call",
+        daemon=True,
+    )
+    thread.start()
+    while not finished.wait(0.2):
+        _check_cancelled(cancel_event)
+    _check_cancelled(cancel_event)
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 
 # ---------------------------------------------------------------------------
@@ -208,25 +255,46 @@ def observe(
     lessons: list[LessonEntry],
     results: list[object],
     llm: LLMClient,
+    quality_context: dict[str, Any] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> list[Observation]:
     """Step 2: Diagnose failures with structured LLM analysis."""
-    if not lessons and not any(
+    _check_cancelled(cancel_event)
+    quality_context = dict(quality_context or {})
+    has_quality_signal = bool(quality_context)
+    if not lessons and not has_quality_signal and not any(
         "failed" in str(getattr(r, "status", "")).lower() for r in results
     ):
         logger.info("A-Evolve observe: no failures to diagnose")
         return []
 
+    stage_summary = _format_stage_summary(results)
+    if quality_context:
+        stage_summary += (
+            "\n\n### Cycle Quality Evidence\n"
+            + json.dumps(
+                quality_context,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
     user = _OBSERVE_USER.format(
         lessons_text=_format_lessons_for_observe(lessons),
-        stage_summary=_format_stage_summary(results),
+        stage_summary=stage_summary,
     )
     try:
-        resp = llm.chat(
-            [{"role": "user", "content": user}],
-            system=_OBSERVE_SYSTEM,
-            json_mode=True,
-            max_tokens=2000,
+        resp = _call_llm(
+            lambda: llm.chat(
+                [{"role": "user", "content": user}],
+                system=_OBSERVE_SYSTEM,
+                json_mode=True,
+                max_tokens=2000,
+            ),
+            cancel_event=cancel_event,
         )
+    except InterruptedError:
+        raise
     except Exception:
         logger.warning("A-Evolve observe: LLM call failed", exc_info=True)
         return []
@@ -253,8 +321,10 @@ def evolve(
     observations: list[Observation],
     llm: LLMClient,
     skills_dir: Path,
+    cancel_event: threading.Event | None = None,
 ) -> list[Mutation]:
     """Step 3: Propose mutations based on observations."""
+    _check_cancelled(cancel_event)
     if not observations:
         return []
 
@@ -274,12 +344,17 @@ def evolve(
         existing_skills=", ".join(existing[:30]) if existing else "(none)",
     )
     try:
-        resp = llm.chat(
-            [{"role": "user", "content": user}],
-            system=_EVOLVE_SYSTEM,
-            json_mode=True,
-            max_tokens=3000,
+        resp = _call_llm(
+            lambda: llm.chat(
+                [{"role": "user", "content": user}],
+                system=_EVOLVE_SYSTEM,
+                json_mode=True,
+                max_tokens=3000,
+            ),
+            cancel_event=cancel_event,
         )
+    except InterruptedError:
+        raise
     except Exception:
         logger.warning("A-Evolve evolve: LLM call failed", exc_info=True)
         return []
@@ -303,8 +378,10 @@ def evolve(
 def gate(
     mutations: list[Mutation],
     llm: LLMClient,
+    cancel_event: threading.Event | None = None,
 ) -> list[Mutation]:
     """Step 4: Validate mutations before accepting."""
+    _check_cancelled(cancel_event)
     if not mutations:
         return []
 
@@ -323,17 +400,31 @@ def gate(
         indent=2,
     )
     try:
-        resp = llm.chat(
-            [{"role": "user", "content": f"Evaluate these mutations:\n{gate_input}"}],
-            system=_GATE_SYSTEM,
-            json_mode=True,
-            max_tokens=1000,
+        resp = _call_llm(
+            lambda: llm.chat(
+                [
+                    {
+                        "role": "user",
+                        "content": f"Evaluate these mutations:\n{gate_input}",
+                    }
+                ],
+                system=_GATE_SYSTEM,
+                json_mode=True,
+                max_tokens=1000,
+            ),
+            cancel_event=cancel_event,
         )
+    except InterruptedError:
+        raise
     except Exception:
-        logger.warning("A-Evolve gate: LLM call failed, accepting all", exc_info=True)
+        logger.warning("A-Evolve gate: LLM call failed, rejecting mutations", exc_info=True)
         for m in mutations:
-            m.gate_passed = True
-            m.gate_reason = "gate skipped (LLM unavailable)"
+            if m.mutation_type == "none":
+                m.gate_passed = True
+                m.gate_reason = "no-op mutation"
+            else:
+                m.gate_passed = False
+                m.gate_reason = "gate failed closed (LLM unavailable)"
         return mutations
 
     parsed = _parse_json_response(resp.content)
@@ -344,9 +435,13 @@ def gate(
             m.gate_passed = True
             m.gate_reason = "no-op mutation"
             continue
-        result = gate_results.get(m.name, {})
-        m.gate_passed = bool(result.get("passed", True))
-        m.gate_reason = result.get("reason", "")
+        result = gate_results.get(m.name)
+        if not isinstance(result, dict) or "passed" not in result:
+            m.gate_passed = False
+            m.gate_reason = "gate failed closed (missing or invalid result)"
+        else:
+            m.gate_passed = bool(result.get("passed", False))
+            m.gate_reason = str(result.get("reason", ""))
         if not m.gate_passed:
             logger.info(
                 "A-Evolve gate rejected '%s': %s", m.name, m.gate_reason
@@ -360,6 +455,7 @@ def reload(
     observations: list[Observation],
     skills_dir: Path,
     run_dir: Path,
+    cancel_event: threading.Event | None = None,
 ) -> list[str]:
     """Step 5: Apply accepted mutations and record results.
 
@@ -368,6 +464,7 @@ def reload(
     created: list[str] = []
 
     for m in mutations:
+        _check_cancelled(cancel_event)
         if not m.gate_passed or m.mutation_type == "none":
             continue
 
@@ -384,6 +481,11 @@ def reload(
                 f"metadata:\n"
                 f"  category: a-evolve\n"
                 f"  source_observation: {m.target_observation}\n"
+                f"  trigger-keywords: \"research,pipeline,quality,experiment,"
+                f"{m.target_observation.lower()}\"\n"
+                f"  applicable-stages: \"1,2,3,4,5,6,7,8,9,10,11,12,"
+                f"13,14,15,16,17,18,19,20,21,22,23\"\n"
+                f"  priority: \"2\"\n"
                 f"---\n\n{m.content}\n"
             )
             (skill_dir / "SKILL.md").write_text(skill_content, encoding="utf-8")
@@ -406,17 +508,18 @@ def reload(
                 "name": m.name,
                 "content": m.content,
                 "source_observation": m.target_observation,
-                "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
             }
             with kb_file.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             logger.info("A-Evolve: wrote knowledge entry '%s'", m.name)
 
     # Write the evolution log
+    _check_cancelled(cancel_event)
     log_file = run_dir / "evolution" / "aevolve_log.json"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_data = {
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
         "observations": [o.to_dict() for o in observations],
         "mutations": [m.to_dict() for m in mutations],
         "skills_created": created,
@@ -436,6 +539,8 @@ def run_aevolve_cycle(
     llm: LLMClient,
     skills_dir: Path,
     run_dir: Path,
+    quality_context: dict[str, Any] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> list[str]:
     """Execute a full A-Evolve cycle after a pipeline run.
 
@@ -453,23 +558,40 @@ def run_aevolve_cycle(
     logger.info("A-Evolve: starting cycle (%d lessons, %d stages)", len(lessons), len(results))
 
     # Step 2: Observe
-    observations = observe(lessons, results, llm)
+    observations = observe(
+        lessons,
+        results,
+        llm,
+        quality_context=quality_context,
+        cancel_event=cancel_event,
+    )
     if not observations:
         logger.info("A-Evolve: no observations — skipping evolve cycle")
         return []
     logger.info("A-Evolve: %d observations produced", len(observations))
 
     # Step 3: Evolve
-    mutations = evolve(observations, llm, skills_dir)
+    mutations = evolve(
+        observations,
+        llm,
+        skills_dir,
+        cancel_event=cancel_event,
+    )
     if not mutations:
         logger.info("A-Evolve: no mutations proposed")
         # Still write log with observations
-        reload([], observations, skills_dir, run_dir)
+        reload(
+            [],
+            observations,
+            skills_dir,
+            run_dir,
+            cancel_event=cancel_event,
+        )
         return []
     logger.info("A-Evolve: %d mutations proposed", len(mutations))
 
     # Step 4: Gate
-    mutations = gate(mutations, llm)
+    mutations = gate(mutations, llm, cancel_event=cancel_event)
     accepted = [m for m in mutations if m.gate_passed and m.mutation_type != "none"]
     logger.info(
         "A-Evolve: %d/%d mutations passed gate",
@@ -477,7 +599,13 @@ def run_aevolve_cycle(
     )
 
     # Step 5: Reload
-    created = reload(mutations, observations, skills_dir, run_dir)
+    created = reload(
+        mutations,
+        observations,
+        skills_dir,
+        run_dir,
+        cancel_event=cancel_event,
+    )
     if created:
         logger.info("A-Evolve: created %d skills: %s", len(created), created)
 

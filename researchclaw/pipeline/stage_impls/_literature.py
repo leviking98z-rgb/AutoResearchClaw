@@ -16,6 +16,7 @@ from researchclaw.config import RCConfig
 from researchclaw.llm.client import LLMClient
 from researchclaw.pipeline._helpers import (
     StageResult,
+    _bind_stage_role,
     _build_fallback_queries,
     _chat_with_prompt,
     _extract_topic_keywords,
@@ -93,6 +94,7 @@ def _execute_search_strategy(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.SEARCH_STRATEGY)
     problem_tree = _read_prior_artifact(run_dir, "problem_tree.md") or ""
     topic = config.research.topic
     plan: dict[str, Any] | None = None
@@ -364,6 +366,7 @@ def _execute_literature_collect(
     prompts: PromptManager | None = None,
 ) -> StageResult:
     """Stage 4: Collect literature — prefer real APIs, fallback to LLM."""
+    llm = _bind_stage_role(llm, Stage.LITERATURE_COLLECT)
     topic = config.research.topic
 
     # Read queries.json from Stage 3 (F1.5 output)
@@ -481,7 +484,6 @@ def _execute_literature_collect(
     if config.web_search.enabled:
         try:
             from researchclaw.web.agent import WebSearchAgent
-            import os
 
             tavily_key = config.web_search.tavily_api_key or os.environ.get(
                 config.web_search.tavily_api_key_env, ""
@@ -657,6 +659,7 @@ def _execute_literature_screen(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.LITERATURE_SCREEN)
     candidates_text = _read_prior_artifact(run_dir, "candidates.jsonl") or ""
 
     # --- P1-1: keyword relevance pre-filter ---
@@ -836,6 +839,7 @@ def _execute_knowledge_extract(
     llm: LLMClient | None = None,
     prompts: PromptManager | None = None,
 ) -> StageResult:
+    llm = _bind_stage_role(llm, Stage.KNOWLEDGE_EXTRACT)
     shortlist = _read_prior_artifact(run_dir, "shortlist.jsonl") or ""
 
     # IMP-21: Defensive gate — refuse to run on an empty/missing shortlist.
