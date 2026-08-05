@@ -201,6 +201,29 @@ def test_poll_once_collects_all_health_and_writes_atomic_snapshot(
     assert not list(tmp_path.glob(".monitor_snapshot.json.*.tmp"))
 
 
+def test_atomic_write_json_retries_transient_missing_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "monitor_heartbeat.json"
+    real_replace = monitor.os.replace
+    calls = 0
+
+    def flaky_replace(src, dst):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise FileNotFoundError(src)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(monitor.os, "replace", flaky_replace)
+    monitor.atomic_write_json(target, {"status": "ok"})
+
+    assert calls == 2
+    assert json.loads(target.read_text()) == {"status": "ok"}
+    assert not list(tmp_path.glob(".monitor_heartbeat.json.*.tmp"))
+
+
 def test_stale_heartbeat_and_dead_pid_trigger_restart(
     tmp_path: Path,
 ) -> None:

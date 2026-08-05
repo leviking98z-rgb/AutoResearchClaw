@@ -403,26 +403,46 @@ def atomic_write_json(path: str | Path, payload: Mapping[str, Any]) -> None:
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(
-        dir=target.parent,
-        prefix=f".{target.name}.",
-        suffix=".tmp",
-    )
-    temp_path = Path(temporary)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        temp_path.replace(target)
-    except BaseException:
+    last_error: FileNotFoundError | None = None
+    # CephFS/FUSE can briefly lose visibility of a just-created temp dentry.
+    # Retry with a fresh temp name instead of crashing the 24/7 monitor.
+    for attempt in range(3):
+        fd, temporary = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+        )
+        temp_path = Path(temporary)
         try:
-            os.close(fd)
-        except OSError:
-            pass
-        temp_path.unlink(missing_ok=True)
-        raise
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    payload,
+                    handle,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, target)
+            return
+        except FileNotFoundError as exc:
+            last_error = exc
+            temp_path.unlink(missing_ok=True)
+            if attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            raise
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            temp_path.unlink(missing_ok=True)
+            raise
+    if last_error is not None:
+        raise last_error
 
 
 def create_pause_request(
