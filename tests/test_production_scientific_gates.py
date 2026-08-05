@@ -803,6 +803,12 @@ def test_stage10_scientific_gate_accepts_real_model_and_benchmark_paths() -> Non
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+def expected_calibration_error(confidences, correctness):
+    return abs(float(confidences[0]) - float(correctness[0]))
+
+def should_accept(calibration_error, threshold=0.1):
+    return calibration_error <= threshold
+
 def main():
     gsm8k = load_dataset("openai/gsm8k", "main", split="test")
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
@@ -811,6 +817,9 @@ def main():
     )
     batch = tokenizer(gsm8k[0]["question"], return_tensors="pt")
     generated = model.generate(**batch, max_new_tokens=32)
+    ece = expected_calibration_error([0.5], [0.0])
+    if not should_accept(ece):
+        print("rollback: rejected self-improvement update")
     print("held_out_accuracy: 0.0")
 
 if __name__ == "__main__":
@@ -827,6 +836,43 @@ if __name__ == "__main__":
     assert report["aligned"] is True
     assert report["missing_model_execution"] is False
     assert report["missing_dataset_execution"] is False
+
+
+def test_stage10_scientific_gate_requires_calibration_driven_acceptance_gate() -> None:
+    selected = _selected_topic()
+    files = {
+        "main.py": """
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+def main():
+    gsm8k = load_dataset("openai/gsm8k", "main", split="test")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+    model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen2.5-7B-Instruct"
+    )
+    generated = model.generate(
+        **tokenizer(gsm8k[0]["question"], return_tensors="pt"),
+        max_new_tokens=32,
+    )
+    print(generated)
+
+if __name__ == "__main__":
+    main()
+""",
+    }
+
+    report = _assess_scientific_code_alignment(
+        files,
+        selected,
+        str(selected["title"]),
+    )
+
+    assert report["aligned"] is False
+    assert report["requires_acceptance_gate"] is True
+    assert report["acceptance_gate_markers"] == []
+    assert report["calibration_markers"] == []
+    assert any("accept/reject" in reason for reason in report["reasons"])
 
 
 def test_stage10_pilot_gate_rejects_full_scale_gpu_campaign() -> None:

@@ -360,6 +360,18 @@ def _assess_scientific_code_alignment(
     requires_named_benchmark = any(
         marker in contract_text for marker in _NAMED_BENCHMARK_MARKERS
     )
+    requires_acceptance_gate = bool(
+        requires_llm_subject
+        and any(
+            marker in contract_text
+            for marker in (
+                "acceptance gate",
+                "acceptance/stopping gate",
+                "calibration-aware gate",
+                "rollback gate",
+            )
+        )
+    )
 
     model_markers_found = sorted(
         marker for marker in declared_models if marker in lowered
@@ -384,6 +396,30 @@ def _assess_scientific_code_alignment(
     llm_benchmark_implementation_markers = sorted(
         marker
         for marker in _LLM_BENCHMARK_IMPLEMENTATION_MARKERS
+        if marker in lowered
+    )
+    acceptance_gate_markers = sorted(
+        marker
+        for marker in (
+            "acceptance_gate",
+            "should_accept",
+            "accept_update",
+            "reject_update",
+            "rollback",
+            "stopping_gate",
+        )
+        if marker in lowered
+    )
+    calibration_markers = sorted(
+        marker
+        for marker in (
+            "expected_calibration_error",
+            "calibration_error",
+            "calibration_gap",
+            "brier_score",
+            "reliability_diagram",
+            "ece",
+        )
         if marker in lowered
     )
     generic_model_subject_found = any(
@@ -476,6 +512,15 @@ def _assess_scientific_code_alignment(
             "generated code omits every declared LLM benchmark family "
             "(GSM8K/MATH/MBPP/HumanEval)"
         )
+    if (
+        authoritative
+        and requires_acceptance_gate
+        and (not acceptance_gate_markers or not calibration_markers)
+    ):
+        reasons.append(
+            "authoritative calibration-aware RSI topic has no executable "
+            "accept/reject or rollback gate driven by a calibration metric"
+        )
 
     return {
         "aligned": not reasons,
@@ -488,6 +533,7 @@ def _assess_scientific_code_alignment(
         "requires_real_dataset": requires_dataset,
         "requires_llm_subject": requires_llm_subject,
         "requires_named_benchmark": requires_named_benchmark,
+        "requires_acceptance_gate": requires_acceptance_gate,
         "declared_model_markers": declared_models,
         "declared_dataset_markers": declared_datasets,
         "model_markers_found": model_markers_found,
@@ -501,6 +547,8 @@ def _assess_scientific_code_alignment(
         "llm_benchmark_implementation_markers": (
             llm_benchmark_implementation_markers
         ),
+        "acceptance_gate_markers": acceptance_gate_markers,
+        "calibration_markers": calibration_markers,
         "generic_model_subject_found": generic_model_subject_found,
         "generic_dataset_subject_found": generic_dataset_subject_found,
         "missing_model_execution": missing_model_execution,
