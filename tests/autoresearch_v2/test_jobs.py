@@ -6,7 +6,10 @@ from types import SimpleNamespace
 
 from researchclaw.autoresearch_v2.gates import GateVerdict
 from researchclaw.autoresearch_v2.ideas import candidate_to_idea
-from researchclaw.autoresearch_v2.jobs import DesignJobExecutor
+from researchclaw.autoresearch_v2.jobs import (
+    BuildJobExecutor,
+    DesignJobExecutor,
+)
 from researchclaw.autoresearch_v2.models import (
     AttemptRecord,
     AttemptStatus,
@@ -86,7 +89,14 @@ def _plan():
         "datasets": [
             {
                 "name": "GSM8K",
-                "split_role": "heldout",
+                "split_role": "screening",
+                "split_id": "gsm8k-screening-v1",
+                "used_for_adaptation": False,
+            },
+            {
+                "name": "GSM8K-confirmatory",
+                "split_role": "heldout_confirmatory",
+                "split_id": "gsm8k-confirmatory-v1",
                 "used_for_adaptation": False,
             }
         ],
@@ -128,9 +138,19 @@ def _plan():
             {"condition": "above threshold", "decision": "promote"},
             {"condition": "below threshold", "decision": "reject"},
         ],
-        "confirmatory_followup": (
-            "At Scale use more examples, seeds, and a new untouched split."
-        ),
+        "confirmatory_followup": {
+            "required": True,
+            "changes": [
+                "increase examples",
+                "increase independent seeds",
+                "use untouched confirmatory data",
+            ],
+            "claim": "Only Scale may support the stronger claim.",
+            "examples": 100,
+            "independent_seeds": [11, 22, 33],
+            "split_id": "gsm8k-confirmatory-v1",
+            "untouched": True,
+        },
         "required_runtime_evidence": ["metrics"],
     }
 
@@ -193,4 +213,196 @@ def test_first_design_attempt_has_no_revision_directive() -> None:
     )
     assert "This is a REVISION attempt" not in prompt
     assert '"study_phase": "screening_pilot"' in prompt
+    assert '"confirmatory_followup": {' in prompt
+    assert '"split_id": "confirmatory-v1"' in prompt
+    assert '"split_role": "screening"' in prompt
     assert "must NOT claim" in prompt
+
+
+def test_build_smoke_can_defer_to_controller_managed_gpu_environment(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    current = store.current_dir(idea.idea_id)
+    current.mkdir(parents=True)
+    (current / "plan.json").write_text(
+        json.dumps(_plan()),
+        encoding="utf-8",
+    )
+    job = JobRecord(
+        job_id="build-job",
+        idea_id=idea.idea_id,
+        kind=JobKind.BUILD,
+    )
+    store.save_job(job)
+    attempt = AttemptRecord(
+        attempt_id="build-job-attempt-01",
+        idea_id=idea.idea_id,
+        job_id=job.job_id,
+        number=1,
+        status=AttemptStatus.RUNNING,
+    )
+    source = """
+import argparse
+import json
+import os
+from pathlib import Path
+
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--mode")
+parser.add_argument("--output")
+args = parser.parse_args()
+output = Path(os.environ["AUTORESEARCH_V2_OUTPUT_DIR"])
+output.mkdir(parents=True, exist_ok=True)
+dataset = load_dataset("gsm8k", split="test")
+model = AutoModelForCausalLM.from_pretrained("Qwen/test-model")
+Path("metrics.json").write_text(json.dumps({"result_valid": True}))
+Path("runtime_evidence.json").write_text(
+    json.dumps({"model_loaded": str(model), "datasets_loaded": [str(dataset)]})
+)
+if args.mode == "smoke":
+    print("smoke-ok")
+""".strip()
+    role = _Role(
+        {
+            "files": {"main.py": source},
+            "commands": {
+                "smoke": [
+                    "python",
+                    "main.py",
+                    "--mode",
+                    "smoke",
+                    "--output",
+                    "artifacts/smoke",
+                ],
+                "pilot": [
+                    "python",
+                    "main.py",
+                    "--mode",
+                    "pilot",
+                    "--output",
+                    "artifacts/pilot",
+                ],
+                "scale": [
+                    "python",
+                    "main.py",
+                    "--mode",
+                    "scale",
+                    "--output",
+                    "artifacts/scale",
+                ],
+            },
+            "dependencies": ["transformers", "datasets"],
+            "expected_outputs": [
+                "metrics.json",
+                "runtime_evidence.json",
+            ],
+        }
+    )
+
+    outcome = BuildJobExecutor(
+        role,
+        execute_smoke_locally=False,
+    ).execute(
+        idea=idea,
+        job=job,
+        attempt=attempt,
+        store=store,
+    )
+
+    assert outcome.success
+    smoke = outcome.result["validation"]["smoke"]
+    assert smoke == {
+        "ok": True,
+        "executed": False,
+        "environment": "gpu_pool",
+        "reason": "deferred_to_controller_managed_remote_smoke",
+    }
+
+
+def test_build_smoke_uses_configured_local_interpreter(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    current = store.current_dir(idea.idea_id)
+    current.mkdir(parents=True)
+    (current / "plan.json").write_text(
+        json.dumps(_plan()),
+        encoding="utf-8",
+    )
+    job = JobRecord(
+        job_id="build-local-smoke",
+        idea_id=idea.idea_id,
+        kind=JobKind.BUILD,
+    )
+    attempt = AttemptRecord(
+        attempt_id="build-local-smoke-attempt-01",
+        idea_id=idea.idea_id,
+        job_id=job.job_id,
+        number=1,
+        status=AttemptStatus.RUNNING,
+    )
+    source = """
+import argparse
+import os
+from pathlib import Path
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--mode")
+args = parser.parse_args()
+Path(os.environ["AUTORESEARCH_V2_OUTPUT_DIR"]).mkdir(
+    parents=True,
+    exist_ok=True,
+)
+output = Path(os.environ["AUTORESEARCH_V2_OUTPUT_DIR"])
+dataset = load_dataset("gsm8k", split="test")
+model = AutoModelForCausalLM.from_pretrained("Qwen/test-model")
+Path("metrics.json").write_text(
+    '{"result_valid": true}',
+)
+Path("runtime_evidence.json").write_text(
+    '{"model_loaded": true, "datasets_loaded": ["gsm8k"]}',
+)
+""".strip()
+    role = _Role(
+        {
+            "files": {"main.py": source},
+            "commands": {
+                "smoke": ["python", "main.py", "--mode", "smoke"],
+                "pilot": ["python", "main.py", "--mode", "pilot"],
+                "scale": ["python", "main.py", "--mode", "scale"],
+            },
+            "dependencies": ["transformers", "datasets"],
+            "expected_outputs": [
+                "metrics.json",
+                "runtime_evidence.json",
+            ],
+        }
+    )
+
+    outcome = BuildJobExecutor(
+        role,
+        python_executable="/definitely/missing/python",
+        execute_smoke_locally=True,
+    ).execute(
+        idea=idea,
+        job=job,
+        attempt=attempt,
+        store=store,
+    )
+
+    assert not outcome.success
+    smoke = outcome.result["validation"]["smoke"]
+    assert smoke["argv"][0] == "/definitely/missing/python"
+    assert smoke["returncode"] == -1

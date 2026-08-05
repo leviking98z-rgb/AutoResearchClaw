@@ -64,6 +64,24 @@ class RetentionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionConfig:
+    """Controller-owned policy for executing generated experiment projects."""
+
+    python_executable: str = "python"
+    attestation_key_file: str = ""
+    attestation_key_id: str = "autoresearch-v2-controller"
+    smoke_timeout_sec: float = 300.0
+    smoke_environment: str = "auto"
+    allowed_env_keys: tuple[str, ...] = (
+        "AUTORESEARCH_V2_ATTEMPT_ID",
+        "AUTORESEARCH_V2_GPU_COUNT",
+        "AUTORESEARCH_V2_IDEA_ID",
+        "AUTORESEARCH_V2_JOB_ID",
+        "AUTORESEARCH_V2_OUTPUT_DIR",
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class GPUConfig:
     enabled: bool = False
     pool_config: str = ""
@@ -111,6 +129,7 @@ class V2Config:
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
     budgets: BudgetConfig = field(default_factory=BudgetConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     gpu: GPUConfig = field(default_factory=GPUConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
     literature: LiteratureConfig = field(default_factory=LiteratureConfig)
@@ -201,6 +220,50 @@ class V2Config:
                 retention_raw.get("maintenance_interval_ticks", 300)
             ),
         )
+        execution_raw = _mapping(data.get("execution"), "execution")
+        env_keys_raw = execution_raw.get(
+            "allowed_env_keys",
+            ExecutionConfig().allowed_env_keys,
+        )
+        if isinstance(env_keys_raw, str):
+            allowed_env_keys = tuple(
+                value.strip()
+                for value in env_keys_raw.split(",")
+                if value.strip()
+            )
+        else:
+            allowed_env_keys = tuple(
+                str(value).strip()
+                for value in (env_keys_raw or ())
+                if str(value).strip()
+            )
+        execution = ExecutionConfig(
+            python_executable=str(
+                execution_raw.get("python_executable", "python")
+                or "python"
+            ),
+            attestation_key_file=str(
+                execution_raw.get("attestation_key_file", "") or ""
+            ),
+            attestation_key_id=str(
+                execution_raw.get(
+                    "attestation_key_id",
+                    "autoresearch-v2-controller",
+                )
+                or "autoresearch-v2-controller"
+            ),
+            smoke_timeout_sec=float(
+                execution_raw.get("smoke_timeout_sec", 300.0)
+            ),
+            smoke_environment=str(
+                execution_raw.get("smoke_environment", "auto") or "auto"
+            )
+            .strip()
+            .casefold(),
+            allowed_env_keys=(
+                allowed_env_keys or ExecutionConfig().allowed_env_keys
+            ),
+        )
         gpu_raw = _mapping(data.get("gpu"), "gpu")
         gpu = GPUConfig(
             enabled=bool(gpu_raw.get("enabled", False)),
@@ -288,6 +351,7 @@ class V2Config:
             concurrency=concurrency,
             budgets=budgets,
             retention=retention,
+            execution=execution,
             gpu=gpu,
             models=models,
             literature=literature,
@@ -362,6 +426,49 @@ class V2Config:
             self.retention.maintenance_interval_ticks,
         ) < 1:
             raise ValueError("retention limits must be positive")
+        if self.execution.smoke_timeout_sec <= 0:
+            raise ValueError("execution.smoke_timeout_sec must be positive")
+        if self.execution.smoke_environment not in {
+            "auto",
+            "local",
+            "gpu_pool",
+        }:
+            raise ValueError(
+                "execution.smoke_environment must be one of "
+                "auto, local, gpu_pool"
+            )
+        if not self.execution.python_executable.strip():
+            raise ValueError("execution.python_executable is required")
+        if not self.execution.attestation_key_id.strip():
+            raise ValueError("execution.attestation_key_id is required")
+        invalid_env_keys = [
+            key
+            for key in self.execution.allowed_env_keys
+            if not key
+            or not (key[0].isalpha() or key[0] == "_")
+            or any(
+                not (character.isalnum() or character == "_")
+                for character in key
+            )
+        ]
+        if invalid_env_keys:
+            raise ValueError(
+                "execution.allowed_env_keys contains invalid names: "
+                + ", ".join(invalid_env_keys)
+            )
+        state_root = self.root
+        key_file = self.execution.attestation_key_file.strip()
+        if key_file:
+            key_path = Path(key_file).expanduser().resolve()
+            if key_path == state_root or key_path.is_relative_to(state_root):
+                for ancestor in (key_path, *key_path.parents):
+                    if ancestor.name in {"candidate", "current"}:
+                        raise ValueError(
+                            "execution.attestation_key_file must be outside "
+                            "Idea candidate/current directories"
+                        )
+                    if ancestor == state_root:
+                        break
 
     @classmethod
     def from_file(cls, path: str | Path) -> V2Config:

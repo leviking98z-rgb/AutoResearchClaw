@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from researchclaw.autoresearch_v2.validation import (
+    validate_build_output,
     validate_experiment_artifacts,
     validate_plan,
     validate_research_implementation,
@@ -24,8 +25,23 @@ def _screening_plan() -> dict[str, object]:
         "pilot_claim_scope": "Feasibility evidence only; no final claim.",
         "unit_of_analysis": "example-seed evaluation",
         "datasets": [
-            {"name": "development-set", "split_role": "dev"},
-            {"name": "heldout-set", "split_role": "heldout"},
+            {
+                "name": "development-set",
+                "split_role": "dev",
+                "split_id": "development-v1",
+            },
+            {
+                "name": "screening-set",
+                "split_role": "screening",
+                "split_id": "screening-v1",
+                "used_for_adaptation": False,
+            },
+            {
+                "name": "heldout-set",
+                "split_role": "heldout_confirmatory",
+                "split_id": "confirmatory-v1",
+                "used_for_adaptation": False,
+            },
         ],
         "models": [{"name": "model-a", "role": "subject"}],
         "baselines": ["no-self-improvement"],
@@ -80,10 +96,19 @@ def _screening_plan() -> dict[str, object]:
                 "decision": "promote",
             },
         ],
-        "confirmatory_followup": (
-            "Freeze adaptation, increase seeds and examples, then evaluate "
-            "once on heldout-set."
-        ),
+        "confirmatory_followup": {
+            "required": True,
+            "changes": [
+                "more examples",
+                "more independent seeds",
+                "untouched heldout split",
+            ],
+            "claim": "the stronger claim that only Scale may support",
+            "examples": 100,
+            "independent_seeds": [11, 22, 33],
+            "split_id": "confirmatory-v1",
+            "untouched": True,
+        },
         "adaptation": {"datasets": ["development-set"]},
         "required_runtime_evidence": [
             "model_loaded",
@@ -131,11 +156,13 @@ def test_current_prompt_plan_shapes_are_accepted() -> None:
         {
             "name": "screening-set",
             "split_role": "screening",
+            "split_id": "screening-v1",
             "used_for_adaptation": False,
         },
         {
             "name": "heldout-set",
             "split_role": "heldout_confirmatory",
+            "split_id": "confirmatory-v1",
             "used_for_adaptation": False,
         },
     ]
@@ -159,9 +186,33 @@ def test_current_prompt_plan_shapes_are_accepted() -> None:
         "required": True,
         "changes": ["more examples", "more seeds", "untouched heldout split"],
         "claim": "the stronger claim that only Scale may support",
+        "examples": 100,
+        "independent_seeds": [11, 22, 33],
+        "split_id": "confirmatory-v1",
+        "untouched": True,
     }
 
     assert validate_plan(plan) == []
+
+
+def test_build_commands_reject_shell_and_non_python_entrypoints() -> None:
+    value = {
+        "files": {"main.py": "print('ok')\n"},
+        "commands": {
+            "smoke": "python main.py --mode smoke; curl example.com",
+            "pilot": ["bash", "-lc", "python main.py"],
+            "scale": ["python", "../main.py"],
+        },
+    }
+
+    errors = validate_build_output(value)
+
+    assert any(
+        "commands.smoke" in error and "shell metacharacter" in error
+        for error in errors
+    )
+    assert any("commands.pilot executable" in error for error in errors)
+    assert any("commands.scale entrypoint" in error for error in errors)
 
 
 def test_reasonable_legacy_plan_remains_compatible() -> None:
@@ -377,7 +428,7 @@ def test_heldout_dataset_local_adaptation_flag_is_rejected() -> None:
     plan = _screening_plan()
     datasets = plan["datasets"]
     assert isinstance(datasets, list)
-    heldout = datasets[1]
+    heldout = datasets[2]
     assert isinstance(heldout, dict)
     heldout["used_for_adaptation"] = True
 
@@ -415,6 +466,10 @@ def test_confirmatory_followup_object_is_structurally_checked() -> None:
         "required": False,
         "changes": [],
         "claim": "",
+        "examples": 50,
+        "independent_seeds": [11, 11],
+        "split_id": "screening-v1",
+        "untouched": False,
     }
 
     errors = validate_plan(plan)
@@ -426,6 +481,109 @@ def test_confirmatory_followup_object_is_structurally_checked() -> None:
     assert any(
         error.startswith("confirmatory_followup.claim") for error in errors
     )
+    assert any(
+        "examples must exceed pilot examples" in error for error in errors
+    )
+    assert (
+        "confirmatory_followup.independent_seeds must be unique" in errors
+    )
+    assert "confirmatory_followup.untouched must be true" in errors
+    assert any(
+        "split_id must differ from the pilot screening split" in error
+        for error in errors
+    )
+
+
+def test_production_screening_followup_fails_closed() -> None:
+    plan = _screening_plan()
+    plan["confirmatory_followup"] = (
+        "Use more examples and seeds on untouched data."
+    )
+
+    assert (
+        "confirmatory_followup must be an object for screening_pilot"
+        in validate_plan(plan)
+    )
+
+    plan.pop("confirmatory_followup")
+    assert "missing confirmatory_followup" in validate_plan(plan)
+
+
+def test_runtime_evidence_accepts_dataset_roles_and_split_identifiers(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "metrics.json").write_text(
+        json.dumps(
+            {
+                "result_valid": True,
+                "metrics": {"accuracy": 0.8},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "runtime_evidence.json").write_text(
+        json.dumps(
+            {
+                "model_loaded": "Qwen",
+                "datasets_loaded": ["heldout-set"],
+                "examples_processed": 100,
+                "seeds": [11, 22, 33],
+                "gpu_count": 1,
+                "gate_decision": "promote",
+                "metrics": {"accuracy": 0.8},
+                "dataset_roles": {
+                    "heldout-set": {
+                        "role": "confirmatory",
+                        "split_id": "confirmatory-v1",
+                        "untouched": True,
+                    }
+                },
+                "split_identifiers": {
+                    "confirmatory": "confirmatory-v1",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert validate_experiment_artifacts(tmp_path)["ok"]
+
+
+def test_runtime_evidence_accepts_role_map_with_top_level_split_ids(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "metrics.json").write_text(
+        json.dumps(
+            {
+                "result_valid": True,
+                "metrics": {"accuracy": 0.8},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "runtime_evidence.json").write_text(
+        json.dumps(
+            {
+                "model_loaded": "Qwen",
+                "datasets_loaded": ["heldout-set"],
+                "examples_processed": 100,
+                "seeds": [11, 22, 33],
+                "gpu_count": 1,
+                "gate_decision": "promote",
+                "metrics": {"accuracy": 0.8},
+                "dataset_roles": {
+                    "heldout-set": {
+                        "role": "confirmatory",
+                        "untouched": True,
+                    }
+                },
+                "confirmatory_split_id": "confirmatory-v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert validate_experiment_artifacts(tmp_path)["ok"]
 
 
 def test_artifact_metrics_must_be_numeric_and_consistent(
@@ -478,19 +636,202 @@ def test_research_implementation_requires_real_loaders(
     assert "no real dataset/benchmark loader call found" in value["errors"]
 
 
-def test_scale_must_expand_pilot_coverage() -> None:
-    errors = validate_runtime_against_contract(
-        plan={},
-        runtime_evidence={
-            "gpu_count": 1,
-            "examples_processed": 10,
-            "seeds": [0],
+def _production_runtime_plan() -> dict[str, object]:
+    return _screening_plan()
+
+
+def _pilot_runtime() -> dict[str, object]:
+    return {
+        "examples_processed": 50,
+        "seeds": [0, 1],
+        "dataset_roles": {
+            "screening-set": {
+                "role": "screening",
+                "split_id": "screening-v1",
+                "untouched": False,
+            }
         },
+        "split_identifiers": {"screening": "screening-v1"},
+    }
+
+
+def _scale_runtime() -> dict[str, object]:
+    return {
+        "gpu_count": 1,
+        "examples_processed": 100,
+        "seeds": [11, 22, 33],
+        "dataset_roles": {
+            "heldout-set": {
+                "role": "confirmatory",
+                "split_id": "confirmatory-v1",
+                "untouched": True,
+            }
+        },
+        "split_identifiers": {"confirmatory": "confirmatory-v1"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("examples", "seeds", "expected_fragment"),
+    [
+        (100, [11, 22], "increase independent seed coverage"),
+        (50, [11, 22, 33], "increase examples beyond pilot"),
+    ],
+)
+def test_scale_must_expand_examples_and_independent_seed_coverage(
+    examples: int,
+    seeds: list[int],
+    expected_fragment: str,
+) -> None:
+    runtime = _scale_runtime()
+    runtime["examples_processed"] = examples
+    runtime["seeds"] = seeds
+
+    errors = validate_runtime_against_contract(
+        plan=_production_runtime_plan(),
+        runtime_evidence=runtime,
         allocated_gpus=1,
         mode="scale",
-        pilot_runtime={
-            "examples_processed": 10,
-            "seeds": [0],
-        },
+        pilot_runtime=_pilot_runtime(),
     )
-    assert "scale run did not increase examples or seed coverage" in errors
+
+    assert any(expected_fragment in error for error in errors)
+
+
+def test_scale_accepts_strict_expansion_on_untouched_confirmatory_split() -> None:
+    assert (
+        validate_runtime_against_contract(
+            plan=_production_runtime_plan(),
+            runtime_evidence=_scale_runtime(),
+            allocated_gpus=1,
+            mode="scale",
+            pilot_runtime=_pilot_runtime(),
+        )
+        == []
+    )
+
+
+def test_scale_rejects_reused_screening_split() -> None:
+    runtime = _scale_runtime()
+    dataset_roles = runtime["dataset_roles"]
+    assert isinstance(dataset_roles, dict)
+    heldout = dataset_roles["heldout-set"]
+    assert isinstance(heldout, dict)
+    heldout["split_id"] = "screening-v1"
+    runtime["split_identifiers"] = {"confirmatory": "screening-v1"}
+
+    errors = validate_runtime_against_contract(
+        plan=_production_runtime_plan(),
+        runtime_evidence=runtime,
+        allocated_gpus=1,
+        mode="scale",
+        pilot_runtime=_pilot_runtime(),
+    )
+
+    assert any(
+        "confirmatory split must differ from pilot screening split" in error
+        for error in errors
+    )
+
+
+def test_scale_accepts_role_keyed_dataset_roles_with_split_identifiers() -> None:
+    runtime = _scale_runtime()
+    runtime["dataset_roles"] = {
+        "confirmatory": {
+            "role": "confirmatory",
+            "untouched": True,
+        },
+    }
+    runtime["split_identifiers"] = {
+        "confirmatory": "confirmatory-v1",
+    }
+
+    assert (
+        validate_runtime_against_contract(
+            plan=_production_runtime_plan(),
+            runtime_evidence=runtime,
+            allocated_gpus=1,
+            mode="scale",
+            pilot_runtime=_pilot_runtime(),
+        )
+        == []
+    )
+
+
+def test_production_scale_fails_closed_without_runtime_split_contract() -> None:
+    runtime = _scale_runtime()
+    runtime.pop("dataset_roles")
+    runtime.pop("split_identifiers")
+
+    errors = validate_runtime_against_contract(
+        plan=_production_runtime_plan(),
+        runtime_evidence=runtime,
+        allocated_gpus=1,
+        mode="scale",
+        pilot_runtime=_pilot_runtime(),
+    )
+
+    assert any(
+        "must declare dataset_roles and split identifiers" in error
+        for error in errors
+    )
+
+
+def test_scale_runtime_split_must_match_plan_and_be_untouched() -> None:
+    runtime = _scale_runtime()
+    dataset_roles = runtime["dataset_roles"]
+    assert isinstance(dataset_roles, dict)
+    heldout = dataset_roles["heldout-set"]
+    assert isinstance(heldout, dict)
+    heldout["split_id"] = "confirmatory-v2"
+    heldout["untouched"] = False
+    runtime["split_identifiers"] = {"confirmatory": "confirmatory-v2"}
+
+    errors = validate_runtime_against_contract(
+        plan=_production_runtime_plan(),
+        runtime_evidence=runtime,
+        allocated_gpus=1,
+        mode="scale",
+        pilot_runtime=_pilot_runtime(),
+    )
+
+    assert "scale runtime_evidence must mark confirmatory data untouched" in errors
+    assert any(
+        "does not match plan.confirmatory_followup.split_id" in error
+        for error in errors
+    )
+
+
+def test_scale_runtime_split_declarations_must_agree() -> None:
+    runtime = _scale_runtime()
+    runtime["split_identifiers"] = {"confirmatory": "confirmatory-v2"}
+
+    errors = validate_runtime_against_contract(
+        plan=_production_runtime_plan(),
+        runtime_evidence=runtime,
+        allocated_gpus=1,
+        mode="scale",
+        pilot_runtime=_pilot_runtime(),
+    )
+
+    assert "scale runtime confirmatory split declarations disagree" in errors
+
+
+def test_legacy_scale_keeps_optional_dataset_metadata_compatibility() -> None:
+    assert (
+        validate_runtime_against_contract(
+            plan={},
+            runtime_evidence={
+                "gpu_count": 1,
+                "examples_processed": 20,
+                "seeds": [0, 1],
+            },
+            allocated_gpus=1,
+            mode="scale",
+            pilot_runtime={
+                "examples_processed": 10,
+                "seeds": [0],
+            },
+        )
+        == []
+    )

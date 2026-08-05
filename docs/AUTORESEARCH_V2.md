@@ -59,6 +59,8 @@ paper never stops the system.
         └── attempt-NN/
             ├── attempt.json
             ├── candidate/       # immutable candidate snapshot
+            ├── execution_contract.json
+            ├── execution_attestation.json
             ├── stdout.log
             └── stderr.log
 ```
@@ -82,8 +84,11 @@ Decision tier retains final admission and consequential gate authority.
 
 ## GPU policy
 
-One `GPUBroker` adopts an already claimed and prepared pool. It never claims,
-prepares, or releases physical nodes. Jobs request malleable ranges:
+One or more `GPUBroker` instances may adopt an already claimed and prepared
+pool. They never claim, prepare, or release physical nodes. A shared SQLite
+lease registry performs atomic cross-Controller reservations, so two
+Controllers cannot overbook the same physical GPU pool. Jobs request malleable
+ranges:
 
 ```text
 min_gpus <= allocated_gpus <= preferred_gpus <= max_gpus
@@ -97,6 +102,7 @@ The scheduler applies:
 - deterministic pool task IDs for idempotent submission;
 - concurrent Pilot/Scale tasks from independent Ideas.
 - bounded tolerance for transient pool probe failures.
+- crash-safe global leases with heartbeat, task-probe recovery, and adoption.
 
 Every physical GPU task must write both:
 
@@ -108,9 +114,27 @@ runtime_evidence.json
 into the absolute shared attempt output directory. A zero return code without
 those artifacts is an invalid experiment and can never promote `current/`.
 The runtime evidence must agree with the actual GPU allocation and the
-preregistered pilot envelope; Scale must increase example or seed coverage.
-Build admission also requires an executable model loader, benchmark loader,
-artifact writes, and source hashes.
+preregistered pilot envelope. Scale must increase **both** examples and
+independent seed coverage and must use a distinct, untouched, preregistered
+confirmatory split. Build admission also requires an executable model loader,
+benchmark loader, artifact writes, source hashes, and a successful direct-argv
+smoke execution.
+
+When GPU execution is enabled, the dependency-bearing smoke run is a separate
+one-GPU job in the same ClusterBridge/Ray environment as Pilot. It is recorded
+as a durable Build sub-attempt, and Pilot is not scheduled until its signed
+attestation succeeds. `execution.smoke_environment` may be `auto`
+(recommended), `gpu_pool`, or `local`; `auto` selects the GPU pool when GPU
+execution is enabled and local execution otherwise.
+
+Generated shell programs are not accepted. Build commands are normalized into
+direct Python `argv` and checked against an allowlist. Before Pilot/Scale, the
+Controller writes `execution_contract.json` containing the exact argv, bound
+plan/build hashes, paths, resource limits, and allowed environment keys. After
+execution it writes a controller-side HMAC-signed
+`execution_attestation.json` over the contract, return code, allocated GPUs,
+stdout/stderr hashes, and the complete artifact manifest. Generated code cannot
+self-sign this evidence because the key never enters its environment.
 
 `max_gpu_jobs`, GPU-hour budgets, wall-clock/no-progress limits,
 allocated-GPU-time accounting, pool utilization, and per-Idea fair share are
@@ -199,6 +223,11 @@ a terminal state.
 - missing small runtime packages such as `arxiv` are installed by
   `bin/researchclaw-ensure-deps`;
 - production GPU-required jobs fail closed when GPU execution is disabled.
+- `execution.python_executable` must exist on the GPU nodes;
+- `execution.smoke_environment: auto` prevents Controller-host dependency
+  gaps from being misclassified as scientific Build failures;
+- `execution.attestation_key_file` should reside outside Idea candidates and
+  be readable only by the Controller.
 
 ## Current verification
 
@@ -221,7 +250,11 @@ The v2 suite covers:
 - focused InfoHub refresh and grounded novelty admission;
 - preregistration workload/estimand/decision-table checks;
 - real model and benchmark implementation checks;
+- direct Build smoke execution with shell-command rejection;
+- controller-issued execution contracts and signed artifact attestations;
+- cross-Controller global GPU lease accounting;
 - allocation/runtime and Pilot/Scale contract checks;
+- strict Scale expansion and untouched confirmatory-split checks;
 - accepted-attempt and interrupted-attempt restart reconciliation;
 - transient GPU probe fault tolerance;
 - bounded `max_ticks` behavior;

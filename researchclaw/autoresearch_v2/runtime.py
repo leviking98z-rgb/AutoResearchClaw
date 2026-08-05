@@ -75,7 +75,16 @@ def build_production_controller(
                 "JSON project snapshots, never patches."
             ),
             validator=validate_build_output,
-        )
+        ),
+        smoke_timeout_sec=config.execution.smoke_timeout_sec,
+        python_executable=config.execution.python_executable,
+        execute_smoke_locally=(
+            config.execution.smoke_environment == "local"
+            or (
+                config.execution.smoke_environment == "auto"
+                and not config.gpu.enabled
+            )
+        ),
     )
     report = ReportJobExecutor(
         StructuredRole(

@@ -8,6 +8,7 @@ import json
 import math
 import py_compile
 import re
+import shlex
 from collections.abc import Mapping
 from itertools import pairwise
 from pathlib import Path
@@ -180,6 +181,21 @@ _SCREENING_FIELDS = frozenset(
         "confirmatory_followup",
     }
 )
+_SCREENING_DATASET_ROLES = frozenset(
+    {
+        "screening",
+        "screening_pilot",
+        "screening_evaluation",
+    }
+)
+_CONFIRMATORY_DATASET_ROLES = frozenset(
+    {
+        "confirmatory",
+        "heldout",
+        "heldout_confirmatory",
+        "confirmatory_heldout",
+    }
+)
 _OUTCOME_REGIONS = frozenset(
     {
         "invalid",
@@ -344,8 +360,6 @@ def _validate_screening_plan(
             errors.append(f"missing {field}")
         elif not isinstance(value[field], str) or not value[field].strip():
             errors.append(f"invalid {field}: must be a non-empty string")
-    _validate_confirmatory_followup(value.get("confirmatory_followup"), errors)
-
     arms = value.get("arms")
     arm_count: int | None = None
     if not isinstance(arms, list):
@@ -432,11 +446,26 @@ def _validate_screening_plan(
     )
     _validate_effect_threshold(value, accounting_numbers, errors)
     _validate_dataset_isolation(value, errors)
+    _validate_confirmatory_followup(
+        value.get("confirmatory_followup"),
+        errors,
+        pilot_numbers=pilot_numbers,
+        workload_numbers=workload_numbers,
+        screening_split_ids=_plan_split_ids(value, role="screening"),
+        confirmatory_split_ids=_plan_split_ids(value, role="confirmatory"),
+        production=True,
+    )
 
 
 def _validate_confirmatory_followup(
     followup: Any,
     errors: list[str],
+    *,
+    pilot_numbers: Mapping[str, int],
+    workload_numbers: Mapping[str, int],
+    screening_split_ids: set[str],
+    confirmatory_split_ids: set[str],
+    production: bool,
 ) -> None:
     if followup is None:
         errors.append("missing confirmatory_followup")
@@ -446,10 +475,15 @@ def _validate_confirmatory_followup(
             errors.append(
                 "invalid confirmatory_followup: must be non-empty"
             )
+        elif production:
+            errors.append(
+                "confirmatory_followup must be an object for "
+                "screening_pilot"
+            )
         return
     if not isinstance(followup, Mapping):
         errors.append(
-            "invalid confirmatory_followup: must be a string or object"
+            "invalid confirmatory_followup: must be an object"
         )
         return
     if followup.get("required") is not True:
@@ -473,6 +507,169 @@ def _validate_confirmatory_followup(
         errors.append(
             "confirmatory_followup.claim must be a non-empty string"
         )
+
+    pilot_examples = pilot_numbers.get(
+        "max_examples",
+        workload_numbers.get("examples"),
+    )
+    pilot_seed_count = pilot_numbers.get(
+        "max_seeds",
+        workload_numbers.get("seeds"),
+    )
+    confirmatory_examples = _positive_integer_alias(
+        followup,
+        ("examples", "max_examples", "examples_per_arm"),
+        "confirmatory_followup.examples",
+        errors,
+    )
+    confirmatory_seed_count = _confirmatory_seed_count(followup, errors)
+    confirmatory_split_id = _split_identifier(followup)
+    if confirmatory_split_id is None:
+        errors.append(
+            "confirmatory_followup.split_id must identify an untouched "
+            "confirmatory split"
+        )
+    untouched = followup.get(
+        "untouched",
+        followup.get("split_untouched"),
+    )
+    if untouched is not True:
+        errors.append("confirmatory_followup.untouched must be true")
+
+    if (
+        pilot_examples is not None
+        and confirmatory_examples is not None
+        and confirmatory_examples <= pilot_examples
+    ):
+        errors.append(
+            "confirmatory_followup.examples must exceed pilot examples "
+            f"({confirmatory_examples} <= {pilot_examples})"
+        )
+    if (
+        pilot_seed_count is not None
+        and confirmatory_seed_count is not None
+        and confirmatory_seed_count <= pilot_seed_count
+    ):
+        errors.append(
+            "confirmatory_followup independent seed count must exceed pilot "
+            f"seeds ({confirmatory_seed_count} <= {pilot_seed_count})"
+        )
+    if (
+        confirmatory_split_id is not None
+        and confirmatory_split_id in screening_split_ids
+    ):
+        errors.append(
+            "confirmatory_followup.split_id must differ from the pilot "
+            "screening split"
+        )
+    if (
+        confirmatory_split_id is not None
+        and confirmatory_split_ids
+        and confirmatory_split_id not in confirmatory_split_ids
+    ):
+        errors.append(
+            "confirmatory_followup.split_id must match a confirmatory "
+            "dataset split"
+        )
+def _positive_integer_alias(
+    value: Mapping[str, Any],
+    aliases: tuple[str, ...],
+    path: str,
+    errors: list[str],
+) -> int | None:
+    found = [(field, value[field]) for field in aliases if field in value]
+    if not found:
+        errors.append(f"invalid {path}: missing positive integer")
+        return None
+    parsed: list[tuple[str, int]] = []
+    for field, raw in found:
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            errors.append(
+                f"invalid confirmatory_followup.{field}: "
+                "must be a positive integer"
+            )
+            continue
+        parsed.append((field, raw))
+    if len({number for _, number in parsed}) > 1:
+        errors.append(
+            f"{path} aliases disagree: "
+            + ", ".join(f"{field}={number}" for field, number in parsed)
+        )
+        return None
+    return parsed[0][1] if parsed else None
+
+
+def _confirmatory_seed_count(
+    followup: Mapping[str, Any],
+    errors: list[str],
+) -> int | None:
+    seed_values = followup.get(
+        "independent_seeds",
+        followup.get("seeds"),
+    )
+    declared_count = _optional_positive_integer_alias(
+        followup,
+        ("independent_seed_count", "seed_count", "max_seeds"),
+        "confirmatory_followup.independent_seed_count",
+        errors,
+    )
+    list_count: int | None = None
+    if isinstance(seed_values, list):
+        if not seed_values:
+            errors.append(
+                "confirmatory_followup.independent_seeds must be a "
+                "non-empty list"
+            )
+        elif any(isinstance(seed, (list, dict, set)) for seed in seed_values):
+            errors.append(
+                "confirmatory_followup.independent_seeds must contain "
+                "scalar identifiers"
+            )
+        elif len({_identity(seed) for seed in seed_values}) != len(seed_values):
+            errors.append(
+                "confirmatory_followup.independent_seeds must be unique"
+            )
+        else:
+            list_count = len(seed_values)
+    elif seed_values is not None:
+        if (
+            isinstance(seed_values, bool)
+            or not isinstance(seed_values, int)
+            or seed_values <= 0
+        ):
+            errors.append(
+                "confirmatory_followup.independent_seeds must be a "
+                "positive integer or non-empty list"
+            )
+        else:
+            list_count = seed_values
+    elif declared_count is None:
+        errors.append(
+            "confirmatory_followup.independent_seeds must declare a "
+            "positive count or non-empty list"
+        )
+
+    if (
+        declared_count is not None
+        and list_count is not None
+        and declared_count != list_count
+    ):
+        errors.append(
+            "confirmatory_followup independent seed declarations disagree"
+        )
+        return None
+    return declared_count if declared_count is not None else list_count
+
+
+def _optional_positive_integer_alias(
+    value: Mapping[str, Any],
+    aliases: tuple[str, ...],
+    path: str,
+    errors: list[str],
+) -> int | None:
+    if not any(field in value for field in aliases):
+        return None
+    return _positive_integer_alias(value, aliases, path, errors)
 
 
 def _validate_workload_arithmetic(
@@ -682,6 +879,248 @@ def _validate_dataset_isolation(
                 "heldout data must not participate in adaptation: "
                 f"{path} is true"
             )
+
+
+def _plan_split_ids(
+    plan: Mapping[str, Any],
+    *,
+    role: str,
+) -> set[str]:
+    datasets = plan.get("datasets")
+    if not isinstance(datasets, list):
+        return set()
+    split_ids: set[str] = set()
+    for dataset in datasets:
+        if not isinstance(dataset, Mapping):
+            continue
+        split_role = _dataset_role(dataset.get("split_role"))
+        if split_role != role:
+            continue
+        split_id = _split_identifier(dataset)
+        if split_id is not None:
+            split_ids.add(split_id)
+    return split_ids
+
+
+def _dataset_role(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = _slug(value)
+    if normalized in _SCREENING_DATASET_ROLES:
+        return "screening"
+    if normalized in _CONFIRMATORY_DATASET_ROLES:
+        return "confirmatory"
+    if normalized in {"dev", "development"}:
+        return "development"
+    return None
+
+
+def _split_identifier(value: Mapping[str, Any]) -> str | None:
+    for field in (
+        "split_id",
+        "split_identifier",
+        "dataset_split_id",
+        "split",
+    ):
+        if field not in value:
+            continue
+        raw = value[field]
+        if isinstance(raw, str) and raw.strip():
+            return _compact(raw)
+        if (
+            isinstance(raw, (int, float))
+            and not isinstance(raw, bool)
+            and math.isfinite(float(raw))
+        ):
+            return _compact(str(raw))
+    return None
+
+
+def _runtime_dataset_roles(
+    runtime: Mapping[str, Any],
+) -> dict[str, tuple[str | None, str | None, bool | None]]:
+    raw_roles = runtime.get("dataset_roles")
+    if isinstance(raw_roles, Mapping):
+        entries = []
+        for dataset, declaration in raw_roles.items():
+            if _dataset_role(dataset) is not None and (
+                isinstance(declaration, str)
+                or (
+                    isinstance(declaration, (int, float))
+                    and not isinstance(declaration, bool)
+                )
+            ):
+                entries.append(
+                    (
+                        str(dataset),
+                        {
+                            "role": str(dataset),
+                            "split_id": declaration,
+                        },
+                    )
+                )
+            else:
+                entries.append((str(dataset), declaration))
+    elif isinstance(raw_roles, list):
+        entries = []
+        for index, declaration in enumerate(raw_roles):
+            if not isinstance(declaration, Mapping):
+                entries.append((f"#{index}", declaration))
+                continue
+            name = declaration.get(
+                "dataset",
+                declaration.get("name", f"#{index}"),
+            )
+            entries.append((str(name), declaration))
+    else:
+        return {}
+
+    roles: dict[str, tuple[str | None, str | None, bool | None]] = {}
+    for dataset, declaration in entries:
+        role: str | None
+        split_id: str | None
+        untouched: bool | None = None
+        if isinstance(declaration, str):
+            role = _dataset_role(declaration)
+            split_id = None
+        elif isinstance(declaration, Mapping):
+            role = _dataset_role(
+                declaration.get("role", declaration.get("split_role"))
+            )
+            split_id = _split_identifier(declaration)
+            raw_untouched = declaration.get(
+                "untouched",
+                declaration.get("split_untouched"),
+            )
+            if isinstance(raw_untouched, bool):
+                untouched = raw_untouched
+        elif (
+            _dataset_role(dataset) is not None
+            and isinstance(declaration, (int, float))
+            and not isinstance(declaration, bool)
+        ):
+            role = _dataset_role(dataset)
+            split_id = _split_identifier({"split_id": declaration})
+        else:
+            role = None
+            split_id = None
+        roles[_compact(dataset)] = (role, split_id, untouched)
+    return roles
+
+
+def _runtime_split_ids(
+    runtime: Mapping[str, Any],
+) -> dict[str, str]:
+    split_ids: dict[str, str] = {}
+    for field in ("split_identifiers", "split_ids"):
+        raw_ids = runtime.get(field)
+        if not isinstance(raw_ids, Mapping):
+            continue
+        for raw_role, raw_split_id in raw_ids.items():
+            role = _role_from_key(raw_role)
+            split_id = _split_identifier({"split_id": raw_split_id})
+            if role is not None and split_id is not None:
+                split_ids[role] = split_id
+    for raw_role, raw_split_id in runtime.items():
+        role = _role_from_key(raw_role)
+        if role is None or not _slug(str(raw_role)).endswith(
+            ("_split", "_split_id", "_split_identifier")
+        ):
+            continue
+        split_id = _split_identifier({"split_id": raw_split_id})
+        if split_id is not None:
+            split_ids[role] = split_id
+    return split_ids
+
+
+def _role_from_key(value: Any) -> str | None:
+    normalized = _slug(str(value))
+    for suffix in ("_split_identifier", "_split_id", "_split"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return _dataset_role(normalized)
+
+
+def _runtime_role_split_ids(
+    runtime: Mapping[str, Any],
+    role: str,
+) -> set[str]:
+    split_ids = {
+        split_id
+        for declared_role, split_id, _ in _runtime_dataset_roles(
+            runtime
+        ).values()
+        if declared_role == role and split_id is not None
+    }
+    top_level = _runtime_split_ids(runtime).get(role)
+    if top_level is not None:
+        split_ids.add(top_level)
+    return split_ids
+
+
+def _runtime_role_declarations(
+    runtime: Mapping[str, Any],
+    role: str,
+) -> list[tuple[str | None, bool | None]]:
+    declarations = [
+        (split_id, untouched)
+        for declared_role, split_id, untouched in _runtime_dataset_roles(
+            runtime
+        ).values()
+        if declared_role == role
+    ]
+    if declarations:
+        return declarations
+    split_id = _runtime_split_ids(runtime).get(role)
+    return [(split_id, None)] if split_id is not None else []
+
+
+def _runtime_role_is_untouched(
+    runtime: Mapping[str, Any],
+    role: str,
+) -> bool:
+    return any(
+        declared_role == role and untouched is True
+        for declared_role, _, untouched in _runtime_dataset_roles(
+            runtime
+        ).values()
+    )
+
+
+def _runtime_split_declarations_agree(
+    runtime: Mapping[str, Any],
+    role: str,
+) -> bool:
+    split_ids = {
+        split_id
+        for split_id, _ in _runtime_role_declarations(runtime, role)
+        if split_id is not None
+    }
+    top_level = _runtime_split_ids(runtime).get(role)
+    if top_level is not None:
+        split_ids.add(top_level)
+    return len(split_ids) <= 1
+
+
+def _runtime_declares_dataset_contract(
+    runtime: Mapping[str, Any],
+) -> bool:
+    return "dataset_roles" in runtime and (
+        "split_identifiers" in runtime
+        or "split_ids" in runtime
+        or any(
+            _role_from_key(field) is not None
+            and _slug(str(field)).endswith(
+                ("_split", "_split_id", "_split_identifier")
+            )
+            for field in runtime
+        )
+    )
+
+
+def _identity(value: Any) -> str:
+    return f"{type(value).__name__}:{value!r}"
 
 
 def _adaptation_references(
@@ -1217,8 +1656,73 @@ def validate_build_output(value: dict[str, Any]) -> list[str]:
         errors.append("commands must be an object")
     else:
         for field in ("smoke", "pilot", "scale"):
-            if not str(commands.get(field, "") or "").strip():
+            command = commands.get(field)
+            if isinstance(command, str):
+                try:
+                    argv = shlex.split(command)
+                except ValueError as exc:
+                    errors.append(f"invalid commands.{field}: {exc}")
+                    continue
+            elif isinstance(command, list) and all(
+                isinstance(item, str) and item
+                for item in command
+            ):
+                argv = list(command)
+            else:
+                argv = []
+            if not argv:
                 errors.append(f"missing commands.{field}")
+                continue
+            errors.extend(
+                validate_execution_argv(
+                    argv,
+                    path=f"commands.{field}",
+                )
+            )
+    return errors
+
+
+def validate_execution_argv(
+    argv: list[str] | tuple[str, ...],
+    *,
+    path: str = "command",
+) -> list[str]:
+    """Allow only a direct Python entrypoint with inert string arguments."""
+
+    errors: list[str] = []
+    if not argv:
+        return [f"{path} must be a non-empty argv list"]
+    executable = Path(argv[0]).name.casefold()
+    if executable not in {
+        "python",
+        "python3",
+        "python3.10",
+        "python3.11",
+        "python3.12",
+    }:
+        errors.append(
+            f"{path} executable must be an approved Python interpreter"
+        )
+    if len(argv) < 2:
+        errors.append(f"{path} must include a Python entrypoint")
+        return errors
+    entrypoint = Path(argv[1])
+    if (
+        entrypoint.is_absolute()
+        or ".." in entrypoint.parts
+        or entrypoint.suffix != ".py"
+    ):
+        errors.append(
+            f"{path} entrypoint must be a relative .py file without '..'"
+        )
+    for index, argument in enumerate(argv):
+        if "\x00" in argument or "\n" in argument or "\r" in argument:
+            errors.append(f"{path}[{index}] contains a control character")
+        if any(
+            token in argument
+            for token in (";", "&&", "||", "|", ">", "<", "`", "$(")
+        ):
+            errors.append(f"{path}[{index}] contains a shell metacharacter")
     return errors
 
 
@@ -1292,6 +1796,71 @@ def validate_runtime_evidence_file(path: Path) -> dict[str, Any]:
     seeds = value.get("seeds")
     if not isinstance(seeds, list) or not seeds:
         errors.append("seeds must be a non-empty list")
+    elif any(isinstance(seed, (list, dict, set)) for seed in seeds):
+        errors.append("seeds must contain scalar identifiers")
+    elif len({_identity(seed) for seed in seeds}) != len(seeds):
+        errors.append("seeds must contain unique independent identifiers")
+
+    if "dataset_roles" in value:
+        dataset_roles = value["dataset_roles"]
+        if (
+            not isinstance(dataset_roles, (Mapping, list))
+            or not dataset_roles
+        ):
+            errors.append(
+                "dataset_roles must be a non-empty object or list"
+            )
+        else:
+            parsed_roles = _runtime_dataset_roles(value)
+            if not parsed_roles:
+                errors.append("dataset_roles contains no valid declarations")
+            for dataset, (role, split_id, untouched) in parsed_roles.items():
+                if role is None:
+                    errors.append(
+                        f"invalid dataset_roles declaration for {dataset!r}"
+                    )
+                if role == "confirmatory" and untouched is not True:
+                    errors.append(
+                        f"dataset_roles[{dataset!r}].untouched must be true "
+                        "for confirmatory data"
+                    )
+    for split_field in ("split_identifiers", "split_ids"):
+        if split_field not in value:
+            continue
+        split_ids = value[split_field]
+        if not isinstance(split_ids, Mapping) or not split_ids:
+            errors.append(f"{split_field} must be a non-empty object")
+        elif not _runtime_split_ids({split_field: split_ids}):
+            errors.append(
+                f"{split_field} contains no valid role/split declarations"
+            )
+    if "dataset_roles" in value:
+        top_level_split_ids = _runtime_split_ids(value)
+        for dataset, (role, split_id, _) in _runtime_dataset_roles(
+            value
+        ).items():
+            if (
+                role is not None
+                and split_id is None
+                and role not in top_level_split_ids
+            ):
+                errors.append(
+                    f"dataset_roles[{dataset!r}] must declare split_id"
+                )
+    if "dataset_roles" in value and not (
+        "split_identifiers" in value
+        or "split_ids" in value
+        or any(
+            _role_from_key(field) is not None
+            and _slug(str(field)).endswith(
+                ("_split", "_split_id", "_split_identifier")
+            )
+            for field in value
+        )
+    ):
+        errors.append(
+            "dataset_roles requires split identifiers for declared roles"
+        )
     if not isinstance(value.get("metrics"), dict) or not value.get("metrics"):
         errors.append("runtime evidence metrics must be a non-empty object")
     else:
@@ -1419,12 +1988,166 @@ def validate_runtime_against_contract(
             scale_examples = pilot_examples = -1
         scale_seeds = runtime_evidence.get("seeds", [])
         prior_seeds = pilot_runtime.get("seeds", [])
-        if (
-            scale_examples <= pilot_examples
-            and len(scale_seeds if isinstance(scale_seeds, list) else [])
-            <= len(prior_seeds if isinstance(prior_seeds, list) else [])
-        ):
+        scale_seed_ids = (
+            {_identity(seed) for seed in scale_seeds}
+            if isinstance(scale_seeds, list)
+            else set()
+        )
+        pilot_seed_ids = (
+            {_identity(seed) for seed in prior_seeds}
+            if isinstance(prior_seeds, list)
+            else set()
+        )
+        if scale_examples <= pilot_examples:
             errors.append(
-                "scale run did not increase examples or seed coverage"
+                "scale run must increase examples beyond pilot "
+                f"({scale_examples} <= {pilot_examples})"
+            )
+        if len(scale_seed_ids) <= len(pilot_seed_ids):
+            errors.append(
+                "scale run must increase independent seed coverage beyond "
+                f"pilot ({len(scale_seed_ids)} <= {len(pilot_seed_ids)})"
+            )
+
+        production = _is_production_screening_plan(plan)
+        if production:
+            _validate_scale_dataset_contract(
+                plan=plan,
+                runtime_evidence=runtime_evidence,
+                pilot_runtime=pilot_runtime,
+                errors=errors,
             )
     return errors
+
+
+def _is_production_screening_plan(plan: Mapping[str, Any]) -> bool:
+    if plan.get("study_phase") == _SCREENING_PHASE:
+        return True
+    followup = plan.get("confirmatory_followup")
+    if not isinstance(followup, Mapping):
+        return False
+    return (
+        followup.get("required") is True
+        or _split_identifier(followup) is not None
+        or followup.get("untouched") is True
+        or followup.get("split_untouched") is True
+    )
+
+
+def _validate_scale_dataset_contract(
+    *,
+    plan: Mapping[str, Any],
+    runtime_evidence: Mapping[str, Any],
+    pilot_runtime: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    followup = plan.get("confirmatory_followup")
+    if not isinstance(followup, Mapping):
+        errors.append(
+            "production scale requires structured "
+            "plan.confirmatory_followup"
+        )
+        return
+
+    planned_confirmatory_split = _split_identifier(followup)
+    if planned_confirmatory_split is None:
+        errors.append(
+            "production scale plan is missing confirmatory split_id"
+        )
+    if followup.get(
+        "untouched",
+        followup.get("split_untouched"),
+    ) is not True:
+        errors.append(
+            "production scale plan must mark confirmatory split untouched"
+        )
+
+    pilot_screening_splits = _runtime_role_split_ids(
+        pilot_runtime,
+        "screening",
+    )
+    if not pilot_screening_splits:
+        pilot_screening_splits = _plan_split_ids(plan, role="screening")
+    if not pilot_screening_splits:
+        errors.append(
+            "pilot runtime must identify the screening split for "
+            "production scale"
+        )
+
+    if not _runtime_declares_dataset_contract(runtime_evidence):
+        errors.append(
+            "production scale runtime_evidence must declare dataset_roles "
+            "and split identifiers"
+        )
+
+    scale_confirmatory_splits = _runtime_role_split_ids(
+        runtime_evidence,
+        "confirmatory",
+    )
+    confirmatory_declarations = _runtime_role_declarations(
+        runtime_evidence,
+        "confirmatory",
+    )
+    if not scale_confirmatory_splits:
+        errors.append(
+            "scale runtime_evidence must identify a confirmatory split"
+        )
+    if not _runtime_role_is_untouched(
+        runtime_evidence,
+        "confirmatory",
+    ):
+        errors.append(
+            "scale runtime_evidence must mark confirmatory data untouched"
+        )
+    if confirmatory_declarations and any(
+        untouched is not True
+        for _, untouched in confirmatory_declarations
+    ):
+        errors.append(
+            "every confirmatory dataset role must be explicitly untouched"
+        )
+    if not _runtime_split_declarations_agree(
+        runtime_evidence,
+        "confirmatory",
+    ):
+        errors.append(
+            "scale runtime confirmatory split declarations disagree"
+        )
+
+    reused = pilot_screening_splits & scale_confirmatory_splits
+    if reused:
+        errors.append(
+            "scale confirmatory split must differ from pilot screening split: "
+            + ", ".join(sorted(reused))
+        )
+    if (
+        planned_confirmatory_split is not None
+        and scale_confirmatory_splits
+        and planned_confirmatory_split not in scale_confirmatory_splits
+    ):
+        errors.append(
+            "scale runtime confirmatory split does not match "
+            "plan.confirmatory_followup.split_id"
+        )
+    if (
+        planned_confirmatory_split is not None
+        and any(
+            split_id is not None
+            and split_id != planned_confirmatory_split
+            for split_id, _ in confirmatory_declarations
+        )
+    ):
+        errors.append(
+            "every confirmatory dataset role must use the preregistered "
+            "confirmatory split"
+        )
+    plan_confirmatory_splits = _plan_split_ids(plan, role="confirmatory")
+    if (
+        planned_confirmatory_split is not None
+        and plan_confirmatory_splits
+        and planned_confirmatory_split not in plan_confirmatory_splits
+    ):
+        errors.append(
+            "plan.confirmatory_followup.split_id does not match the "
+            "confirmatory dataset split"
+        )

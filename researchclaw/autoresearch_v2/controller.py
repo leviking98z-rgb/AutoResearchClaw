@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import json
+import os
 import random
 import shlex
 import shutil
@@ -14,6 +16,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .attestation import (
+    create_execution_attestation,
+    create_execution_contract,
+    write_execution_attestation,
+    write_execution_contract,
+)
 from .config import V2Config
 from .gpu import GPUBroker
 from .ideas import IdeaAdmission, IdeaGenerator
@@ -31,6 +39,7 @@ from .models import (
 )
 from .store import V2Store
 from .validation import (
+    validate_execution_argv,
     validate_experiment_artifacts,
     validate_runtime_against_contract,
 )
@@ -365,6 +374,15 @@ class V2Controller:
             kind = _KIND_FOR_STATUS.get(idea.status)
             if kind is None:
                 continue
+            build = self._read_current_json(idea.idea_id, "build.json")
+            remote_smoke = bool(
+                kind is JobKind.PILOT
+                and self.config.gpu.enabled
+                and self.config.execution.smoke_environment
+                in {"auto", "gpu_pool"}
+                and not self._build_has_successful_remote_smoke(build)
+            )
+            dispatch_kind = JobKind.BUILD if remote_smoke else kind
             base = f"{idea.idea_id}-{kind.value}"
             index = 1
             job_id = base
@@ -373,7 +391,9 @@ class V2Controller:
                 job_id = f"{base}-{index:02d}"
             compute = idea.candidate.get("compute", {})
             requested_gpus = 0
-            if kind in {JobKind.PILOT, JobKind.SCALE}:
+            if remote_smoke:
+                requested_gpus = 1
+            elif kind in {JobKind.PILOT, JobKind.SCALE}:
                 try:
                     requested_gpus = max(
                         1, int(compute.get("gpu_count", 1))
@@ -381,6 +401,9 @@ class V2Controller:
                 except (AttributeError, TypeError, ValueError):
                     requested_gpus = 1
             max_gpus = (
+                1
+                if remote_smoke
+                else
                 self.config.gpu.pilot_max_gpus
                 if kind is JobKind.PILOT
                 else self.config.gpu.scale_max_gpus
@@ -388,10 +411,10 @@ class V2Controller:
             job = JobRecord(
                 job_id=job_id,
                 idea_id=idea.idea_id,
-                kind=kind,
+                kind=dispatch_kind,
                 attempt_limit=(
                     self.config.budgets.max_build_attempts
-                    if kind is JobKind.BUILD
+                    if dispatch_kind is JobKind.BUILD
                     else self.config.budgets.max_job_attempts
                 ),
                 requires_gpu=bool(requested_gpus),
@@ -402,7 +425,19 @@ class V2Controller:
                     else 0
                 ),
                 max_gpus=max_gpus if requested_gpus else 0,
-                timeout_sec=self._job_timeout(idea, kind),
+                timeout_sec=(
+                    self.config.execution.smoke_timeout_sec
+                    if remote_smoke
+                    else self._job_timeout(idea, kind)
+                ),
+                result=(
+                    {
+                        "remote_smoke": True,
+                        "next_kind": JobKind.PILOT.value,
+                    }
+                    if remote_smoke
+                    else {}
+                ),
             )
             idea.current_job_id = job.job_id
             idea.status = _STATUS_FOR_KIND[kind]
@@ -413,7 +448,8 @@ class V2Controller:
                 "job_created",
                 idea_id=idea.idea_id,
                 job_id=job.job_id,
-                kind=kind.value,
+                kind=dispatch_kind.value,
+                remote_smoke=remote_smoke,
             )
 
     def _job_timeout(self, idea: IdeaRecord, kind: JobKind) -> float:
@@ -430,6 +466,21 @@ class V2Controller:
             else self.config.budgets.scale_gpu_hours
         )
         return max(60.0, min(requested, cap) * 3600.0)
+
+    @staticmethod
+    def _is_remote_smoke_job(job: JobRecord) -> bool:
+        return bool(job.result.get("remote_smoke"))
+
+    @staticmethod
+    def _build_has_successful_remote_smoke(
+        build: Mapping[str, Any],
+    ) -> bool:
+        remote_smoke = build.get("remote_smoke")
+        return bool(
+            isinstance(remote_smoke, Mapping)
+            and remote_smoke.get("ok") is True
+            and str(remote_smoke.get("attestation_sha256", "")).strip()
+        )
 
     def _dispatch(self) -> None:
         running_llm = sum(
@@ -525,12 +576,20 @@ class V2Controller:
             attempt.started_at = utc_now()
             candidate = self.store.snapshot_current(attempt)
             try:
-                command, output_dir = self._gpu_command(
-                    idea=idea,
-                    job=job,
-                    attempt=attempt,
-                    candidate=candidate,
-                )
+                if self._is_remote_smoke_job(job):
+                    command, output_dir = self._gpu_smoke_command(
+                        idea=idea,
+                        job=job,
+                        attempt=attempt,
+                        candidate=candidate,
+                    )
+                else:
+                    command, output_dir = self._gpu_command(
+                        idea=idea,
+                        job=job,
+                        attempt=attempt,
+                        candidate=candidate,
+                    )
             except Exception as exc:  # noqa: BLE001
                 attempt.status = AttemptStatus.FAILED
                 attempt.error = f"{type(exc).__name__}: {exc}"
@@ -588,7 +647,9 @@ class V2Controller:
             job.attempt = attempt.number
             job.status = JobStatus.RUNNING
             job.submitted_task_id = decision.task_id
+            prior_result = dict(job.result)
             job.result = {
+                **prior_result,
                 "allocated_gpus": decision.allocated_gpus,
                 "submitted_at": utc_now(),
                 "task_id": decision.task_id,
@@ -657,13 +718,63 @@ class V2Controller:
         attempt: AttemptRecord,
         candidate: Path,
     ) -> tuple[str, Path]:
-        build = json.loads(
-            (candidate / "build.json").read_text(encoding="utf-8")
-        )
         mode = "pilot" if job.kind is JobKind.PILOT else "scale"
-        raw_command = str(build["commands"][mode]).strip()
-        if not raw_command:
-            raise ValueError(f"missing build command for {mode}")
+        return self._trusted_gpu_command(
+            idea=idea,
+            job=job,
+            attempt=attempt,
+            candidate=candidate,
+            mode=mode,
+            max_gpus=job.max_gpus,
+            preferred_gpus=job.preferred_gpus,
+        )
+
+    def _gpu_smoke_command(
+        self,
+        *,
+        idea: IdeaRecord,
+        job: JobRecord,
+        attempt: AttemptRecord,
+        candidate: Path,
+    ) -> tuple[str, Path]:
+        return self._trusted_gpu_command(
+            idea=idea,
+            job=job,
+            attempt=attempt,
+            candidate=candidate,
+            mode="smoke",
+            max_gpus=1,
+            preferred_gpus=1,
+        )
+
+    def _trusted_gpu_command(
+        self,
+        *,
+        idea: IdeaRecord,
+        job: JobRecord,
+        attempt: AttemptRecord,
+        candidate: Path,
+        mode: str,
+        max_gpus: int,
+        preferred_gpus: int,
+    ) -> tuple[str, Path]:
+        build_path = candidate / "build.json"
+        build = json.loads(build_path.read_text(encoding="utf-8"))
+        raw_argv = build["commands"][mode]
+        if isinstance(raw_argv, str):
+            argv = shlex.split(raw_argv)
+        elif isinstance(raw_argv, list) and all(
+            isinstance(item, str) for item in raw_argv
+        ):
+            argv = list(raw_argv)
+        else:
+            argv = []
+        command_errors = validate_execution_argv(
+            argv,
+            path=f"commands.{mode}",
+        )
+        if command_errors:
+            raise ValueError("; ".join(command_errors))
         shared_root = Path(
             self.config.gpu.shared_workspace_root
         ).expanduser().resolve()
@@ -680,18 +791,64 @@ class V2Controller:
                 f"workspace: {candidate} is outside {shared_root}"
             )
         output_dir.mkdir(parents=True, exist_ok=True)
-        # Generated commands use paths relative to the project snapshot. Set
-        # cwd explicitly, and pass the absolute artifact contract path.
-        env = (
-            f"AUTORESEARCH_V2_OUTPUT_DIR={shlex.quote(str(output_dir))} "
-            f"AUTORESEARCH_V2_ATTEMPT_ID={shlex.quote(attempt.attempt_id)} "
-            f"AUTORESEARCH_V2_IDEA_ID={shlex.quote(idea.idea_id)} "
+        execution_argv = [
+            self.config.execution.python_executable,
+            *argv[1:],
+        ]
+        bound_build_path = build_path
+        if mode == "smoke":
+            provenance = candidate / "trusted" / "remote_smoke"
+            provenance.mkdir(parents=True, exist_ok=True)
+            bound_build_path = provenance / "executed_build.json"
+            shutil.copy2(build_path, bound_build_path)
+        contract = create_execution_contract(
+            idea_id=idea.idea_id,
+            job_id=job.job_id,
+            attempt_id=attempt.attempt_id,
+            mode=mode,
+            argv=execution_argv,
+            cwd=candidate,
+            entrypoint=argv[1],
+            output_dir=output_dir,
+            resource_limits={
+                "min_gpus": (
+                    1
+                    if mode == "smoke"
+                    else job.min_gpus
+                ),
+                "max_gpus": max_gpus,
+                "preferred_gpus": preferred_gpus,
+                "timeout_sec": job.timeout_sec,
+            },
+            plan_path=candidate / "plan.json",
+            build_path=bound_build_path,
+            allowed_env_keys=self.config.execution.allowed_env_keys,
+        )
+        contract_path = self.store.attempt_dir(attempt) / (
+            "execution_contract.json"
+        )
+        write_execution_contract(contract_path, contract)
+        runner = (
+            "import json, os, subprocess, sys\n"
+            "contract=json.load(open(sys.argv[1], encoding='utf-8'))\n"
+            "candidate=sys.argv[2]\n"
+            "allowed=set(contract['allowed_env_keys'])\n"
+            "env={k:v for k,v in os.environ.items() if k in allowed}\n"
+            "for key in ('PATH','HOME','LANG','LC_ALL','LD_LIBRARY_PATH',"
+            "'PYTHONPATH','HF_HOME','TORCH_HOME','CUDA_HOME'):\n"
+            "    if key in os.environ: env[key]=os.environ[key]\n"
+            "env['PYTHONUNBUFFERED']='1'\n"
+            "env['TOKENIZERS_PARALLELISM']='false'\n"
+            "raise SystemExit(subprocess.run("
+            "contract['argv'], cwd=candidate, env=env, shell=False).returncode)"
         )
         command = (
             "set -euo pipefail; "
-            f"cd {shlex.quote(str(candidate))}; "
             f"mkdir -p {shlex.quote(str(output_dir))}; "
-            f"{env}bash -lc {shlex.quote(raw_command)}"
+            f"{shlex.quote(self.config.execution.python_executable)} "
+            f"-c {shlex.quote(runner)} "
+            f"{shlex.quote(str(contract_path))} "
+            f"{shlex.quote(str(candidate))}"
         )
         return command, output_dir
 
@@ -721,11 +878,13 @@ class V2Controller:
             if attempt is None:
                 attempt = self.store.create_attempt(job)
             attempt_dir = self.store.attempt_dir(attempt)
-            (attempt_dir / "stdout.log").write_text(
+            stdout_path = attempt_dir / "stdout.log"
+            stderr_path = attempt_dir / "stderr.log"
+            stdout_path.write_text(
                 str(result.get("stdout", "") or ""),
                 encoding="utf-8",
             )
-            (attempt_dir / "stderr.log").write_text(
+            stderr_path.write_text(
                 str(result.get("stderr", "") or ""),
                 encoding="utf-8",
             )
@@ -745,12 +904,49 @@ class V2Controller:
                 / "candidate"
                 / "artifacts"
                 / (
-                    "pilot"
+                    "smoke"
+                    if self._is_remote_smoke_job(job)
+                    else "pilot"
                     if job.kind is JobKind.PILOT
                     else "scale"
                 )
             )
+            if self._is_remote_smoke_job(job):
+                self._complete_remote_smoke(
+                    idea=idea,
+                    job=job,
+                    attempt=attempt,
+                    result=result,
+                    output_dir=output_dir,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    returncode=returncode,
+                    allocated_gpus=allocated,
+                    elapsed_sec=elapsed_sec,
+                )
+                continue
             validation = validate_experiment_artifacts(output_dir)
+            if self._simulation_mode:
+                validation["execution_attestation"] = {
+                    "simulation": True
+                }
+            else:
+                attestation = self._attest_gpu_execution(
+                    idea=idea,
+                    job=job,
+                    attempt=attempt,
+                    output_dir=output_dir,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    returncode=returncode,
+                    allocated_gpus=allocated,
+                    elapsed_sec=elapsed_sec,
+                )
+                if attestation.get("errors"):
+                    validation["errors"].extend(attestation["errors"])
+                    validation["ok"] = False
+                else:
+                    validation["execution_attestation"] = attestation
             plan = self._read_current_json(idea.idea_id, "plan.json")
             pilot_runtime = (
                 self._read_current_json(
@@ -824,9 +1020,7 @@ class V2Controller:
                         ),
                     }
                     gate_tokens = verdict.tokens
-                decision_path = (
-                    output_dir / "decision_review.json"
-                )
+                decision_path = attempt_dir / "decision_review.json"
                 decision_path.write_text(
                     json.dumps(
                         gate,
@@ -887,6 +1081,218 @@ class V2Controller:
             )
             self._apply_outcome(idea, job, attempt, outcome)
 
+    def _complete_remote_smoke(
+        self,
+        *,
+        idea: IdeaRecord,
+        job: JobRecord,
+        attempt: AttemptRecord,
+        result: Mapping[str, Any],
+        output_dir: Path,
+        stdout_path: Path,
+        stderr_path: Path,
+        returncode: int,
+        allocated_gpus: int,
+        elapsed_sec: float,
+    ) -> None:
+        attestation = self._attest_gpu_execution(
+            idea=idea,
+            job=job,
+            attempt=attempt,
+            output_dir=output_dir,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            returncode=returncode,
+            allocated_gpus=allocated_gpus,
+            elapsed_sec=elapsed_sec,
+        )
+        validation: dict[str, Any] = {
+            "ok": returncode == 0 and not attestation.get("errors"),
+            "remote_smoke": {
+                "executed": True,
+                "environment": "gpu_pool",
+                "returncode": returncode,
+                "allocated_gpus": allocated_gpus,
+                "execution_attestation": attestation,
+            },
+            "errors": list(attestation.get("errors", [])),
+        }
+        attempt.output_manifest = {
+            **dict(result),
+            "output_dir": str(output_dir),
+        }
+        attempt.validation = validation
+        if validation["ok"]:
+            build_path = (
+                self.store.attempt_dir(attempt) / "candidate" / "build.json"
+            )
+            build = json.loads(build_path.read_text(encoding="utf-8"))
+            build["remote_smoke"] = {
+                "ok": True,
+                "attempt_id": attempt.attempt_id,
+                "contract_path": attestation.get("contract_path", ""),
+                "attestation_path": attestation.get("path", ""),
+                "attestation_sha256": attestation.get("sha256", ""),
+            }
+            build_path.write_text(
+                json.dumps(
+                    build,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            attempt.status = AttemptStatus.VALIDATING
+            attempt.finished_at = utc_now()
+            self.store.save_attempt(attempt)
+            self.store.commit_candidate(attempt)
+            outcome = JobOutcome(
+                True,
+                "promote",
+                "remote_smoke_accepted",
+                {
+                    "remote_smoke": build["remote_smoke"],
+                    "pool_result": dict(result),
+                },
+                elapsed_sec=elapsed_sec,
+            )
+        else:
+            attempt.status = AttemptStatus.REJECTED
+            attempt.error = (
+                f"returncode={returncode}; "
+                + "; ".join(validation["errors"])
+            )
+            attempt.finished_at = utc_now()
+            self.store.save_attempt(attempt)
+            outcome = JobOutcome(
+                False,
+                "retry",
+                "remote_smoke_invalid",
+                {
+                    "returncode": returncode,
+                    "validation": validation,
+                    "pool_result": dict(result),
+                },
+                elapsed_sec=elapsed_sec,
+            )
+        idea.gpu_seconds_spent += allocated_gpus * max(0.0, elapsed_sec)
+        self._apply_outcome(
+            idea,
+            job,
+            attempt,
+            JobOutcome(
+                outcome.success,
+                outcome.decision,
+                outcome.reason,
+                outcome.result,
+                tokens=outcome.tokens,
+                elapsed_sec=0.0,
+            ),
+        )
+
+    def _attest_gpu_execution(
+        self,
+        *,
+        idea: IdeaRecord,
+        job: JobRecord,
+        attempt: AttemptRecord,
+        output_dir: Path,
+        stdout_path: Path,
+        stderr_path: Path,
+        returncode: int,
+        allocated_gpus: int,
+        elapsed_sec: float,
+    ) -> dict[str, Any]:
+        contract_path = (
+            self.store.attempt_dir(attempt) / "execution_contract.json"
+        )
+        try:
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            key = self._attestation_key()
+            ended = datetime.now(UTC)
+            started = ended - timedelta(
+                seconds=max(0.0, float(elapsed_sec))
+            )
+            attestation_value = create_execution_attestation(
+                contract,
+                signing_key=key,
+                key_id=self.config.execution.attestation_key_id,
+                started_at=started,
+                ended_at=ended,
+                returncode=returncode,
+                allocated_gpus=allocated_gpus,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                artifact_dir=output_dir,
+            )
+            attestation_path = (
+                self.store.attempt_dir(attempt)
+                / "execution_attestation.json"
+            )
+            attestation_hash = write_execution_attestation(
+                attestation_path,
+                attestation_value,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"errors": [f"{type(exc).__name__}: {exc}"]}
+        return {
+            "path": str(attestation_path),
+            "sha256": attestation_hash,
+            "contract_path": str(contract_path),
+            "key_id": self.config.execution.attestation_key_id,
+            "idea_id": idea.idea_id,
+            "job_id": job.job_id,
+        }
+
+    def _attestation_key(self) -> bytes:
+        configured = self.config.execution.attestation_key_file.strip()
+        key_path = (
+            Path(configured).expanduser().resolve()
+            if configured
+            else self.config.root / ".controller-attestation.key"
+        )
+
+        def read_key() -> bytes:
+            raw = key_path.read_bytes().strip()
+            try:
+                decoded = base64.urlsafe_b64decode(raw)
+            except (ValueError, TypeError):
+                decoded = raw
+            if len(decoded) < 32:
+                raise ValueError(
+                    f"attestation key is too short: {key_path}"
+                )
+            return decoded
+
+        if key_path.exists():
+            return read_key()
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        key = os.urandom(32)
+        encoded = base64.urlsafe_b64encode(key)
+        temp_path = key_path.with_name(
+            f".{key_path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp"
+        )
+        try:
+            descriptor = os.open(
+                temp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            os.write(descriptor, encoded + b"\n")
+            os.fsync(descriptor)
+        finally:
+            if "descriptor" in locals():
+                os.close(descriptor)
+        try:
+            os.link(temp_path, key_path)
+        except FileExistsError:
+            return read_key()
+        finally:
+            temp_path.unlink(missing_ok=True)
+        return read_key()
+
     def _collect_finished(self) -> None:
         for job_id, running in list(self._running.items()):
             if not running.future.done():
@@ -937,7 +1343,9 @@ class V2Controller:
             idea.gpu_seconds_spent += allocated * max(
                 0.0, float(outcome.elapsed_sec)
             )
+        prior_result = dict(job.result)
         job.result = {
+            **prior_result,
             "decision": outcome.decision,
             "reason": outcome.reason,
             **outcome.result,
@@ -970,13 +1378,16 @@ class V2Controller:
             job.retry_not_before = ""
             idea.current_job_id = ""
             if outcome.decision == "promote":
-                idea.status = {
-                    JobKind.DESIGN: IdeaStatus.BUILDING,
-                    JobKind.BUILD: IdeaStatus.PILOTING,
-                    JobKind.PILOT: IdeaStatus.SCALING,
-                    JobKind.SCALE: IdeaStatus.REPORTING,
-                    JobKind.REPORT: IdeaStatus.COMPLETED,
-                }[job.kind]
+                if self._is_remote_smoke_job(job):
+                    idea.status = IdeaStatus.PILOTING
+                else:
+                    idea.status = {
+                        JobKind.DESIGN: IdeaStatus.BUILDING,
+                        JobKind.BUILD: IdeaStatus.PILOTING,
+                        JobKind.PILOT: IdeaStatus.SCALING,
+                        JobKind.SCALE: IdeaStatus.REPORTING,
+                        JobKind.REPORT: IdeaStatus.COMPLETED,
+                    }[job.kind]
             elif outcome.decision == "complete":
                 idea.status = IdeaStatus.COMPLETED
                 idea.exit_reason = outcome.reason
@@ -1044,13 +1455,16 @@ class V2Controller:
                 job.status = JobStatus.SUCCEEDED
                 job.retry_not_before = ""
                 idea.current_job_id = ""
-                idea.status = {
-                    JobKind.DESIGN: IdeaStatus.BUILDING,
-                    JobKind.BUILD: IdeaStatus.PILOTING,
-                    JobKind.PILOT: IdeaStatus.SCALING,
-                    JobKind.SCALE: IdeaStatus.REPORTING,
-                    JobKind.REPORT: IdeaStatus.COMPLETED,
-                }[job.kind]
+                if self._is_remote_smoke_job(job):
+                    idea.status = IdeaStatus.PILOTING
+                else:
+                    idea.status = {
+                        JobKind.DESIGN: IdeaStatus.BUILDING,
+                        JobKind.BUILD: IdeaStatus.PILOTING,
+                        JobKind.PILOT: IdeaStatus.SCALING,
+                        JobKind.SCALE: IdeaStatus.REPORTING,
+                        JobKind.REPORT: IdeaStatus.COMPLETED,
+                    }[job.kind]
                 idea.last_progress_at = utc_now()
                 self.store.save_job(job)
                 self.store.save_idea(idea)
@@ -1126,14 +1540,22 @@ class V2Controller:
         if job.requires_gpu:
             budget_hours = (
                 self.config.budgets.pilot_gpu_hours
-                if job.kind is JobKind.PILOT
+                if (
+                    job.kind is JobKind.PILOT
+                    or self._is_remote_smoke_job(job)
+                )
                 else self.config.budgets.scale_gpu_hours
             )
             # GPU accounting is GPU-seconds, so the configured budget is also
             # interpreted as GPU-hours rather than wall-clock hours.
             budget_seconds = budget_hours * 3600.0
             if idea.gpu_seconds_spent >= budget_seconds:
-                return f"{job.kind.value}_gpu_budget_exhausted"
+                stage = (
+                    "smoke"
+                    if self._is_remote_smoke_job(job)
+                    else job.kind.value
+                )
+                return f"{stage}_gpu_budget_exhausted"
             remaining = budget_seconds - idea.gpu_seconds_spent
             projected = max(1, job.min_gpus) * job.timeout_sec
             if projected > remaining + 1e-9:
@@ -1147,7 +1569,12 @@ class V2Controller:
                     max(1, job.preferred_gpus) * job.timeout_sec
                     > remaining + 1e-9
                 ):
-                    return f"{job.kind.value}_gpu_budget_insufficient"
+                    stage = (
+                        "smoke"
+                        if self._is_remote_smoke_job(job)
+                        else job.kind.value
+                    )
+                    return f"{stage}_gpu_budget_insufficient"
                 self.store.save_job(job)
         created = _parse_time(idea.created_at)
         if created is not None:

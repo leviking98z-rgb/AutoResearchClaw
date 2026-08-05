@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from researchclaw.autoresearch_v2.config import V2Config
@@ -96,6 +97,192 @@ class _Pool:
         return {"returncode": 130, "elapsed_sec": 1.0}
 
 
+def test_controller_runs_build_smoke_on_gpu_pool_before_pilot(
+    tmp_path: Path,
+) -> None:
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "population": {
+                    "reservoir_low_watermark": 1,
+                    "reservoir_target": 1,
+                    "generation_batch_size": 1,
+                    "active_idea_target": 1,
+                    "max_active_ideas": 1,
+                    "max_same_family": 2,
+                },
+                "concurrency": {
+                    "max_llm_jobs": 1,
+                    "max_cpu_jobs": 1,
+                    "max_gpu_jobs": 1,
+                    "poll_interval_sec": 0.001,
+                },
+                "execution": {
+                    "python_executable": sys.executable,
+                    "smoke_environment": "gpu_pool",
+                },
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
+                    "pilot_max_gpus": 1,
+                    "scale_max_gpus": 1,
+                },
+            }
+        }
+    )
+
+    class SmokeAwarePool(_Pool):
+        def collect_task(self, task_id: str):
+            request = self.requests[task_id]
+            output_dir = Path(
+                str(
+                    request.get("env", {}).get(
+                        "AUTORESEARCH_V2_OUTPUT_DIR",
+                        "",
+                    )
+                )
+            )
+            output_dir.mkdir(parents=True, exist_ok=True)
+            if output_dir.name != "smoke":
+                return super().collect_task(task_id)
+            return {
+                "returncode": 0,
+                "elapsed_sec": 1.0,
+                "stdout": "smoke-ok\n",
+                "stderr": "",
+            }
+
+    store = V2Store(tmp_path)
+    pool = SmokeAwarePool()
+    controller = V2Controller(
+        config=config,
+        store=store,
+        generator=StaticIdeaGenerator([_candidate(0)]),
+        executors={
+            JobKind.DESIGN: SimulatedJobExecutor(),
+            JobKind.BUILD: SimulatedJobExecutor(),
+            JobKind.REPORT: SimulatedJobExecutor(),
+        },
+        gpu_broker=GPUBroker(
+            pool=pool,
+            scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        ),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+
+    import time
+
+    for _ in range(120):
+        controller.tick()
+        time.sleep(0.002)
+        pilot_requests = [
+            request
+            for request in pool.requests.values()
+            if Path(
+                str(
+                    request.get("env", {}).get(
+                        "AUTORESEARCH_V2_OUTPUT_DIR",
+                        "",
+                    )
+                )
+            ).name
+            == "pilot"
+        ]
+        if pilot_requests:
+            break
+
+    requests = list(pool.requests.values())
+    output_names = [
+        Path(
+            str(
+                request.get("env", {}).get(
+                    "AUTORESEARCH_V2_OUTPUT_DIR",
+                    "",
+                )
+            )
+        ).name
+        for request in requests
+    ]
+    assert "smoke" in output_names
+    assert "pilot" in output_names
+    smoke_index = output_names.index("smoke")
+    pilot_index = output_names.index("pilot")
+    assert smoke_index < pilot_index
+    smoke_request = requests[smoke_index]
+    assert sys.executable in str(smoke_request["command"])
+    assert "shell=False" in str(smoke_request["command"])
+
+    builds = [
+        job
+        for job in store.list_jobs()
+        if job.kind is JobKind.BUILD and job.result.get("remote_smoke")
+    ]
+    assert len(builds) == 1
+    assert builds[0].status.value == "succeeded"
+    current_build = json.loads(
+        (
+            store.current_dir(store.list_ideas()[0].idea_id)
+            / "build.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert current_build["remote_smoke"]["ok"] is True
+    assert current_build["remote_smoke"]["attestation_sha256"]
+    smoke_contracts = []
+    for path in tmp_path.rglob("execution_contract.json"):
+        contract = json.loads(path.read_text(encoding="utf-8"))
+        if contract.get("mode") == "smoke":
+            smoke_contracts.append(contract)
+    assert len(smoke_contracts) == 1
+    assert smoke_contracts[0]["resource_limits"]["min_gpus"] == 1
+    controller._pool.shutdown(wait=True)
+
+
+def test_attestation_key_creation_is_race_safe(
+    tmp_path: Path,
+) -> None:
+    key_path = tmp_path / "shared-controller.key"
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path / "state"),
+                "execution": {
+                    "attestation_key_file": str(key_path),
+                },
+            }
+        }
+    )
+    controllers = [
+        V2Controller(
+            config=config,
+            store=V2Store(tmp_path / f"state-{index}"),
+            generator=StaticIdeaGenerator([]),
+            executors={},
+        )
+        for index in range(2)
+    ]
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        keys = list(
+            executor.map(
+                lambda controller: controller._attestation_key(),
+                controllers,
+            )
+        )
+
+    assert keys[0] == keys[1]
+    assert len(keys[0]) >= 32
+    assert key_path.is_file()
+    for controller in controllers:
+        controller._pool.shutdown(wait=True)
+
+
 def test_controller_submits_multiple_gpu_ideas_into_one_pool(
     tmp_path: Path,
 ) -> None:
@@ -117,6 +304,9 @@ def test_controller_submits_multiple_gpu_ideas_into_one_pool(
                     "max_cpu_jobs": 3,
                     "max_gpu_jobs": 3,
                     "poll_interval_sec": 0.001,
+                },
+                "execution": {
+                    "smoke_environment": "local",
                 },
                 "gpu": {
                     "enabled": True,
@@ -151,7 +341,7 @@ def test_controller_submits_multiple_gpu_ideas_into_one_pool(
         sleep=lambda _: None,
     )
     controller.initialize()
-    for _ in range(80):
+    for _ in range(200):
         controller.tick()
         import time
 
@@ -170,6 +360,17 @@ def test_controller_submits_multiple_gpu_ideas_into_one_pool(
     ) == 6
     for request in pilot_requests.values():
         assert request["command"]
+        assert "execution_contract.json" in str(request["command"])
+        assert "shell=False" in str(request["command"])
+    contract_paths = list(
+        tmp_path.rglob("execution_contract.json")
+    )
+    assert len(contract_paths) >= 3
+    contract = json.loads(contract_paths[0].read_text(encoding="utf-8"))
+    assert isinstance(contract["argv"], list)
+    assert contract["argv"][0] == "python"
+    assert contract["argv"][1].endswith(".py")
+    assert "python -c" in str(next(iter(pilot_requests.values()))["command"])
     controller.tick()
     assert any(
         idea.status in {IdeaStatus.SCALING, IdeaStatus.REPORTING}
@@ -197,6 +398,9 @@ def test_controller_enforces_max_gpu_jobs(tmp_path: Path) -> None:
                     "max_cpu_jobs": 3,
                     "max_gpu_jobs": 1,
                     "poll_interval_sec": 0.001,
+                },
+                "execution": {
+                    "smoke_environment": "local",
                 },
                 "gpu": {
                     "enabled": True,
@@ -261,6 +465,9 @@ def test_missing_gpu_artifacts_retry_without_mutating_current(
                     "active_idea_target": 1,
                     "max_active_ideas": 1,
                     "max_same_family": 2,
+                },
+                "execution": {
+                    "smoke_environment": "local",
                 },
                 "gpu": {
                     "enabled": True,

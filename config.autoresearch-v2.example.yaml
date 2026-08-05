@@ -41,6 +41,19 @@ autoresearch_v2:
     keep_failed_attempts_per_job: 4
     maintenance_interval_ticks: 300
 
+  execution:
+    # Must exist on every GPU node. Commands remain structured argv; generated
+    # shell programs are rejected.
+    python_executable: /opt/conda/envs/torch-base/bin/python3
+    # Leave empty to create a 0600 key under state_dir, or point at a
+    # Controller-only shared path outside Idea candidates.
+    attestation_key_file: ""
+    attestation_key_id: autoresearch-v2-controller
+    smoke_timeout_sec: 300
+    # auto: use the GPU pool whenever gpu.enabled=true, otherwise local.
+    # This prevents Controller-host dependency gaps from rejecting valid code.
+    smoke_environment: auto
+
   gpu:
     enabled: false
     pool_config: config.cluster32.yaml

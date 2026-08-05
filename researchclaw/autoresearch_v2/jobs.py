@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from .attestation import sha256_file
 from .gates import DecisionGate, design_preflight
 from .llm import StructuredRole
 from .models import (
@@ -27,6 +28,7 @@ from .models import (
 )
 from .store import V2Store
 from .validation import (
+    validate_execution_argv,
     validate_experiment_artifacts,
     validate_python_tree,
     validate_research_implementation,
@@ -240,11 +242,19 @@ Return exactly:
     {{
       "name": "one public benchmark development partition",
       "split_role": "dev",
+      "split_id": "development-v1",
       "used_for_adaptation": true
     }},
     {{
       "name": "one public benchmark screening-evaluation partition",
-      "split_role": "heldout",
+      "split_role": "screening",
+      "split_id": "screening-v1",
+      "used_for_adaptation": false
+    }},
+    {{
+      "name": "one public benchmark confirmatory partition",
+      "split_role": "heldout_confirmatory",
+      "split_id": "confirmatory-v1",
       "used_for_adaptation": false
     }}
   ],
@@ -294,10 +304,23 @@ Return exactly:
       "decision": "reject"
     }}
   ],
-  "confirmatory_followup": "At Scale use more examples, multiple independent seeds, and a new untouched confirmatory split to test the stronger paper-level claim.",
+  "confirmatory_followup": {{
+    "required": true,
+    "changes": [
+      "increase examples beyond the screening pilot",
+      "increase independent seed coverage",
+      "use the preregistered untouched confirmatory split"
+    ],
+    "claim": "the stronger paper-level claim that only Scale may support",
+    "examples": 100,
+    "independent_seeds": [11, 22, 33],
+    "split_id": "confirmatory-v1",
+    "untouched": true
+  }},
   "required_runtime_evidence": [
     "model_loaded", "datasets_loaded", "examples_processed",
-    "gpu_count", "gate_decision", "metrics"
+    "gpu_count", "gate_decision", "metrics", "dataset_roles",
+    "split_identifiers"
   ]
 }}
 This phase asks whether the protocol runs and whether a coarse signal merits
@@ -306,6 +329,9 @@ paper-level confirmatory effect. Use only 2-3 primary arms, one public
 benchmark initially, 16-50 examples, and one seed. Use paired outcomes and
 report uncertainty. Keep held-out confirmatory data completely isolated from
 prompting, memory writing, calibration, selection, and adaptation.
+Every dataset entry must use an explicit, stable split_id. The screening and
+confirmatory split IDs must differ, and confirmatory_followup.split_id must
+exactly match the heldout_confirmatory dataset entry.
 Use the Idea's real closest_papers and novelty evidence; never call an empty
 search result proof of novelty. Make metrics comparable across every arm,
 cover all possible outcomes in the decision table, and ensure the workload
@@ -319,8 +345,18 @@ pilot still requires the confirmatory_followup at Scale.
 
 
 class BuildJobExecutor:
-    def __init__(self, role: StructuredRole) -> None:
+    def __init__(
+        self,
+        role: StructuredRole,
+        *,
+        smoke_timeout_sec: float = 300.0,
+        python_executable: str = "",
+        execute_smoke_locally: bool = True,
+    ) -> None:
         self.role = role
+        self.smoke_timeout_sec = max(1.0, float(smoke_timeout_sec))
+        self.python_executable = str(python_executable).strip()
+        self.execute_smoke_locally = bool(execute_smoke_locally)
 
     def execute(
         self,
@@ -355,6 +391,24 @@ class BuildJobExecutor:
         validation["research_contract"] = implementation
         validation["ok"] = bool(
             validation.get("ok") and implementation.get("ok")
+        )
+        if self.execute_smoke_locally:
+            smoke = self._run_smoke(
+                candidate=candidate,
+                command=output["commands"]["smoke"],
+                attempt=attempt,
+                store=store,
+            )
+        else:
+            smoke = {
+                "ok": True,
+                "executed": False,
+                "environment": "gpu_pool",
+                "reason": "deferred_to_controller_managed_remote_smoke",
+            }
+        validation["smoke"] = smoke
+        validation["ok"] = bool(
+            validation.get("ok") and smoke.get("ok")
         )
         attempt.validation = validation
         attempt.output_manifest = {
@@ -429,7 +483,79 @@ Requirements:
 - The runtime must write runtime_evidence.json with exact model, datasets,
   examples, seeds, GPU count and any accept/reject/rollback decision.
 - Respect plan budgets. Never synthesize scientific outcomes.
+- Every commands value must be either a direct argv list or a shell-free
+  Python command such as "python main.py --mode pilot --output ...".
+- Do not use pipes, redirects, command substitution, shell builtins, package
+  installation, or multi-command strings.
 """
+
+    def _run_smoke(
+        self,
+        *,
+        candidate: Path,
+        command: object,
+        attempt: AttemptRecord,
+        store: V2Store,
+    ) -> dict[str, Any]:
+        try:
+            argv = _command_argv(command)
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "returncode": -1,
+                "errors": [f"invalid commands.smoke: {exc}"],
+            }
+        errors = validate_execution_argv(argv, path="commands.smoke")
+        if errors:
+            return {"ok": False, "returncode": -1, "errors": errors}
+        env = _execution_env(
+            idea_id=attempt.idea_id,
+            job_id=attempt.job_id,
+            attempt_id=attempt.attempt_id,
+            output_dir=candidate / "artifacts" / "smoke",
+            gpu_count=0,
+        )
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
+        resolved_argv = list(argv)
+        if self.python_executable:
+            resolved_argv[0] = self.python_executable
+        try:
+            completed = subprocess.run(
+                resolved_argv,
+                cwd=candidate,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=self.smoke_timeout_sec,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {
+                "ok": False,
+                "argv": resolved_argv,
+                "returncode": -1,
+                "errors": [f"{type(exc).__name__}: {exc}"],
+            }
+        attempt_dir = store.attempt_dir(attempt)
+        stdout_path = attempt_dir / "smoke.stdout.log"
+        stderr_path = attempt_dir / "smoke.stderr.log"
+        stdout_path.write_text(completed.stdout, encoding="utf-8")
+        stderr_path.write_text(completed.stderr, encoding="utf-8")
+        return {
+            "ok": completed.returncode == 0,
+            "executed": True,
+            "environment": "local",
+            "argv": resolved_argv,
+            "returncode": completed.returncode,
+            "stdout_sha256": sha256_file(stdout_path),
+            "stderr_sha256": sha256_file(stderr_path),
+            "errors": (
+                []
+                if completed.returncode == 0
+                else [f"smoke returncode={completed.returncode}"]
+            ),
+        }
 
 
 class ExperimentJobExecutor:
@@ -454,15 +580,24 @@ class ExperimentJobExecutor:
         candidate = store.snapshot_current(attempt)
         build = json.loads((candidate / "build.json").read_text(encoding="utf-8"))
         mode = "pilot" if job.kind is JobKind.PILOT else "scale"
-        command = str(build["commands"][mode])
+        argv = _command_argv(build["commands"][mode])
+        command_errors = validate_execution_argv(
+            argv,
+            path=f"commands.{mode}",
+        )
+        if command_errors:
+            raise ValueError("; ".join(command_errors))
         artifacts = candidate / "artifacts" / mode
         artifacts.mkdir(parents=True, exist_ok=True)
-        env = os.environ.copy()
-        env["AUTORESEARCH_V2_IDEA_ID"] = idea.idea_id
-        env["AUTORESEARCH_V2_ATTEMPT_ID"] = attempt.attempt_id
+        env = _execution_env(
+            idea_id=idea.idea_id,
+            job_id=job.job_id,
+            attempt_id=attempt.attempt_id,
+            output_dir=artifacts,
+            gpu_count=0,
+        )
         completed = subprocess.run(
-            command,
-            shell=True,
+            argv,
             cwd=candidate,
             env=env,
             text=True,
@@ -507,7 +642,7 @@ class ExperimentJobExecutor:
             validation["ok"] = False
         attempt.validation = validation
         attempt.output_manifest = {
-            "command": command,
+            "argv": argv,
             "returncode": completed.returncode,
             "metrics_path": str(metrics_path),
             "runtime_evidence_path": str(
@@ -552,7 +687,9 @@ class ExperimentJobExecutor:
             gate_tokens = verdict.tokens
         else:
             gate = _experiment_gate(metrics)
-        _write_json(artifacts / "decision_review.json", gate)
+        decision_path = store.attempt_dir(attempt) / "decision_review.json"
+        _write_json(decision_path, gate)
+        attempt.output_manifest["decision_review_path"] = str(decision_path)
         if gate["decision"] == "retry":
             attempt.status = AttemptStatus.REJECTED
             attempt.error = str(gate["reason"])
@@ -717,6 +854,57 @@ def _read_json(path: Path) -> dict[str, Any]:
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return {}
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _command_argv(value: object) -> list[str]:
+    if isinstance(value, list) and all(
+        isinstance(item, str) for item in value
+    ):
+        return list(value)
+    if isinstance(value, str):
+        import shlex
+
+        return shlex.split(value)
+    return []
+
+
+def _execution_env(
+    *,
+    idea_id: str,
+    job_id: str,
+    attempt_id: str,
+    output_dir: Path,
+    gpu_count: int,
+) -> dict[str, str]:
+    """Pass only a minimal allow-listed environment to generated code."""
+
+    inherited = {
+        key: value
+        for key in (
+            "CUDA_HOME",
+            "HF_HOME",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "LD_LIBRARY_PATH",
+            "PATH",
+            "PYTHONPATH",
+            "TORCH_HOME",
+        )
+        if (value := os.environ.get(key))
+    }
+    inherited.update(
+        {
+            "AUTORESEARCH_V2_IDEA_ID": idea_id,
+            "AUTORESEARCH_V2_JOB_ID": job_id,
+            "AUTORESEARCH_V2_ATTEMPT_ID": attempt_id,
+            "AUTORESEARCH_V2_GPU_COUNT": str(max(0, int(gpu_count))),
+            "AUTORESEARCH_V2_OUTPUT_DIR": str(output_dir.resolve()),
+            "PYTHONUNBUFFERED": "1",
+            "TOKENIZERS_PARALLELISM": "false",
+        }
+    )
+    return inherited
 
 
 def _collect_metrics(root: Path) -> list[dict[str, Any]]:

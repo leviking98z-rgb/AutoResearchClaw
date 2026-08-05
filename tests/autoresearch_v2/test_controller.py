@@ -78,7 +78,7 @@ def test_multi_idea_closed_loop_completes_concurrently(tmp_path: Path) -> None:
         executors={kind: SimulatedJobExecutor() for kind in JobKind},
         sleep=lambda _: None,
     )
-    controller.run(max_ticks=80)
+    controller.run(max_ticks=200)
     snapshot = controller.snapshot()
 
     assert snapshot["ideas_by_status"].get("completed", 0) >= 3

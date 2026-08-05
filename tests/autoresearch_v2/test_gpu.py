@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
 from researchclaw.autoresearch_v2.gpu import (
     AdaptiveGPUScheduler,
     GPUBroker,
     GPULease,
 )
+from researchclaw.autoresearch_v2.gpu_lease import SharedGPULeaseRegistry
 from researchclaw.autoresearch_v2.models import JobKind, JobRecord
 
 
@@ -124,3 +128,225 @@ def test_transient_probe_failure_keeps_lease() -> None:
     assert broker.leases["job"].probe_failures == 1
     assert broker.reconcile() == []
     assert broker.leases["job"].probe_failures == 0
+
+
+class _SharedPool:
+    def __init__(self) -> None:
+        self.requests: dict[str, dict[str, object]] = {}
+        self.states: dict[str, str] = {}
+
+    def submit_task(self, command: str, **kwargs):
+        task_id = str(kwargs["task_id"])
+        self.requests[task_id] = {"command": command, **kwargs}
+        self.states[task_id] = "running"
+        return {"task_id": task_id}
+
+    def probe_task(self, task_id: str):
+        return {"state": self.states.get(task_id, "lost")}
+
+    def collect_task(self, task_id: str):
+        self.states[task_id] = "finished"
+        return {"returncode": 0, "elapsed_sec": 1.0}
+
+    def cancel_task(self, task_id: str):
+        self.states[task_id] = "cancelled"
+        return {"returncode": 130}
+
+
+def _registry(path: Path, *, clock=lambda: 100.0):
+    return SharedGPULeaseRegistry(
+        path,
+        pool_id="shared-test-pool",
+        total_gpus=4,
+        max_share_per_idea=1.0,
+        owner_ttl_sec=10.0,
+        clock=clock,
+    )
+
+
+def _broker(
+    pool: _SharedPool,
+    registry: SharedGPULeaseRegistry,
+    owner: str,
+) -> GPUBroker:
+    return GPUBroker(
+        pool=pool,
+        scheduler=AdaptiveGPUScheduler(
+            total_gpus=4,
+            max_share_per_idea=1.0,
+        ),
+        lease_registry=registry,
+        owner_id=owner,
+        lease_heartbeat_interval_sec=0,
+    )
+
+
+def test_global_registry_prevents_two_controllers_from_overallocating(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "leases.sqlite3"
+    pool = _SharedPool()
+    broker_a = _broker(pool, _registry(path), "controller-a")
+    broker_b = _broker(pool, _registry(path), "controller-b")
+    job_a = _job("idea-a", (3, 3, 3))
+    job_b = _job("idea-b", (2, 3, 3))
+    job_a.command = job_b.command = "true"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        decisions = list(
+            executor.map(
+                lambda pair: pair[0].submit(pair[1], priorities={}),
+                ((broker_a, job_a), (broker_b, job_b)),
+            )
+        )
+
+    assert sum(item.allocated_gpus for item in decisions if item.admitted) <= 4
+    assert sum(1 for item in decisions if item.admitted) == 1
+    assert sum(lease.allocated_gpus for lease in _registry(path).list_leases()) <= 4
+
+
+def test_reconcile_releases_global_capacity_for_another_controller(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "leases.sqlite3"
+    pool = _SharedPool()
+    broker_a = _broker(pool, _registry(path), "controller-a")
+    broker_b = _broker(pool, _registry(path), "controller-b")
+    first = _job("idea-a", (4, 4, 4))
+    second = _job("idea-b", (1, 2, 2))
+    first.command = second.command = "true"
+
+    assert broker_a.submit(first, priorities={}).admitted
+    assert not broker_b.submit(second, priorities={}).admitted
+    pool.states["idea-a-pilot-attempt-01"] = "finished"
+    assert broker_a.reconcile()[0][0] == first.job_id
+    assert broker_b.submit(second, priorities={}).admitted
+
+
+def test_cancel_releases_global_capacity(tmp_path: Path) -> None:
+    path = tmp_path / "leases.sqlite3"
+    pool = _SharedPool()
+    broker_a = _broker(pool, _registry(path), "controller-a")
+    broker_b = _broker(pool, _registry(path), "controller-b")
+    first = _job("idea-a", (4, 4, 4))
+    second = _job("idea-b", (4, 4, 4))
+    first.command = second.command = "true"
+
+    assert broker_a.submit(first, priorities={}).admitted
+    broker_a.cancel(first.job_id)
+    assert broker_b.submit(second, priorities={}).admitted
+
+
+def test_stale_owner_running_task_stays_reserved_until_terminal_probe(
+    tmp_path: Path,
+) -> None:
+    now = [100.0]
+    path = tmp_path / "leases.sqlite3"
+    registry = _registry(path, clock=lambda: now[0])
+    reservation = registry.reserve(
+        owner_id="crashed",
+        task_id="task-a",
+        idea_id="idea-a",
+        job_id="job-a",
+        min_gpus=4,
+        preferred_gpus=4,
+        max_gpus=4,
+    )
+    assert reservation.admitted
+    now[0] = 111.0
+
+    assert registry.reap_stale(lambda _: {"state": "running"}) == []
+    blocked = registry.reserve(
+        owner_id="new",
+        task_id="task-b",
+        idea_id="idea-b",
+        job_id="job-b",
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+    )
+    assert not blocked.admitted
+    now[0] = 122.0
+    assert registry.reap_stale(lambda _: {"state": "finished"}) == ["task-a"]
+    admitted = registry.reserve(
+        owner_id="new",
+        task_id="task-b",
+        idea_id="idea-b",
+        job_id="job-b",
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+    )
+    assert admitted.admitted
+
+
+def test_adopt_transfers_existing_task_accounting_to_new_owner(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path / "leases.sqlite3")
+    assert registry.reserve(
+        owner_id="old",
+        task_id="task-a",
+        idea_id="idea-a",
+        job_id="job-a",
+        min_gpus=2,
+        preferred_gpus=2,
+        max_gpus=2,
+    ).admitted
+
+    registry.adopt(
+        owner_id="new",
+        task_id="task-a",
+        idea_id="idea-a",
+        job_id="job-a",
+        allocated_gpus=2,
+    )
+
+    leases = registry.list_leases()
+    assert len(leases) == 1
+    assert leases[0].owner_id == "new"
+    assert leases[0].allocated_gpus == 2
+
+
+def test_orphaned_reservation_expires_even_if_owner_is_still_heartbeating(
+    tmp_path: Path,
+) -> None:
+    now = [100.0]
+    registry = _registry(
+        tmp_path / "leases.sqlite3",
+        clock=lambda: now[0],
+    )
+    assert registry.reserve(
+        owner_id="controller",
+        task_id="uncertain-submit",
+        idea_id="idea-a",
+        job_id="job-a",
+        min_gpus=4,
+        preferred_gpus=4,
+        max_gpus=4,
+    ).admitted
+    registry.detach("controller", "uncertain-submit")
+    now[0] = 111.0
+    registry.heartbeat("controller")
+
+    assert registry.reap_stale(lambda _: {"state": "lost"}) == [
+        "uncertain-submit"
+    ]
+    assert registry.list_leases() == []
+
+
+def test_registry_rejects_capacity_mismatch(tmp_path: Path) -> None:
+    path = tmp_path / "leases.sqlite3"
+    _registry(path)
+
+    try:
+        SharedGPULeaseRegistry(
+            path,
+            pool_id="shared-test-pool",
+            total_gpus=8,
+            owner_ttl_sec=10.0,
+        )
+    except ValueError as exc:
+        assert "capacity mismatch" in str(exc)
+    else:
+        raise AssertionError("capacity mismatch must fail closed")

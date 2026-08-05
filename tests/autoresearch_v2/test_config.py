@@ -38,3 +38,49 @@ def test_config_rejects_impossible_target() -> None:
                 }
             }
         )
+
+
+def test_execution_smoke_environment_is_validated() -> None:
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "execution": {
+                    "smoke_environment": "GPU_POOL",
+                }
+            }
+        }
+    )
+    assert config.execution.smoke_environment == "gpu_pool"
+
+    with pytest.raises(ValueError, match="smoke_environment"):
+        V2Config.from_mapping(
+            {
+                "autoresearch_v2": {
+                    "execution": {
+                        "smoke_environment": "somewhere",
+                    }
+                }
+            }
+        )
+
+
+def test_attestation_key_cannot_live_in_generated_candidate(
+    tmp_path,
+) -> None:
+    with pytest.raises(ValueError, match="outside Idea candidate"):
+        V2Config.from_mapping(
+            {
+                "autoresearch_v2": {
+                    "state_dir": str(tmp_path),
+                    "execution": {
+                        "attestation_key_file": str(
+                            tmp_path
+                            / "ideas"
+                            / "idea-1"
+                            / "current"
+                            / "controller.key"
+                        ),
+                    },
+                }
+            }
+        )
