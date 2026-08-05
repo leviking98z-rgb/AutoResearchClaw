@@ -15,6 +15,7 @@ from researchclaw.pipeline.stage_impls._experiment_design import (
     _selected_topic_prompt_contract,
 )
 from researchclaw.pipeline.stage_impls._code_generation import (
+    _assess_pilot_envelope,
     _assess_scientific_code_alignment,
 )
 from researchclaw.pipeline.stage_impls._paper_writing import (
@@ -826,6 +827,48 @@ if __name__ == "__main__":
     assert report["aligned"] is True
     assert report["missing_model_execution"] is False
     assert report["missing_dataset_execution"] is False
+
+
+def test_stage10_pilot_gate_rejects_full_scale_gpu_campaign() -> None:
+    selected = _selected_topic()
+    files = {
+        "config.py": """
+from dataclasses import dataclass, field
+
+@dataclass
+class Config:
+    num_gpus_available: int = 4
+    pilot_rounds: int = 10
+    prompts_per_round: int = 512
+    seeds: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
+""",
+    }
+
+    report = _assess_pilot_envelope(files, selected)
+
+    assert report["aligned"] is False
+    assert len(report["reasons"]) == 4
+
+
+def test_stage10_pilot_gate_accepts_bounded_real_pilot() -> None:
+    selected = _selected_topic()
+    files = {
+        "config.py": """
+from dataclasses import dataclass, field
+
+@dataclass
+class Config:
+    num_gpus_available: int = 1
+    pilot_rounds: int = 3
+    prompts_per_round: int = 100
+    seeds: list[int] = field(default_factory=lambda: [0, 1, 2])
+""",
+    }
+
+    report = _assess_pilot_envelope(files, selected)
+
+    assert report["aligned"] is True
+    assert report["reasons"] == []
 
 
 def test_stage10_scientific_gate_does_not_treat_generic_open_as_dataset_load() -> None:

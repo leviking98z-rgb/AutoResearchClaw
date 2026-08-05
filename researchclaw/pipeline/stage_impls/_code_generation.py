@@ -435,6 +435,128 @@ def _assess_scientific_code_alignment(
     }
 
 
+def _assess_pilot_envelope(
+    files: dict[str, str],
+    selected_topic: dict[str, Any],
+) -> dict[str, Any]:
+    """Fail closed when generated code expands a declared cheap pilot.
+
+    Stage 10 may faithfully implement the scientific subject while still
+    turning a one-GPU discriminating pilot into a full campaign.  Detect the
+    most common hard-coded scale expansions before any sandbox/GPU execution.
+    """
+
+    cheap_pilot = str(selected_topic.get("cheap_pilot", "") or "").strip()
+    compute = selected_topic.get("compute")
+    if not isinstance(compute, dict):
+        compute = {}
+    if not cheap_pilot and not compute:
+        return {
+            "aligned": True,
+            "cheap_pilot_declared": False,
+            "reasons": [],
+            "observed": {},
+        }
+
+    combined = "\n\n".join(
+        code for name, code in sorted(files.items()) if name.endswith(".py")
+    )
+
+    def int_assignments(*names: str) -> list[int]:
+        escaped = "|".join(re.escape(name) for name in names)
+        return [
+            int(match.group(1))
+            for match in re.finditer(
+                rf"(?m)^\s*(?:{escaped})\s*(?::[^=\n]+)?=\s*(\d+)\b",
+                combined,
+            )
+        ]
+
+    seed_count = 0
+    for match in re.finditer(
+        r"(?m)^\s*seeds\s*(?::[^=\n]+)?=\s*(?:field\([^=\n]*"
+        r"default_factory\s*=\s*lambda:\s*)?\[([^\]]*)\]",
+        combined,
+    ):
+        seed_count = max(
+            seed_count,
+            len(re.findall(r"(?<![\w.])-?\d+(?![\w.])", match.group(1))),
+        )
+
+    observed = {
+        "gpu_counts": int_assignments(
+            "num_gpus_available",
+            "num_gpus",
+            "gpu_count",
+            "max_gpu",
+        ),
+        "seed_count": seed_count,
+        "iterations": int_assignments(
+            "pilot_rounds",
+            "max_self_improvement_rounds",
+            "max_iterations",
+            "num_iterations",
+        ),
+        "examples": int_assignments(
+            "prompts_per_round",
+            "num_examples",
+            "max_examples",
+            "pilot_examples",
+            "sample_size",
+        ),
+    }
+
+    declared_gpu_count = compute.get("gpu_count", compute.get("max_gpu"))
+    try:
+        declared_gpu_limit = int(declared_gpu_count)
+    except (TypeError, ValueError):
+        declared_gpu_limit = None
+    pilot_lower = cheap_pilot.casefold()
+    if declared_gpu_limit is None and re.search(
+        r"\b(?:one|1)[ -]?gpu\b", pilot_lower
+    ):
+        declared_gpu_limit = 1
+
+    reasons: list[str] = []
+    if (
+        declared_gpu_limit is not None
+        and observed["gpu_counts"]
+        and max(observed["gpu_counts"]) > declared_gpu_limit
+    ):
+        reasons.append(
+            "generated code requests more GPUs than the selected topic's "
+            f"cheap pilot ({max(observed['gpu_counts'])} > "
+            f"{declared_gpu_limit})"
+        )
+    # These are conservative production-canary ceilings.  They allow the
+    # selected topic's usual 3-5 round / 100-200 example pilot while blocking
+    # accidental full-scale campaigns before Stage 11 can apply resources.
+    if observed["seed_count"] > 3:
+        reasons.append(
+            "generated cheap-pilot code hard-codes more than 3 seeds "
+            f"({observed['seed_count']})"
+        )
+    if observed["iterations"] and max(observed["iterations"]) > 5:
+        reasons.append(
+            "generated cheap-pilot code hard-codes more than 5 iterations "
+            f"({max(observed['iterations'])})"
+        )
+    if observed["examples"] and max(observed["examples"]) > 200:
+        reasons.append(
+            "generated cheap-pilot code hard-codes more than 200 examples "
+            f"({max(observed['examples'])})"
+        )
+
+    return {
+        "aligned": not reasons,
+        "cheap_pilot_declared": True,
+        "cheap_pilot": cheap_pilot,
+        "declared_gpu_limit": declared_gpu_limit,
+        "observed": observed,
+        "reasons": reasons,
+    }
+
+
 def _scientific_code_alignment_result(
     stage_dir: Path,
     report: dict[str, Any],
@@ -1126,7 +1248,15 @@ def _execute_code_generation(
             prompts=_pm,
             config=_ca_cfg,
             stage_dir=stage_dir,
-            sandbox_factory=_sandbox_factory,
+            # CodeAgent execution-in-the-loop must not launch a real remote
+            # cluster task before Stage 10's scientific and pilot gates have
+            # accepted the generated project.  Stage 12 remains the only
+            # production experiment execution boundary for cluster modes.
+            sandbox_factory=(
+                None
+                if config.experiment.mode in ("clusterbridge", "clusterbridge_pool")
+                else _sandbox_factory
+            ),
             experiment_config=config.experiment,
             domain_profile=_domain_profile,
             code_search_result=_code_search_result,
@@ -1952,6 +2082,14 @@ def _execute_code_generation(
         stage_dir,
         scientific_report,
     )
+    pilot_report = _assess_pilot_envelope(
+        files,
+        _load_scientific_contract(run_dir, config),
+    )
+    (stage_dir / "pilot_envelope.json").write_text(
+        json.dumps(pilot_report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
     file_list = ", ".join(f"`{f}`" for f in sorted(files.keys()))
     main_validation = validate_code(files.get("main.py", ""))
@@ -1989,6 +2127,7 @@ Multi-file experiment project with {len(files)} file(s): {file_list}
         "experiment/",
         "experiment_spec.md",
         "scientific_code_alignment.json",
+        "pilot_envelope.json",
     ]
     if (stage_dir / "validation_report.md").exists():
         artifacts.append("validation_report.md")
@@ -2001,6 +2140,18 @@ Multi-file experiment project with {len(files)} file(s): {file_list}
             error=scientific_gate.error,
             decision=scientific_gate.decision,
             evidence_refs=scientific_gate.evidence_refs,
+        )
+    if not pilot_report.get("aligned", False):
+        return StageResult(
+            stage=Stage.CODE_GENERATION,
+            status=StageStatus.PAUSED,
+            artifacts=tuple(artifacts),
+            error=(
+                "Generated code expands the selected topic's cheap pilot "
+                "beyond the production envelope"
+            ),
+            decision="pilot_envelope_violation",
+            evidence_refs=("stage-10/pilot_envelope.json",),
         )
 
     # BUG-R6-01: Fail stage if alignment check detected persistent mismatch
