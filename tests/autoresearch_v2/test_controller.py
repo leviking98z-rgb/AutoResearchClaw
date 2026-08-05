@@ -188,6 +188,40 @@ def test_restart_recovers_running_job_to_retry_wait(tmp_path: Path) -> None:
     restarted._pool.shutdown(wait=True)
 
 
+def test_restart_exhaustion_clears_current_job_and_records_reason(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=store,
+        generator=StaticIdeaGenerator([_candidate(2)]),
+        executors={kind: _InterruptedExecutor() for kind in JobKind},
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    controller.tick()
+    job = store.list_jobs(statuses={JobStatus.RUNNING})[0]
+    job.attempt = job.attempt_limit
+    store.save_job(job)
+    controller._pool.shutdown(wait=True)
+
+    restarted = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([]),
+        sleep=lambda _: None,
+    )
+    restarted.initialize()
+    recovered = restarted.store.get_job(job.job_id)
+    idea = restarted.store.get_idea(job.idea_id)
+    assert recovered is not None and recovered.status is JobStatus.FAILED
+    assert idea is not None and idea.status is IdeaStatus.QUARANTINED
+    assert idea.current_job_id == ""
+    assert idea.exit_reason == "controller_interrupted_attempt_limit"
+    restarted._pool.shutdown(wait=True)
+
+
 def test_max_ticks_does_not_schedule_unbounded_downstream_work(
     tmp_path: Path,
 ) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from researchclaw.autoresearch_v2.config import V2Config
@@ -30,6 +31,10 @@ def test_dashboard_exposes_lanes_usage_and_controls(tmp_path: Path) -> None:
         gpu_total=8,
         target_utilization=0.9,
     )
+    store.writer_lock_path.write_text(
+        json.dumps({"pid": 1}),
+        encoding="utf-8",
+    )
     value = dashboard.collect()
     assert value["controller"]["gpu_hours_total"] == 2
     assert value["lanes"]["pilot"][0]["idea_id"] == "idea-dashboard"
@@ -39,6 +44,21 @@ def test_dashboard_exposes_lanes_usage_and_controls(tmp_path: Path) -> None:
     paused = dashboard.collect()
     assert paused["controller"]["status"] == "paused"
     assert paused["controls"]["can_resume"]
+
+
+def test_dashboard_reports_stopped_without_live_controller(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    store.writer_lock_path.write_text(
+        json.dumps({"pid": 999_999_999}),
+        encoding="utf-8",
+    )
+    value = V2Dashboard(store).collect()
+    assert value["controller"]["status"] == "stopped"
+    assert not value["controls"]["can_pause"]
+    assert not value["controls"]["can_stop"]
 
 
 def test_config_contains_shared_workspace_and_infohub_defaults() -> None:
@@ -66,3 +86,17 @@ def test_health_uses_controller_tick_not_unrelated_event(
     store.event("dashboard_control_used")
     health = V2Dashboard(store).health(stale_after_sec=120)
     assert health["status"] == "ok"
+
+
+def test_health_detects_stale_controller_lock(tmp_path: Path) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    store.event("controller_tick")
+    store.writer_lock_path.write_text(
+        json.dumps({"pid": 999_999_999}),
+        encoding="utf-8",
+    )
+    health = V2Dashboard(store).health(stale_after_sec=120)
+    assert health["status"] == "degraded"
+    assert health["writer_lock_state"] == "stale"
+    assert "controller_lock_stale" in health["reasons"]

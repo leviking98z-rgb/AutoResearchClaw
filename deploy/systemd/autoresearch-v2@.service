@@ -1,7 +1,9 @@
 [Unit]
 Description=AutoResearch v2 continuous controller (%i)
-After=network-online.target srv-bridge.service
-Wants=network-online.target srv-bridge.service
+After=network-online.target srv-bridge.service srv-infohub.service
+Wants=network-online.target srv-bridge.service srv-infohub.service
+StartLimitIntervalSec=30min
+StartLimitBurst=30
 
 [Service]
 Type=simple
@@ -21,9 +23,11 @@ KillMode=mixed
 UMask=0077
 NoNewPrivileges=yes
 ProtectSystem=full
-ReadWritePaths=/root/shared/.clusters /data/workspace/autoresearch-stack/AutoResearchClaw-prod/workspace
+ReadWritePaths=/root/shared/.clusters
 LimitNOFILE=524288
 TasksMax=infinity
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

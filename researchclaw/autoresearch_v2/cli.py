@@ -41,7 +41,12 @@ def main(argv: list[str] | None = None) -> int:
             store=store,
             generator=StaticIdeaGenerator([]),
         )
-        print(json.dumps(controller.snapshot(), ensure_ascii=False, indent=2))
+        snapshot = controller.snapshot()
+        writer = store.writer_status()
+        snapshot["controller_process"] = writer
+        if writer["state"] != "live":
+            snapshot["status"] = "stopped"
+        print(json.dumps(snapshot, ensure_ascii=False, indent=2))
         controller._pool.shutdown(wait=True)
         return 0
     if args.command == "ideas":

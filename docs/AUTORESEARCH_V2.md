@@ -14,6 +14,11 @@ or CodeAgent. It directly reuses the stable parts of AutoResearchClaw:
 - persistent InfoHub literature memory;
 - dashboard styling and the existing FastAPI deployment stack.
 
+This is a **reference-and-infrastructure reuse boundary**, not a wrapper around
+the old framework. The reusable adapters can be extracted into standalone
+packages later; replacing or deleting the legacy `pipeline` and `rsi`
+directories does not change the v2 lifecycle or durable state machine.
+
 The durable source of truth is one SQLite database. Every generated or repaired
 project is written to a new immutable attempt directory and is copied to
 `current/` only after deterministic validation succeeds.
@@ -135,6 +140,28 @@ autoresearch-v2-dashboard \
 The dashboard displays the reservoir and five lifecycle lanes, job/attempt
 drill-down, stdout/stderr, decision reasons, token/GPU cost, active GPU jobs,
 pool utilization, events, and pause/resume/stop controls.
+
+## Run unattended with systemd
+
+Install the checked-in units and one instance environment:
+
+```bash
+install -m 0644 deploy/systemd/autoresearch-v2@.service \
+  /etc/systemd/system/
+install -m 0644 deploy/systemd/autoresearch-v2-dashboard@.service \
+  /etc/systemd/system/
+install -d -m 0750 /etc/autoresearch-v2
+install -m 0640 deploy/systemd/autoresearch-v2-canary.env.example \
+  /etc/autoresearch-v2/rsi-canary2.env
+systemctl daemon-reload
+systemctl enable --now autoresearch-v2@rsi-canary2.service
+systemctl enable --now autoresearch-v2-dashboard@rsi-canary2.service
+```
+
+The controller unit runs the dependency installer before every start, restarts
+after failures, and writes stdout/stderr to journald. The dashboard uses the
+controller tick plus the recorded controller PID for health: a stale lock is
+reported as stopped/degraded rather than falsely shown as running.
 
 ## Run locally in simulation
 

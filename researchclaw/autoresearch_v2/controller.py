@@ -1078,6 +1078,9 @@ class V2Controller:
                     if job.status is JobStatus.RETRY_WAIT
                     else IdeaStatus.QUARANTINED
                 )
+                if job.status is JobStatus.FAILED:
+                    idea.current_job_id = ""
+                    idea.exit_reason = "controller_interrupted_attempt_limit"
                 self.store.save_idea(idea)
             self.store.event(
                 "interrupted_job_recovered",

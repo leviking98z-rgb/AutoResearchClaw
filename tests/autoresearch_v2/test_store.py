@@ -74,6 +74,26 @@ def test_failed_candidate_never_mutates_current(tmp_path: Path) -> None:
     )
 
 
+def test_create_attempt_is_not_durable_until_saved(tmp_path: Path) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="idea-test-design",
+        idea_id=idea.idea_id,
+        kind=JobKind.DESIGN,
+    )
+    store.save_job(job)
+
+    attempt = store.create_attempt(job)
+    assert store.get_attempt(attempt.attempt_id) is None
+    assert not store.attempt_dir(attempt).exists()
+
+    store.save_attempt(attempt)
+    assert store.get_attempt(attempt.attempt_id) == attempt
+
+
 def test_commit_replaces_current_atomically_without_stale_files(
     tmp_path: Path,
 ) -> None:

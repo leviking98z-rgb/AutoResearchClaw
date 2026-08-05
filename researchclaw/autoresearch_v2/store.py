@@ -42,10 +42,18 @@ class V2Store:
         self.ideas_root.mkdir(parents=True, exist_ok=True)
         self.control_dir.mkdir(parents=True, exist_ok=True)
         self._recover_filesystem_commits()
+        # The controller may already be doing a large WAL transaction while a
+        # read-only process (dashboard/status) starts.  Setting journal_mode is
+        # a database-wide write and can therefore fail with "database is
+        # locked" even though the schema already exists.  Only bootstrap WAL
+        # before the database exists; normal initializers create/check schema
+        # without trying to rewrite the journal mode.
+        bootstrap = not self.db_path.exists()
         with self.connect() as conn:
+            if bootstrap:
+                conn.execute("PRAGMA journal_mode=WAL;")
             conn.executescript(
                 """
-                PRAGMA journal_mode=WAL;
                 PRAGMA synchronous=NORMAL;
                 PRAGMA foreign_keys=ON;
                 CREATE TABLE IF NOT EXISTS ideas (
@@ -511,7 +519,6 @@ class V2Store:
             job_id=job.job_id,
             number=number,
         )
-        self.save_attempt(attempt)
         return attempt
 
     def save_attempt(self, attempt: AttemptRecord) -> None:
@@ -626,6 +633,32 @@ class V2Store:
 
     def control_requested(self, name: str) -> bool:
         return (self.control_dir / name).is_file()
+
+    def writer_status(self) -> dict[str, Any]:
+        """Return whether the durable controller-lock record names a live PID."""
+
+        try:
+            value = json.loads(
+                self.writer_lock_path.read_text(encoding="utf-8")
+            )
+            pid = int(value.get("pid", 0) or 0)
+        except (
+            FileNotFoundError,
+            OSError,
+            ValueError,
+            TypeError,
+            json.JSONDecodeError,
+        ):
+            return {"state": "missing", "pid": 0}
+        if pid <= 0:
+            return {"state": "stale", "pid": 0}
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return {"state": "stale", "pid": pid}
+        except PermissionError:
+            pass
+        return {"state": "live", "pid": pid}
 
     def idea_dir(self, idea_id: str) -> Path:
         return self.ideas_root / idea_id

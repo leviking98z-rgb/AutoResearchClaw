@@ -18,7 +18,9 @@ RestartSec=10
 UMask=0077
 NoNewPrivileges=yes
 ProtectSystem=full
-ReadWritePaths=/root/shared/.clusters /data/workspace/autoresearch-stack/AutoResearchClaw-prod/workspace
+ReadWritePaths=/root/shared/.clusters
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

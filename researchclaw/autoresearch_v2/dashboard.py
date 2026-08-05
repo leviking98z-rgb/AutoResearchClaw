@@ -104,6 +104,15 @@ class V2Dashboard:
                 jobs_by_status.get(job.status.value, 0) + 1
             )
         last_event = self.store.list_events(limit=1)
+        writer = self.store.writer_status()
+        if self.store.control_requested("stop"):
+            controller_status = "stopping"
+        elif self.store.control_requested("pause"):
+            controller_status = "paused"
+        elif writer["state"] == "live":
+            controller_status = "running"
+        else:
+            controller_status = "stopped"
         return {
             "controller": {
                 "timestamp": (
@@ -111,13 +120,8 @@ class V2Dashboard:
                     if last_event
                     else ""
                 ),
-                "status": (
-                    "stopping"
-                    if self.store.control_requested("stop")
-                    else "paused"
-                    if self.store.control_requested("pause")
-                    else "running"
-                ),
+                "status": controller_status,
+                "process": writer,
                 "ideas_total": len(ideas),
                 "ideas_by_status": ideas_by_status,
                 "jobs_total": len(jobs),
@@ -145,10 +149,13 @@ class V2Dashboard:
             "controls": {
                 "enabled": self.control_enabled,
                 "can_pause": self.control_enabled
+                and writer["state"] == "live"
                 and not self.store.control_requested("pause"),
                 "can_resume": self.control_enabled
+                and writer["state"] == "live"
                 and self.store.control_requested("pause"),
-                "can_stop": self.control_enabled,
+                "can_stop": self.control_enabled
+                and writer["state"] == "live",
             },
         }
 
@@ -172,12 +179,18 @@ class V2Dashboard:
             except (TypeError, ValueError):
                 pass
         stale = age_sec is None or age_sec > stale_after_sec
+        writer = self.store.writer_status()
+        reasons = ["controller_tick_stale"] if stale else []
+        if writer["state"] == "stale":
+            reasons.append("controller_lock_stale")
         return {
-            "status": "degraded" if stale else "ok",
+            "status": "degraded" if reasons else "ok",
             "tick_age_sec": age_sec,
             "stale_after_sec": stale_after_sec,
-            "reasons": ["controller_tick_stale"] if stale else [],
-            "writer_lock_present": self.store.writer_lock_path.exists(),
+            "reasons": reasons,
+            "writer_lock_present": writer["state"] != "missing",
+            "writer_lock_state": writer["state"],
+            "writer_pid": writer["pid"],
         }
 
     def log(
