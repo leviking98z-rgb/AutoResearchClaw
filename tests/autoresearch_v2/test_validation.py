@@ -3,11 +3,429 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from researchclaw.autoresearch_v2.validation import (
     validate_experiment_artifacts,
+    validate_plan,
     validate_research_implementation,
     validate_runtime_against_contract,
 )
+
+
+def _screening_plan() -> dict[str, object]:
+    return {
+        "research_question": "Does treatment improve held-out accuracy?",
+        "hypothesis": "Treatment improves accuracy by at least two points.",
+        "primary_metric": "accuracy_delta",
+        "metric_direction": "maximize",
+        "study_phase": "screening_pilot",
+        "pilot_objective": "Screen for an effect large enough to confirm.",
+        "pilot_claim_scope": "Feasibility evidence only; no final claim.",
+        "unit_of_analysis": "example-seed evaluation",
+        "datasets": [
+            {"name": "development-set", "split_role": "dev"},
+            {"name": "heldout-set", "split_role": "heldout"},
+        ],
+        "models": [{"name": "model-a", "role": "subject"}],
+        "baselines": ["no-self-improvement"],
+        "ablations": ["remove treatment"],
+        "arms": [
+            {"name": "control", "role": "baseline"},
+            {"name": "treatment", "role": "candidate"},
+        ],
+        "pilot": {
+            "max_gpus": 1,
+            "max_examples": 50,
+            "max_seeds": 2,
+            "timeout_sec": 7200,
+        },
+        "promotion_rule": "valid delta >= 0.02",
+        "early_stop_rule": "invalid evidence or delta < 0.02",
+        "estimand": "mean paired accuracy delta across example-seed units",
+        "sample_size_rationale": "100 units per arm resolve 0.01.",
+        "sample_accounting": {
+            "arms": 2,
+            "examples_per_arm": 50,
+            "seeds": 2,
+            "calls_per_example": 1,
+            "total_model_calls": 200,
+        },
+        "effect_threshold": {"value": 0.02, "scale": "proportion"},
+        "workload_budget": {
+            "conditions": 2,
+            "models": 1,
+            "examples": 50,
+            "seeds": 2,
+            "max_new_tokens": 512,
+            "estimated_model_calls": 200,
+        },
+        "decision_table": [
+            {
+                "condition": {"evidence_valid": False},
+                "decision": "retry",
+            },
+            {
+                "condition": {
+                    "evidence_valid": True,
+                    "effect_threshold_met": False,
+                },
+                "decision": "reject",
+            },
+            {
+                "condition": {
+                    "evidence_valid": True,
+                    "effect_threshold_met": True,
+                },
+                "decision": "promote",
+            },
+        ],
+        "confirmatory_followup": (
+            "Freeze adaptation, increase seeds and examples, then evaluate "
+            "once on heldout-set."
+        ),
+        "adaptation": {"datasets": ["development-set"]},
+        "required_runtime_evidence": [
+            "model_loaded",
+            "datasets_loaded",
+            "examples_processed",
+            "gpu_count",
+            "gate_decision",
+            "metrics",
+        ],
+    }
+
+
+def _legacy_plan() -> dict[str, object]:
+    value = _screening_plan()
+    for field in (
+        "study_phase",
+        "pilot_objective",
+        "pilot_claim_scope",
+        "unit_of_analysis",
+        "arms",
+        "sample_accounting",
+        "effect_threshold",
+        "confirmatory_followup",
+        "adaptation",
+    ):
+        value.pop(field)
+    value["datasets"] = ["development-set"]
+    value["models"] = ["model-a"]
+    value["decision_table"] = [
+        {
+            "condition": "all possible metric regions",
+            "decision": "promote",
+        }
+    ]
+    return value
+
+
+def test_screening_pilot_plan_is_deterministically_valid() -> None:
+    assert validate_plan(_screening_plan()) == []
+
+
+def test_current_prompt_plan_shapes_are_accepted() -> None:
+    plan = _screening_plan()
+    plan["datasets"] = [
+        {
+            "name": "screening-set",
+            "split_role": "screening",
+            "used_for_adaptation": False,
+        },
+        {
+            "name": "heldout-set",
+            "split_role": "heldout_confirmatory",
+            "used_for_adaptation": False,
+        },
+    ]
+    plan["decision_table"] = [
+        {
+            "condition": "protocol invalid or required evidence missing",
+            "decision": "retry",
+        },
+        {
+            "condition": (
+                "valid signal meets the preregistered screening threshold"
+            ),
+            "decision": "promote",
+        },
+        {
+            "condition": "valid signal is below the threshold",
+            "decision": "reject",
+        },
+    ]
+    plan["confirmatory_followup"] = {
+        "required": True,
+        "changes": ["more examples", "more seeds", "untouched heldout split"],
+        "claim": "the stronger claim that only Scale may support",
+    }
+
+    assert validate_plan(plan) == []
+
+
+def test_reasonable_legacy_plan_remains_compatible() -> None:
+    assert validate_plan(_legacy_plan()) == []
+
+
+def test_any_phase_aware_field_requires_complete_screening_contract() -> None:
+    plan = _legacy_plan()
+    plan["study_phase"] = "screening_pilot"
+
+    errors = validate_plan(plan)
+
+    assert "missing pilot_objective" in errors
+    assert "missing pilot_claim_scope" in errors
+    assert "missing unit_of_analysis" in errors
+    assert "arms must be a list with at least two entries" in errors
+    assert "sample_accounting must be an object" in errors
+    assert "effect_threshold must be an object" in errors
+    assert "missing confirmatory_followup" in errors
+    assert any(
+        "condition must identify exactly one structured outcome region"
+        in error
+        for error in errors
+    )
+
+
+def test_screening_sample_and_workload_arithmetic_must_agree() -> None:
+    plan = _screening_plan()
+    plan["arms"] = [
+        {"name": "control", "role": "baseline"},
+        {"name": "treatment", "role": "candidate"},
+        {"name": "ablation", "role": "ablation"},
+    ]
+    accounting = plan["sample_accounting"]
+    assert isinstance(accounting, dict)
+    accounting["total_model_calls"] = 199
+    workload = plan["workload_budget"]
+    assert isinstance(workload, dict)
+    workload["estimated_model_calls"] = 201
+    workload["models"] = 2
+
+    errors = validate_plan(plan)
+
+    assert any("does not match len(arms)=3" in error for error in errors)
+    assert any(
+        "total_model_calls=199 does not equal" in error for error in errors
+    )
+    assert any(
+        "estimated_model_calls=201 does not equal" in error
+        for error in errors
+    )
+    assert any(
+        "calls_per_example=1 does not match workload_budget.models=2"
+        in error
+        for error in errors
+    )
+
+
+def test_screening_sample_accounting_cannot_exceed_pilot_caps() -> None:
+    plan = _screening_plan()
+    accounting = plan["sample_accounting"]
+    assert isinstance(accounting, dict)
+    accounting["examples_per_arm"] = 51
+    accounting["seeds"] = 3
+    accounting["total_model_calls"] = 306
+    workload = plan["workload_budget"]
+    assert isinstance(workload, dict)
+    workload["examples"] = 51
+    workload["seeds"] = 3
+    workload["estimated_model_calls"] = 306
+
+    errors = validate_plan(plan)
+
+    assert (
+        "sample_accounting.examples_per_arm=51 exceeds "
+        "pilot.max_examples=50"
+    ) in errors
+    assert (
+        "sample_accounting.seeds=3 exceeds pilot.max_seeds=2"
+    ) in errors
+
+
+@pytest.mark.parametrize(
+    ("scale", "threshold", "fragment"),
+    [
+        ("proportion", 0.005, "pilot sample resolution=0.01"),
+        ("percentage_points", 0.5, "pilot sample resolution=1"),
+        ("absolute", 0.005, "pilot sample resolution=0.01"),
+    ],
+)
+def test_effect_threshold_must_be_resolvable_by_pilot_sample(
+    scale: str,
+    threshold: float,
+    fragment: str,
+) -> None:
+    plan = _screening_plan()
+    plan["effect_threshold"] = {"value": threshold, "scale": scale}
+
+    errors = validate_plan(plan)
+
+    assert any(fragment in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "effect_threshold",
+    [
+        {"value": 0, "scale": "proportion"},
+        {"value": 1.1, "scale": "proportion"},
+        {"value": 101, "scale": "percentage_points"},
+        {"value": 2, "scale": "unknown"},
+        {"value": "0.02", "scale": "proportion"},
+    ],
+)
+def test_effect_threshold_shape_and_scale_are_strict(
+    effect_threshold: dict[str, object],
+) -> None:
+    plan = _screening_plan()
+    plan["effect_threshold"] = effect_threshold
+
+    assert any(
+        error.startswith("invalid effect_threshold")
+        for error in validate_plan(plan)
+    )
+
+
+def test_decision_table_rejects_duplicate_and_missing_regions() -> None:
+    plan = _screening_plan()
+    table = plan["decision_table"]
+    assert isinstance(table, list)
+    table[2] = {
+        "condition": {
+            "evidence_valid": True,
+            "effect_threshold_met": False,
+        },
+        "decision": "promote",
+    }
+
+    errors = validate_plan(plan)
+
+    assert any("duplicate decision_table condition" in error for error in errors)
+    assert any(
+        "duplicate decision_table outcome region "
+        "'below_effect_threshold'" in error
+        for error in errors
+    )
+    assert any(
+        "missing outcome regions: at_or_above_effect_threshold" in error
+        for error in errors
+    )
+
+
+def test_decision_table_numeric_intervals_must_partition_outcomes() -> None:
+    plan = _screening_plan()
+    plan["decision_table"] = [
+        {
+            "condition": {"evidence_valid": False},
+            "decision": "retry",
+        },
+        {
+            "condition": {
+                "operator": "<",
+                "value": 0.02,
+            },
+            "decision": "reject",
+        },
+        {
+            "condition": {
+                "operator": ">=",
+                "value": 0.02,
+            },
+            "decision": "promote",
+        },
+    ]
+    assert validate_plan(plan) == []
+
+    table = plan["decision_table"]
+    assert isinstance(table, list)
+    table[2] = {
+        "condition": {"operator": ">", "value": 0.02},
+        "decision": "promote",
+    }
+    errors = validate_plan(plan)
+    assert any("uncovered boundary" in error for error in errors)
+
+    table[1] = {
+        "condition": {"operator": "<=", "value": 0.02},
+        "decision": "reject",
+    }
+    table[2] = {
+        "condition": {"operator": ">=", "value": 0.02},
+        "decision": "promote",
+    }
+    errors = validate_plan(plan)
+    assert any("overlap at their boundary" in error for error in errors)
+
+
+def test_heldout_dataset_must_not_participate_in_adaptation() -> None:
+    plan = _screening_plan()
+    plan["adaptation"] = {
+        "datasets": ["development-set", "heldout-set"],
+    }
+
+    errors = validate_plan(plan)
+
+    assert any(
+        "heldout data must not participate in adaptation" in error
+        and "heldout-set" in error
+        for error in errors
+    )
+
+
+def test_heldout_dataset_local_adaptation_flag_is_rejected() -> None:
+    plan = _screening_plan()
+    datasets = plan["datasets"]
+    assert isinstance(datasets, list)
+    heldout = datasets[1]
+    assert isinstance(heldout, dict)
+    heldout["used_for_adaptation"] = True
+
+    errors = validate_plan(plan)
+
+    assert any(
+        "heldout dataset 'heldout-set' participates in adaptation" in error
+        for error in errors
+    )
+
+
+@pytest.mark.parametrize(
+    "adaptation_key",
+    [
+        "calibration_datasets",
+        "memory_write_datasets",
+        "prompt_selection_datasets",
+    ],
+)
+def test_heldout_is_isolated_from_all_adaptive_paths(
+    adaptation_key: str,
+) -> None:
+    plan = _screening_plan()
+    plan[adaptation_key] = ["heldout-set"]
+
+    assert any(
+        "heldout data must not participate in adaptation" in error
+        for error in validate_plan(plan)
+    )
+
+
+def test_confirmatory_followup_object_is_structurally_checked() -> None:
+    plan = _screening_plan()
+    plan["confirmatory_followup"] = {
+        "required": False,
+        "changes": [],
+        "claim": "",
+    }
+
+    errors = validate_plan(plan)
+
+    assert "confirmatory_followup.required must be true" in errors
+    assert any(
+        error.startswith("confirmatory_followup.changes") for error in errors
+    )
+    assert any(
+        error.startswith("confirmatory_followup.claim") for error in errors
+    )
 
 
 def test_artifact_metrics_must_be_numeric_and_consistent(

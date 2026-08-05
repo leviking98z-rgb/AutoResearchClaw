@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
+from collections.abc import Callable
 from pathlib import Path
+from types import FrameType
 
 from .config import V2Config
 from .controller import V2Controller
@@ -28,6 +31,35 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("status")
     commands.add_parser("ideas")
     return parser
+
+
+def _install_stop_handlers(
+    controller: V2Controller,
+) -> dict[signal.Signals, Callable[[int, FrameType | None], object] | int | None]:
+    """Translate service/terminal shutdown into cooperative controller stop."""
+
+    previous: dict[
+        signal.Signals,
+        Callable[[int, FrameType | None], object] | int | None,
+    ] = {}
+
+    def request_stop(signum: int, _frame: FrameType | None) -> None:
+        controller.request_stop(reason=signal.Signals(signum).name)
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, request_stop)
+    return previous
+
+
+def _restore_signal_handlers(
+    previous: dict[
+        signal.Signals,
+        Callable[[int, FrameType | None], object] | int | None,
+    ],
+) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -77,7 +109,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         controller = build_production_controller(config)
-    controller.run(max_ticks=args.max_ticks)
+    previous_handlers = _install_stop_handlers(controller)
+    try:
+        controller.run(max_ticks=args.max_ticks)
+    finally:
+        _restore_signal_handlers(previous_handlers)
     return 0
 
 

@@ -14,6 +14,7 @@ from .models import IdeaRecord, stable_id
 
 MIN_IDEA_CANDIDATES = 12
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+_NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
 _SCORE_FIELDS = (
     "novelty",
     "scientific_importance",
@@ -30,6 +31,124 @@ _WEIGHTS = {
     "reproducibility": 0.13,
     "meaningful_result_likelihood": 0.15,
 }
+_PUBLIC_DATASET_MARKERS = (
+    "arc",
+    "bbh",
+    "bigbench",
+    "big-bench",
+    "cifar",
+    "commonsenseqa",
+    "drop",
+    "evalplus",
+    "gsm8k",
+    "hellaswag",
+    "humaneval",
+    "imagenet",
+    "math",
+    "mbpp",
+    "mmlu",
+    "openwebtext",
+    "public",
+    "squad",
+    "truthfulqa",
+    "wikitext",
+)
+_OPEN_MODEL_MARKERS = (
+    "apache",
+    "bloom",
+    "falcon",
+    "gemma",
+    "gpt2",
+    "gpt-2",
+    "huggingface",
+    "llama",
+    "mistral",
+    "mit license",
+    "open weights",
+    "open-weight",
+    "phi",
+    "qwen",
+    "smollm",
+    "t5",
+    "tinyllama",
+)
+_BOUND_MARKERS = (
+    "batch",
+    "budget",
+    "epoch",
+    "example",
+    "gpu",
+    "hour",
+    "iteration",
+    "minute",
+    "sample",
+    "seed",
+    "step",
+    "task",
+    "token",
+)
+_AUTOMATED_MEASUREMENT_MARKERS = (
+    "accuracy",
+    "auc",
+    "benchmark",
+    "brier",
+    "calibration",
+    "cost",
+    "ece",
+    "error",
+    "exact match",
+    "f1",
+    "latency",
+    "loss",
+    "pass@",
+    "precision",
+    "recall",
+    "regression",
+    "reward",
+    "runtime",
+    "score",
+    "throughput",
+    "token",
+)
+_GENERIC_RESOURCE_TOKENS = frozenset(
+    {
+        "a",
+        "an",
+        "benchmark",
+        "corpus",
+        "data",
+        "dataset",
+        "datasets",
+        "model",
+        "models",
+        "private",
+        "proprietary",
+        "public",
+        "test",
+        "unknown",
+    }
+)
+_HUMAN_DEPENDENCY_PATTERNS = (
+    re.compile(
+        r"\b(?:human|expert|clinician|lawyer|teacher|annotator|reviewer)"
+        r"(?:[- ](?:rated|judged|graded|scored|reviewed|annotated|labeled))?\b"
+    ),
+    re.compile(r"\bmanual(?:ly)? (?:review|rating|grading|scoring|annotation|label)"),
+    re.compile(r"\b(?:user|participant) study\b"),
+    re.compile(r"\b(?:irb|ethics approval|institutional review board)\b"),
+    re.compile(r"\b(?:interview|survey|focus group)\b"),
+)
+_HUMAN_REPLACEMENT_MARKERS = (
+    "already labeled",
+    "automatic",
+    "automated",
+    "deterministic",
+    "existing labels",
+    "gold label",
+    "gold labels",
+    "public labels",
+    "released annotations",
+)
 
 
 class IdeaGenerator(Protocol):
@@ -75,6 +194,247 @@ def infer_family(candidate: Mapping[str, Any]) -> str:
         if marker in text:
             return family
     return "other"
+
+
+def _items(candidate: Mapping[str, Any], field: str) -> list[str]:
+    value = candidate.get(field)
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _has_marker(text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in text for marker in markers)
+
+
+def _looks_public_or_concrete(
+    items: list[str],
+    *,
+    markers: tuple[str, ...],
+) -> tuple[bool, bool]:
+    text = " ".join(items).casefold()
+    if _has_marker(text, markers):
+        return True, True
+    # Named resources are still useful design evidence even when this small
+    # deterministic checker does not recognize their catalog entry. Generic
+    # placeholders such as "a dataset" must not receive the same credit.
+    concrete = any(
+        bool(re.search(r"\d|[-_/]", item))
+        or len(_tokens(item) - _GENERIC_RESOURCE_TOKENS) >= 2
+        for item in items
+    )
+    return False, concrete
+
+
+def designability_evidence(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a conservative, deterministic cheap-pilot designability audit.
+
+    The audit rewards positive evidence and only emits hard blockers when
+    multiple independent signals make the proposed pilot non-executable. It is
+    intentionally not a domain whitelist: unfamiliar but concrete resources
+    remain reviewable instead of being rejected by brittle keyword matching.
+    """
+
+    pilot = str(candidate.get("cheap_pilot", "") or "").strip()
+    metric = str(candidate.get("primary_metric", "") or "").strip()
+    datasets = _items(candidate, "datasets")
+    models = _items(candidate, "models")
+    baselines = _items(candidate, "baselines")
+    ablations = _items(candidate, "ablations")
+    implementation = str(
+        candidate.get("implementation_feasibility", "") or ""
+    ).strip()
+    licensing = str(candidate.get("licensing_feasibility", "") or "").strip()
+    pilot_text = f"{pilot} {metric}".casefold()
+    resource_text = " ".join(
+        (*datasets, *models, implementation, licensing)
+    ).casefold()
+    full_text = " ".join(
+        (
+            pilot,
+            metric,
+            *datasets,
+            *models,
+            *baselines,
+            *ablations,
+            implementation,
+            licensing,
+        )
+    ).casefold()
+
+    evidence: list[str] = []
+    concerns: list[str] = []
+    blockers: list[str] = []
+
+    has_metric = bool(metric)
+    has_bound = bool(_NUMBER_RE.search(pilot_text)) and _has_marker(
+        pilot_text, _BOUND_MARKERS
+    )
+    has_automated_measurement = _has_marker(
+        pilot_text, _AUTOMATED_MEASUREMENT_MARKERS
+    )
+    if has_metric and (has_bound or has_automated_measurement):
+        evidence.append("measurable_unit")
+    elif not has_metric:
+        blockers.append("missing_measurable_unit")
+    else:
+        concerns.append("pilot_unit_not_operationalized")
+
+    dataset_public, dataset_concrete = _looks_public_or_concrete(
+        datasets,
+        markers=_PUBLIC_DATASET_MARKERS,
+    )
+    if dataset_public:
+        evidence.append("public_dataset")
+    elif dataset_concrete:
+        evidence.append("concrete_dataset_needs_access_verification")
+        concerns.append("dataset_access_unverified")
+    else:
+        blockers.append("dataset_not_identified")
+
+    model_open, model_concrete = _looks_public_or_concrete(
+        models,
+        markers=_OPEN_MODEL_MARKERS,
+    )
+    if model_open or _has_marker(resource_text, _OPEN_MODEL_MARKERS):
+        evidence.append("open_or_accessible_model")
+    elif model_concrete:
+        evidence.append("concrete_model_needs_access_verification")
+        concerns.append("model_access_unverified")
+    else:
+        blockers.append("model_not_identified")
+
+    baseline_texts = [item.casefold() for item in baselines]
+    no_improvement_controls = (
+        "no-self-improvement",
+        "no self-improvement",
+        "single-pass",
+        "single pass",
+        "fixed policy",
+    )
+    has_independent_baseline = any(
+        _has_marker(item, no_improvement_controls)
+        or _has_marker(
+            item,
+            (
+                "baseline model",
+                "best published",
+                "current method",
+                "heuristic",
+                "prior method",
+                "random policy",
+                "standard method",
+                "state of the art",
+            ),
+        )
+        for item in baseline_texts
+    )
+    if has_independent_baseline:
+        evidence.append("independent_baseline")
+    else:
+        blockers.append("independent_baseline_missing")
+
+    compute = candidate.get("compute")
+    gpu_count: int | None = None
+    wall_clock_hours: float | None = None
+    if isinstance(compute, Mapping):
+        try:
+            gpu_count = int(compute.get("gpu_count", -1))
+            wall_clock_hours = float(compute.get("wall_clock_hours", -1))
+        except (TypeError, ValueError):
+            pass
+    if (
+        gpu_count is None
+        or wall_clock_hours is None
+        or gpu_count < 0
+        or not math.isfinite(wall_clock_hours)
+        or wall_clock_hours <= 0
+    ):
+        blockers.append("compute_budget_invalid")
+    else:
+        gpu_hours = gpu_count * wall_clock_hours
+        if gpu_hours <= 2.0 and gpu_count <= 2:
+            evidence.append("cheap_compute_budget")
+        elif gpu_hours <= 8.0 and gpu_count <= 4:
+            concerns.append("pilot_budget_above_cheap_target")
+        else:
+            concerns.append("pilot_budget_complex")
+            if not has_bound:
+                blockers.append("unbounded_complex_pilot")
+
+    hidden_human_dependencies = sorted(
+        {
+            pattern.pattern
+            for pattern in _HUMAN_DEPENDENCY_PATTERNS
+            if pattern.search(full_text)
+        }
+    )
+    has_human_replacement = _has_marker(full_text, _HUMAN_REPLACEMENT_MARKERS)
+    if hidden_human_dependencies and not has_human_replacement:
+        concerns.append("hidden_human_or_review_dependency")
+        # Human studies or approvals are not a cheap autonomous pilot unless a
+        # bounded, already-released annotation source replaces live recruitment.
+        if not has_bound or any(
+            marker in full_text
+            for marker in (
+                "participant study",
+                "user study",
+                "irb",
+                "ethics approval",
+                "institutional review board",
+            )
+        ):
+            blockers.append("external_human_dependency")
+    elif hidden_human_dependencies:
+        evidence.append("human_labels_already_available")
+
+    raw_penalty = 0.0
+    concern_penalties = {
+        "pilot_unit_not_operationalized": 0.45,
+        "dataset_access_unverified": 0.20,
+        "model_access_unverified": 0.20,
+        "pilot_budget_above_cheap_target": 0.45,
+        "pilot_budget_complex": 0.90,
+        "hidden_human_or_review_dependency": 0.90,
+    }
+    blocker_penalties = {
+        "missing_measurable_unit": 1.25,
+        "dataset_not_identified": 1.00,
+        "model_not_identified": 1.00,
+        "independent_baseline_missing": 1.25,
+        "compute_budget_invalid": 1.25,
+        "unbounded_complex_pilot": 1.25,
+        "external_human_dependency": 1.50,
+    }
+    raw_penalty += sum(concern_penalties.get(item, 0.25) for item in concerns)
+    raw_penalty += sum(blocker_penalties.get(item, 0.75) for item in blockers)
+    penalty = round(min(3.0, raw_penalty), 4)
+    return {
+        "version": 1,
+        "designable": not blockers,
+        "penalty": penalty,
+        "evidence": sorted(set(evidence)),
+        "concerns": sorted(set(concerns)),
+        "blockers": sorted(set(blockers)),
+        "facts": {
+            "gpu_count": gpu_count,
+            "wall_clock_hours": wall_clock_hours,
+            "gpu_hours": (
+                round(gpu_count * wall_clock_hours, 4)
+                if gpu_count is not None
+                and wall_clock_hours is not None
+                and gpu_count >= 0
+                and math.isfinite(wall_clock_hours)
+                and wall_clock_hours > 0
+                else None
+            ),
+            "datasets": datasets,
+            "models": models,
+            "baselines": baselines,
+            "pilot_has_numeric_bound": has_bound,
+            "hidden_human_signals": len(hidden_human_dependencies),
+        },
+    }
 
 
 def validate_candidate(candidate: Mapping[str, Any]) -> list[str]:
@@ -148,12 +508,24 @@ def weighted_score(candidate: Mapping[str, Any]) -> float:
     scores = candidate["scores"]
     positive = sum(float(scores[name]) * _WEIGHTS[name] for name in _SCORE_FIELDS)
     risk = float(scores["risk"]) * 0.12
-    return round(max(0.0, min(10.0, positive - risk)), 4)
+    designability = candidate.get("designability")
+    if not isinstance(designability, Mapping):
+        designability = designability_evidence(candidate)
+    try:
+        penalty = float(designability.get("penalty", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        penalty = 0.0
+    if not math.isfinite(penalty) or penalty < 0:
+        penalty = 0.0
+    return round(max(0.0, min(10.0, positive - risk - penalty)), 4)
 
 
 def candidate_to_idea(candidate: Mapping[str, Any]) -> IdeaRecord:
     title = str(candidate["title"]).strip()
-    score = weighted_score(candidate)
+    enriched = dict(candidate)
+    enriched["designability"] = designability_evidence(candidate)
+    score = weighted_score(enriched)
+    enriched["weighted_score"] = score
     return IdeaRecord(
         idea_id=stable_id(
             str(candidate.get("id", "") or title),
@@ -165,7 +537,7 @@ def candidate_to_idea(candidate: Mapping[str, Any]) -> IdeaRecord:
             candidate["falsifiable_hypothesis"]
         ).strip(),
         primary_metric=str(candidate["primary_metric"]).strip(),
-        candidate={**dict(candidate), "weighted_score": score},
+        candidate=enriched,
         score=score,
         family=infer_family(candidate),
         priority=round(score / 10.0, 4),
@@ -204,6 +576,21 @@ class IdeaAdmission:
         errors = validate_candidate(idea.candidate)
         if errors:
             return AdmissionDecision(False, "malformed:" + ";".join(errors))
+        designability = idea.candidate.get("designability")
+        if not isinstance(designability, Mapping):
+            designability = designability_evidence(idea.candidate)
+            idea.candidate["designability"] = designability
+        blockers = designability.get("blockers", [])
+        if (
+            designability.get("designable") is False
+            or isinstance(blockers, list)
+            and blockers
+        ):
+            reason = ",".join(str(item) for item in blockers if str(item))
+            return AdmissionDecision(
+                False,
+                "not_designable:" + (reason or "deterministic_gate"),
+            )
         if idea.score < self.minimum_score:
             return AdmissionDecision(False, "score_below_threshold")
         if self.require_novelty_evidence:

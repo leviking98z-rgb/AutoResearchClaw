@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .gates import DecisionGate
+from .gates import DecisionGate, design_preflight
 from .llm import StructuredRole
 from .models import (
     AttemptRecord,
@@ -82,9 +82,40 @@ class DesignJobExecutor:
         store: V2Store,
     ) -> JobOutcome:
         started = time.monotonic()
+        preflight = (
+            design_preflight(idea)
+            if self.decision_gate is not None
+            else None
+        )
+        if preflight is not None:
+            attempt.validation = {
+                "ok": False,
+                "decision_gate": preflight.raw or {},
+                "preflight": True,
+            }
+            attempt.status = AttemptStatus.REJECTED
+            attempt.error = preflight.reason
+            store.save_attempt(attempt)
+            return JobOutcome(
+                True,
+                "reject",
+                preflight.reason,
+                {"decision_gate": preflight.raw or {}, "preflight": True},
+                elapsed_sec=time.monotonic() - started,
+            )
         candidate = store.prepare_candidate(attempt)
+        previous_plan, previous_review = self._previous_attempt_context(
+            job=job,
+            attempt=attempt,
+            store=store,
+        )
         result = self.role.call(
-            self._prompt(idea, prior_failure=job.result),
+            self._prompt(
+                idea,
+                prior_failure=job.result,
+                previous_plan=previous_plan,
+                previous_review=previous_review,
+            ),
             max_tokens=10000,
             temperature=0.25,
         )
@@ -137,53 +168,153 @@ class DesignJobExecutor:
         )
 
     @staticmethod
+    def _previous_attempt_context(
+        *,
+        job: JobRecord,
+        attempt: AttemptRecord,
+        store: V2Store,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Load the immediately preceding rejected design for targeted repair."""
+
+        if attempt.number <= 1:
+            return {}, {}
+        previous = [
+            item
+            for item in store.list_attempts(job_id=job.job_id)
+            if item.number < attempt.number
+        ]
+        if not previous:
+            return {}, {}
+        prior = max(previous, key=lambda item: item.number)
+        candidate = store.attempt_dir(prior) / "candidate"
+        return (
+            _read_json(candidate / "plan.json"),
+            _read_json(candidate / "design_review.json"),
+        )
+
+    @staticmethod
     def _prompt(
         idea: IdeaRecord,
         *,
         prior_failure: Mapping[str, Any],
+        previous_plan: Mapping[str, Any] | None = None,
+        previous_review: Mapping[str, Any] | None = None,
     ) -> str:
+        previous_plan = dict(previous_plan or {})
+        previous_review = dict(previous_review or {})
+        repair = ""
+        if previous_plan:
+            repair = f"""
+This is a REVISION attempt. Do not design a different study and do not start
+over. Preserve the Idea, primary estimand, public model, benchmark, and all
+parts of the prior plan that were not criticized. Edit the prior plan
+point-by-point so every required change in the review is resolved. If two
+review requests conflict with the screening budget, narrow the pilot claim
+rather than pretending the pilot is a confirmatory study.
+
+PRIOR PLAN TO EDIT:
+{json.dumps(previous_plan, ensure_ascii=False, indent=2)[:18000]}
+
+PRIOR DESIGN REVIEW TO RESOLVE:
+{json.dumps(previous_review, ensure_ascii=False, indent=2)[:10000]}
+"""
         return f"""\
-Create an executable preregistered experiment plan for this Idea:
+Create an executable SCREENING-PILOT plan for this Idea:
 {json.dumps(idea.candidate, ensure_ascii=False, indent=2)}
 
 Prior failed attempt feedback, if any:
 {json.dumps(dict(prior_failure), ensure_ascii=False, indent=2)[:8000]}
+{repair}
 
 Return exactly:
 {{
+  "study_phase": "screening_pilot",
+  "pilot_objective": "one sentence: feasibility, protocol validation, or coarse go/no-go signal",
+  "pilot_claim_scope": "what this small pilot can and cannot conclude",
   "research_question": "...",
   "hypothesis": "...",
   "primary_metric": "...",
   "metric_direction": "maximize|minimize",
-  "datasets": [{{"name": "...", "split_role": "dev|heldout"}}],
+  "unit_of_analysis": "one paired example, task, modification, or stream",
+  "datasets": [
+    {{
+      "name": "one public benchmark development partition",
+      "split_role": "dev",
+      "used_for_adaptation": true
+    }},
+    {{
+      "name": "one public benchmark screening-evaluation partition",
+      "split_role": "heldout",
+      "used_for_adaptation": false
+    }}
+  ],
   "models": [{{"name": "...", "role": "subject|verifier"}}],
   "baselines": ["include no-self-improvement"],
   "ablations": ["..."],
+  "arms": [
+    {{"name": "treatment", "role": "treatment"}},
+    {{"name": "no-self-improvement", "role": "control"}}
+  ],
   "pilot": {{
-    "max_gpus": 1, "max_examples": 50, "max_seeds": 1,
+    "max_gpus": 1, "max_examples": 32, "max_seeds": 1,
     "timeout_sec": 7200
   }},
-  "promotion_rule": "numeric evidence threshold",
-  "early_stop_rule": "futility/invalidity threshold",
+  "sample_accounting": {{
+    "arms": 2, "examples_per_arm": 32, "seeds": 1,
+    "calls_per_example": 1, "total_model_calls": 64
+  }},
+  "effect_threshold": {{
+    "value": 0.15, "scale": "proportion"
+  }},
+  "promotion_rule": "coarse screening threshold with paired uncertainty",
+  "early_stop_rule": "disjoint futility or protocol-invalidity threshold",
   "estimand": "exact unit, treatment contrast and aggregation",
-  "sample_size_rationale": "minimum detectable effect or precision target",
+  "sample_size_rationale": "screening precision/resolution, not confirmatory power",
   "workload_budget": {{
-    "conditions": 2, "models": 1, "examples": 50, "seeds": 1,
-    "max_new_tokens": 512, "estimated_model_calls": 100
+    "conditions": 2, "models": 1, "examples": 32, "seeds": 1,
+    "max_new_tokens": 512, "estimated_model_calls": 64
   }},
   "decision_table": [
-    {{"condition": "all possible metric regions", "decision": "promote|retry|reject"}}
+    {{
+      "condition": {{"evidence_valid": false}},
+      "decision": "retry"
+    }},
+    {{
+      "condition": {{
+        "evidence_valid": true,
+        "effect_threshold_met": true
+      }},
+      "decision": "promote"
+    }},
+    {{
+      "condition": {{
+        "evidence_valid": true,
+        "effect_threshold_met": false
+      }},
+      "decision": "reject"
+    }}
   ],
+  "confirmatory_followup": "At Scale use more examples, multiple independent seeds, and a new untouched confirmatory split to test the stronger paper-level claim.",
   "required_runtime_evidence": [
     "model_loaded", "datasets_loaded", "examples_processed",
     "gpu_count", "gate_decision", "metrics"
   ]
 }}
-The plan must be answerable by the cheap pilot. Keep held-out data isolated.
+This phase asks whether the protocol runs and whether a coarse signal merits
+Scale. It must NOT claim that 16-50 examples and one seed establish a
+paper-level confirmatory effect. Use only 2-3 primary arms, one public
+benchmark initially, 16-50 examples, and one seed. Use paired outcomes and
+report uncertainty. Keep held-out confirmatory data completely isolated from
+prompting, memory writing, calibration, selection, and adaptation.
 Use the Idea's real closest_papers and novelty evidence; never call an empty
 search result proof of novelty. Make metrics comparable across every arm,
 cover all possible outcomes in the decision table, and ensure the workload
-arithmetic fits the stated GPU and wall-clock budget.
+arithmetic is exact: arms × examples_per_arm × seeds × calls_per_example must
+equal total_model_calls and workload_budget.estimated_model_calls. In this
+contract workload_budget.models means model calls per arm-example-seed unit,
+not the count of distinct model identities. Do not set
+an effect threshold below the metric's finite-sample resolution. A promoted
+pilot still requires the confirmatory_followup at Scale.
 """
 
 

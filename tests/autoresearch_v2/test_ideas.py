@@ -3,6 +3,7 @@ from __future__ import annotations
 from researchclaw.autoresearch_v2.ideas import (
     IdeaAdmission,
     candidate_to_idea,
+    designability_evidence,
     evidence_adjusted_score,
     title_similarity,
     validate_candidate,
@@ -56,6 +57,15 @@ def test_high_quality_candidate_validates_and_scores() -> None:
     assert idea.score > 8
     assert idea.priority > 0.8
     assert idea.family == "calibration"
+    assert idea.candidate["designability"]["designable"] is True
+    assert idea.candidate["designability"]["penalty"] == 0
+    assert {
+        "measurable_unit",
+        "public_dataset",
+        "open_or_accessible_model",
+        "independent_baseline",
+        "cheap_compute_budget",
+    } <= set(idea.candidate["designability"]["evidence"])
 
 
 def test_candidate_without_control_is_rejected() -> None:
@@ -128,3 +138,87 @@ def test_missing_novelty_evidence_reduces_self_reported_score() -> None:
         "max_similarity": 0.0,
     }
     assert evidence_adjusted_score(idea) < original
+
+
+def test_designability_penalizes_reviewable_budget_and_access_uncertainty() -> None:
+    candidate = _candidate()
+    candidate["datasets"] = ["Acme Reasoning Suite"]
+    candidate["models"] = ["Acme Research Model"]
+    candidate["compute"] = {"gpu_count": 2, "wall_clock_hours": 3}
+    candidate["cheap_pilot"] = (
+        "Run 3 seeds over 100 examples and report exact-match accuracy."
+    )
+
+    evidence = designability_evidence(candidate)
+    idea = candidate_to_idea(candidate)
+
+    assert evidence["designable"] is True
+    assert evidence["blockers"] == []
+    assert {
+        "dataset_access_unverified",
+        "model_access_unverified",
+        "pilot_budget_above_cheap_target",
+    } <= set(evidence["concerns"])
+    assert evidence["penalty"] > 0
+    assert idea.score < candidate["scores"]["novelty"]
+    assert IdeaAdmission(minimum_score=0).decide(idea, existing=[]).admitted
+
+
+def test_admission_rejects_pilot_without_measurable_resources_or_control() -> None:
+    candidate = _candidate()
+    candidate["datasets"] = ["data"]
+    candidate["models"] = ["model"]
+    candidate["primary_metric"] = ""
+    candidate["baselines"] = ["our method", "remove one module ablation"]
+    idea = candidate_to_idea(candidate)
+
+    decision = IdeaAdmission(minimum_score=0).decide(idea, existing=[])
+
+    assert not decision.admitted
+    assert decision.reason.startswith("malformed:missing primary_metric")
+    blockers = set(idea.candidate["designability"]["blockers"])
+    assert {
+        "missing_measurable_unit",
+        "dataset_not_identified",
+        "model_not_identified",
+        "independent_baseline_missing",
+    } <= blockers
+
+
+def test_admission_rejects_unbounded_human_dependent_complex_pilot() -> None:
+    candidate = _candidate()
+    candidate["cheap_pilot"] = (
+        "Recruit participants for a user study and have expert reviewers judge "
+        "whether each answer is useful."
+    )
+    candidate["primary_metric"] = "expert reviewer preference"
+    candidate["compute"] = {"gpu_count": 8, "wall_clock_hours": 8}
+    idea = candidate_to_idea(candidate)
+
+    decision = IdeaAdmission(minimum_score=0).decide(idea, existing=[])
+
+    assert not decision.admitted
+    blockers = set(idea.candidate["designability"]["blockers"])
+    assert "external_human_dependency" in blockers
+    assert "unbounded_complex_pilot" in blockers
+    assert "hidden_human_or_review_dependency" in set(
+        idea.candidate["designability"]["concerns"]
+    )
+
+
+def test_released_human_labels_do_not_trigger_brittle_human_rejection() -> None:
+    candidate = _candidate()
+    candidate["datasets"] = [
+        "Public Helpfulness Benchmark with released human labels"
+    ]
+    candidate["cheap_pilot"] = (
+        "Automatically score 100 examples against the released annotations."
+    )
+    candidate["primary_metric"] = "accuracy against existing labels"
+    evidence = designability_evidence(candidate)
+    idea = candidate_to_idea(candidate)
+
+    assert evidence["designable"] is True
+    assert "external_human_dependency" not in evidence["blockers"]
+    assert "human_labels_already_available" in evidence["evidence"]
+    assert IdeaAdmission(minimum_score=0).decide(idea, existing=[]).admitted

@@ -159,9 +159,13 @@ systemctl enable --now autoresearch-v2-dashboard@rsi-canary2.service
 ```
 
 The controller unit runs the dependency installer before every start, restarts
-after failures, and writes stdout/stderr to journald. The dashboard uses the
-controller tick plus the recorded controller PID for health: a stale lock is
-reported as stopped/degraded rather than falsely shown as running.
+after failures, translates `SIGTERM`/`SIGINT` into a cooperative stop, drains
+already admitted local model calls, and writes stdout/stderr to journald.
+Infrastructure interruptions are recorded but refunded from the scientific
+attempt budget. `TimeoutStopSec=15min` allows long in-flight model calls to
+finish before systemd escalates. The dashboard uses the controller tick plus
+the recorded controller PID for health: a stale lock is reported as
+stopped/degraded rather than falsely shown as running.
 
 ## Run locally in simulation
 
@@ -203,9 +207,12 @@ The v2 suite covers:
 - SQLite/WAL persistence;
 - immutable attempts and atomic promotion;
 - high-quality candidate schema and diversity admission;
+- deterministic designability scoring before active-slot admission;
+- phase-aware screening-pilot contracts and finite-sample arithmetic gates;
+- Design retries that edit the previous plan against its prior review;
 - multiple Ideas progressing concurrently;
 - bounded retry and failure isolation;
-- interrupted job recovery;
+- graceful stop plus interrupted job recovery without scientific retry loss;
 - fair-share/malleable GPU allocation;
 - three independent Ideas filling one six-GPU test pool;
 - strict GPU artifact validation and failed-attempt isolation;

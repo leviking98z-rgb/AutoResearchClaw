@@ -157,7 +157,9 @@ def test_bounded_retry_quarantines_one_idea_without_stopping_others(
     )
 
 
-def test_restart_recovers_running_job_to_retry_wait(tmp_path: Path) -> None:
+def test_restart_recovers_running_job_without_spending_retry_budget(
+    tmp_path: Path,
+) -> None:
     store = V2Store(tmp_path)
     controller = V2Controller(
         config=_config(tmp_path),
@@ -182,13 +184,16 @@ def test_restart_recovers_running_job_to_retry_wait(tmp_path: Path) -> None:
     recovered = restarted.store.get_job(running[0].job_id)
     assert recovered is not None
     assert recovered.status is JobStatus.RETRY_WAIT
+    assert recovered.attempt == 0
+    assert recovered.attempt_id == ""
     attempt = restarted.store.get_attempt(running[0].attempt_id)
     assert attempt is not None
     assert attempt.status.value == "failed"
+    assert attempt.error == "controller_interrupted"
     restarted._pool.shutdown(wait=True)
 
 
-def test_restart_exhaustion_clears_current_job_and_records_reason(
+def test_repeated_restart_interruption_never_quarantines_or_spends_budget(
     tmp_path: Path,
 ) -> None:
     store = V2Store(tmp_path)
@@ -203,23 +208,78 @@ def test_restart_exhaustion_clears_current_job_and_records_reason(
     controller.tick()
     job = store.list_jobs(statuses={JobStatus.RUNNING})[0]
     job.attempt = job.attempt_limit
+    attempt = store.get_attempt(job.attempt_id)
+    assert attempt is not None
+    attempt.number = job.attempt_limit
+    store.save_attempt(attempt)
     store.save_job(job)
     controller._pool.shutdown(wait=True)
 
-    restarted = V2Controller(
+    for _ in range(3):
+        restarted = V2Controller(
+            config=_config(tmp_path),
+            store=V2Store(tmp_path),
+            generator=StaticIdeaGenerator([]),
+            executors={
+                kind: _InterruptedExecutor()
+                for kind in JobKind
+            },
+            sleep=lambda _: None,
+        )
+        restarted.initialize()
+        recovered = restarted.store.get_job(job.job_id)
+        idea = restarted.store.get_idea(job.idea_id)
+        assert recovered is not None
+        assert recovered.status is JobStatus.RETRY_WAIT
+        assert recovered.attempt == job.attempt_limit - 1
+        assert idea is not None
+        assert idea.status is IdeaStatus.DESIGNING
+        assert idea.current_job_id == job.job_id
+        assert idea.exit_reason == ""
+
+        # Simulate another process interruption after the refunded attempt is
+        # re-dispatched. Every restart must preserve the same scientific count.
+        restarted.tick()
+        running = restarted.store.get_job(job.job_id)
+        assert running is not None and running.status is JobStatus.RUNNING
+        assert running.attempt == job.attempt_limit
+        job = running
+        restarted._pool.shutdown(wait=True)
+
+
+def test_request_stop_prevents_new_admission_and_drains_started_work(
+    tmp_path: Path,
+) -> None:
+    controller = V2Controller(
         config=_config(tmp_path),
         store=V2Store(tmp_path),
-        generator=StaticIdeaGenerator([]),
+        generator=StaticIdeaGenerator([_candidate(i) for i in range(8)]),
+        executors={kind: _SlowExecutor() for kind in JobKind},
         sleep=lambda _: None,
     )
-    restarted.initialize()
-    recovered = restarted.store.get_job(job.job_id)
-    idea = restarted.store.get_idea(job.idea_id)
-    assert recovered is not None and recovered.status is JobStatus.FAILED
-    assert idea is not None and idea.status is IdeaStatus.QUARANTINED
-    assert idea.current_job_id == ""
-    assert idea.exit_reason == "controller_interrupted_attempt_limit"
-    restarted._pool.shutdown(wait=True)
+    controller.initialize()
+    controller.tick()
+    started = {
+        job.job_id
+        for job in controller.store.list_jobs()
+        if job.status is JobStatus.RUNNING
+    }
+    assert started
+
+    controller.request_stop(reason="SIGTERM")
+    controller.tick()
+    assert {
+        job.job_id
+        for job in controller.store.list_jobs()
+        if job.status in {JobStatus.READY, JobStatus.RUNNING}
+    } <= started
+    controller._drain_local_futures()
+    assert all(
+        job.status is JobStatus.SUCCEEDED
+        for job in controller.store.list_jobs()
+        if job.job_id in started
+    )
+    controller.close()
 
 
 def test_max_ticks_does_not_schedule_unbounded_downstream_work(

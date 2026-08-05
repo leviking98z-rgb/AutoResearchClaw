@@ -134,8 +134,28 @@ IDEA:
 PLAN:
 {json.dumps(dict(plan), ensure_ascii=False, indent=2)[:24000]}
 
-Check novelty evidence, falsifiability, controls, leakage, metric alignment,
-cheap-pilot discrimination, and compute feasibility.
+This plan is explicitly a SCREENING PILOT, not the confirmatory paper study.
+Judge whether it can produce a valid, inexpensive go/no-go decision,
+validate the protocol, or expose a coarse signal worth scaling. Do not require
+16-50 examples or one seed to precisely establish the eventual paper-level
+effect. Instead require:
+- a precise unit of analysis and paired/comparable outcomes;
+- 2-3 primary arms with an independent no-self-improvement control;
+- exact, internally consistent sample/call arithmetic;
+- a threshold no finer than finite-sample metric resolution;
+- disjoint promotion, retry/invalidity, and rejection/futility regions;
+- no adaptation, calibration, selection, or memory writing on heldout data;
+- an explicit confirmatory follow-up with more examples/seeds at Scale;
+- claims explicitly limited to screening feasibility or a coarse signal.
+
+Still fail closed on leakage, missing controls, impossible compute, ambiguous
+outcomes, manipulated metrics, or a pilot framed as confirmatory evidence.
+Check novelty evidence, falsifiability, controls, metric alignment, screening
+discrimination, and compute feasibility. Grounded closest-paper evidence has
+already passed deterministic preflight: do not require an exhaustive
+bibliographic review merely to run a screening pilot. Treat incomplete
+coverage as a recorded risk/follow-up unless the supplied evidence reveals a
+direct duplicate or the claimed gap is contradicted.
 
 Return:
 {{
@@ -276,3 +296,9 @@ def _design_preflight(idea: IdeaRecord) -> GateVerdict | None:
         ),
         raw=raw,
     )
+
+
+def design_preflight(idea: IdeaRecord) -> GateVerdict | None:
+    """Public deterministic preflight used before spending a worker-model call."""
+
+    return _design_preflight(idea)

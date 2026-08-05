@@ -111,6 +111,7 @@ class V2Controller:
         )
         self._running: dict[str, _Running] = {}
         self._stop = False
+        self._stop_reason = ""
         self._initialized = False
         self._tick_count = 0
 
@@ -178,13 +179,27 @@ class V2Controller:
             )
             self._collect_finished()
 
-    def request_stop(self) -> None:
+    def request_stop(self, reason: str = "requested") -> None:
+        if self._stop:
+            return
         self._stop = True
+        self._stop_reason = str(reason or "requested")
+        if self._initialized:
+            self.store.event(
+                "controller_stop_requested",
+                reason=self._stop_reason,
+                running_futures=len(self._running),
+                running_gpu_jobs=(
+                    len(self.gpu_broker.leases)
+                    if self.gpu_broker is not None
+                    else 0
+                ),
+            )
 
     def tick(self) -> dict[str, Any]:
         self._tick_count += 1
         if self.store.control_requested("stop"):
-            self._stop = True
+            self.request_stop(reason="control_stop")
         self._collect_finished()
         self._collect_gpu_finished()
         self._enforce_liveness_budgets()
@@ -1047,16 +1062,8 @@ class V2Controller:
                     status=idea.status.value,
                 )
                 continue
-            job.status = (
-                JobStatus.RETRY_WAIT
-                if job.attempt < job.attempt_limit
-                else JobStatus.FAILED
-            )
-            if job.status is JobStatus.RETRY_WAIT:
-                job.retry_not_before = datetime.now(UTC).isoformat(
-                    timespec="milliseconds"
-                )
-            self.store.save_job(job)
+            refunded = False
+            interrupted_attempt_id = job.attempt_id
             if job.attempt_id:
                 attempt = self.store.get_attempt(job.attempt_id)
                 if (
@@ -1072,21 +1079,37 @@ class V2Controller:
                     attempt.error = "controller_interrupted"
                     attempt.finished_at = utc_now()
                     self.store.save_attempt(attempt)
+                    # The process disappeared before a scientific outcome was
+                    # observed. Keep the audit row, but refund this attempt so
+                    # repeated service restarts cannot exhaust retry budget.
+                    if job.attempt == attempt.number:
+                        job.attempt = max(0, job.attempt - 1)
+                        refunded = True
+            job.status = JobStatus.RETRY_WAIT
+            job.retry_not_before = datetime.now(UTC).isoformat(
+                timespec="milliseconds"
+            )
+            job.attempt_id = ""
+            job.submitted_task_id = ""
+            job.result = {
+                **job.result,
+                "infrastructure_interruption": "controller_interrupted",
+                "interrupted_attempt_id": interrupted_attempt_id,
+                "attempt_refunded": refunded,
+            }
+            self.store.save_job(job)
             if idea is not None:
-                idea.status = (
-                    _STATUS_FOR_KIND[job.kind]
-                    if job.status is JobStatus.RETRY_WAIT
-                    else IdeaStatus.QUARANTINED
-                )
-                if job.status is JobStatus.FAILED:
-                    idea.current_job_id = ""
-                    idea.exit_reason = "controller_interrupted_attempt_limit"
+                idea.status = _STATUS_FOR_KIND[job.kind]
+                idea.exit_reason = ""
                 self.store.save_idea(idea)
             self.store.event(
                 "interrupted_job_recovered",
                 idea_id=job.idea_id,
                 job_id=job.job_id,
                 status=job.status.value,
+                interrupted_attempt_id=interrupted_attempt_id,
+                attempt_refunded=refunded,
+                scientific_attempt=job.attempt,
             )
 
     def _budget_block_reason(
