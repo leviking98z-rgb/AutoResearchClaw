@@ -197,6 +197,53 @@ def test_rc_config_parses_role_model_routing(tmp_path: Path):
     assert config.llm.roles["coding_engineer"].fallback_models is None
 
 
+def test_rc_config_parses_three_model_tiers(tmp_path: Path):
+    data = _valid_config_data()
+    data["llm"]["model_tiers"] = {
+        "decision": {
+            "model": "codebuddy/gpt-5.6-sol",
+            "fallback_models": [],
+        },
+        "worker": "codebuddy/claude-sonnet-5",
+        "utility": {"model": "codebuddy/claude-haiku-4.5"},
+    }
+
+    config = RCConfig.from_dict(data, project_root=tmp_path, check_paths=False)
+
+    assert config.llm.model_tiers.decision.model == "codebuddy/gpt-5.6-sol"
+    assert config.llm.model_tiers.decision.fallback_models == ()
+    assert config.llm.model_tiers.worker.model == "codebuddy/claude-sonnet-5"
+    assert config.llm.model_tiers.utility.model == "codebuddy/claude-haiku-4.5"
+
+
+@pytest.mark.parametrize(
+    ("tiers", "expected"),
+    [
+        ([], "llm.model_tiers must be a mapping"),
+        (
+            {"decision": {"fallback_models": ["fallback-only"]}},
+            "llm.model_tiers.decision.model is required",
+        ),
+        (
+            {"worker": {"model": "x", "fallback_models": "y"}},
+            "llm.model_tiers.worker.fallback_models must be a list",
+        ),
+        (
+            {"extra": {"model": "x"}},
+            "Unknown llm.model_tiers.extra",
+        ),
+    ],
+)
+def test_model_tier_validation(tiers: object, expected: str) -> None:
+    data = _valid_config_data()
+    data["llm"]["model_tiers"] = tiers
+
+    result = validate_config(data, check_paths=False)
+
+    assert result.ok is False
+    assert expected in result.errors
+
+
 @pytest.mark.parametrize("entry", [0, 24, "5", 9.1])
 def test_validate_config_rejects_invalid_hitl_required_stages_entries(
     tmp_path: Path, entry: object

@@ -62,6 +62,26 @@ KNOWN_ROLES: frozenset[str] = frozenset(
     }
 )
 
+ROLE_MODEL_TIERS: dict[str, str] = {
+    # Expensive, consequential judgments.
+    "topic_selector": "decision",
+    "campaign_director": "decision",
+    "research_director": "decision",
+    "skeptical_reviewer": "decision",
+    "mutation_auditor": "decision",
+    # Main scientific and engineering work.
+    "idea_scientist": "worker",
+    "experiment_designer": "worker",
+    "coding_engineer": "worker",
+    "result_analyst": "worker",
+    "paper_writer": "worker",
+    "mutation_proposer": "worker",
+    # High-volume extraction, organization, and operational narration.
+    "literature_researcher": "utility",
+    "compute_operator": "utility",
+    "citation_auditor": "utility",
+}
+
 _SAFE_ROLE_RE = re.compile(r"[^a-z0-9_.-]+")
 
 
@@ -76,6 +96,12 @@ def role_for_stage(stage: Stage) -> str:
     """Return the default execution role for a pipeline stage."""
 
     return DEFAULT_STAGE_ROLES[stage]
+
+
+def model_tier_for_role(role: str) -> str:
+    """Return the configured three-tier class for *role*."""
+
+    return ROLE_MODEL_TIERS.get(normalize_role_name(role), "worker")
 
 
 @dataclass(frozen=True)
@@ -100,13 +126,30 @@ class ResolvedRole:
 
 
 def resolve_role(config: RCConfig, role: str) -> ResolvedRole:
-    """Resolve a role against the global LLM defaults."""
+    """Resolve a role against the global LLM defaults and three tiers."""
 
     name = normalize_role_name(role)
     role_cfg = config.llm.roles.get(name, RoleConfig())
+    tier_name = model_tier_for_role(name)
+    tier_cfg = getattr(config.llm.model_tiers, tier_name)
+    inherited_model = tier_cfg.model or config.llm.primary_model
+    inherited_fallbacks = (
+        tier_cfg.fallback_models if tier_cfg.model else config.llm.fallback_models
+    )
+    # Once three-tier routing is enabled, the tier is the model authority.
+    # Per-role model fields from older configs are intentionally ignored so a
+    # deployment cannot silently grow back into N independently routed models.
+    tiered = any(
+        candidate.model
+        for candidate in (
+            config.llm.model_tiers.decision,
+            config.llm.model_tiers.worker,
+            config.llm.model_tiers.utility,
+        )
+    )
     fallback_models = (
-        config.llm.fallback_models
-        if role_cfg.fallback_models is None
+        inherited_fallbacks
+        if tiered or role_cfg.fallback_models is None
         else role_cfg.fallback_models
     )
     return ResolvedRole(
@@ -117,7 +160,7 @@ def resolve_role(config: RCConfig, role: str) -> ResolvedRole:
         wire_api=role_cfg.wire_api or config.llm.wire_api,
         api_key_env=role_cfg.api_key_env or config.llm.api_key_env,
         api_key=role_cfg.api_key or config.llm.api_key,
-        model=role_cfg.model or config.llm.primary_model,
+        model=inherited_model if tiered else (role_cfg.model or inherited_model),
         fallback_models=tuple(fallback_models),
         temperature=role_cfg.temperature,
         max_tokens=role_cfg.max_tokens,

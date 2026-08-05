@@ -85,8 +85,9 @@ The system may choose a better direction discovered through literature review.
 
 ## Resources and execution constraints
 
-- Reasoning and code-generation backend: local Bridge Server using
-  `codebuddy/deepseek-v4-pro-ioa`.
+- API transport: local Bridge Server backed by the authenticated CodeBuddy CLI.
+- Decision model: `gpt-5.6-sol`; worker model: `claude-sonnet-5`; utility
+  model: `claude-haiku-4.5`.
 - Available compute: up to 32 NVIDIA H20 GPUs through the prepared
   ClusterBridge/Ray pool.
 - Start with low-cost pilots and scale only when evidence justifies it.

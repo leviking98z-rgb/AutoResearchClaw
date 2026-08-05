@@ -607,6 +607,13 @@ llm:
   api_key: ""                      # 或直接填写 key
   primary_model: "gpt-4o"          # 主模型
   fallback_models: ["gpt-4o-mini"] # 回退链
+  model_tiers:                     # 可选：只保留三类模型
+    decision:                      # 选题、审批、转向、淘汰、最终裁决
+      model: "gpt-5.6-sol"
+    worker:                        # 科学推理、实验、代码、分析、论文
+      model: "claude-sonnet-5"
+    utility:                       # 搜索、抽取、整理、格式化
+      model: "claude-haiku-4.5"
   s2_api_key: ""                   # Semantic Scholar API key（可选，更高速率限制）
   acp:                             # 仅在 provider: "acp" 时使用
     agent: "claude"                # ACP Agent CLI 命令（claude, codex, gemini 等）

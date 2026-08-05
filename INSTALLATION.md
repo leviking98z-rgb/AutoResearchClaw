@@ -8,7 +8,9 @@ machine.
 - AutoResearchClaw 0.5.0, pinned by the current Git checkout.
 - Python 3.11 virtual environment at `.venv/`.
 - Local Bridge Server at `http://127.0.0.1:8787/v1`.
-- CodeBuddy model pinned to `codebuddy/deepseek-v4-pro-ioa`.
+- Three explicit research model tiers through the authenticated CodeBuddy CLI:
+  decision `gpt-5.6-sol`, worker `claude-sonnet-5`, and utility
+  `claude-haiku-4.5`.
 - Persistent RSI supervisor, monitor, pause/stop/resume controls, evidence
   scorecards, and cross-cycle A-Evolve memory.
 - Background `rsi-submit` automatically starts the independent monitor with a
@@ -49,9 +51,17 @@ machine.
 
 ## Backend note
 
-The production reasoning/code-generation backend is the local Bridge Server
-using `codebuddy/deepseek-v4-pro-ioa`. The placeholder environment variable
-required by the OpenAI-compatible client is:
+The production API transport is the local Bridge Server. CodeBuddy is the CLI
+runtime, not the model. `config.rsi.yaml` restricts research work to:
+
+```text
+decision: gpt-5.6-sol
+worker:   claude-sonnet-5
+utility:  claude-haiku-4.5
+```
+
+The placeholder environment variable required by the OpenAI-compatible client
+is:
 
 ```bash
 export BRIDGE_LOCAL_API_KEY=local-bridge

@@ -225,6 +225,23 @@ class RoleConfig:
 
 
 @dataclass(frozen=True)
+class ModelTierConfig:
+    """One of the three intentionally small research model tiers."""
+
+    model: str = ""
+    fallback_models: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ModelTiersConfig:
+    """Decision, worker, and utility models used by role routing."""
+
+    decision: ModelTierConfig = field(default_factory=ModelTierConfig)
+    worker: ModelTierConfig = field(default_factory=ModelTierConfig)
+    utility: ModelTierConfig = field(default_factory=ModelTierConfig)
+
+
+@dataclass(frozen=True)
 class LlmConfig:
     provider: str
     base_url: str = ""
@@ -237,6 +254,7 @@ class LlmConfig:
     notes: str = ""
     timeout_sec: int = 600
     acp: AcpConfig = field(default_factory=AcpConfig)
+    model_tiers: ModelTiersConfig = field(default_factory=ModelTiersConfig)
     roles: dict[str, RoleConfig] = field(default_factory=dict)
 
 
@@ -1255,6 +1273,32 @@ def validate_config(
             if tools is not None and not isinstance(tools, (list, tuple)):
                 errors.append(f"{role_path}.tools must be a list")
 
+    model_tiers = _get_by_path(data, "llm.model_tiers")
+    if model_tiers is not None and not isinstance(model_tiers, dict):
+        errors.append("llm.model_tiers must be a mapping")
+    elif isinstance(model_tiers, dict):
+        allowed_tiers = {"decision", "worker", "utility"}
+        for tier_name, tier_data in model_tiers.items():
+            tier_path = f"llm.model_tiers.{tier_name}"
+            if tier_name not in allowed_tiers:
+                errors.append(f"Unknown {tier_path}")
+                continue
+            if isinstance(tier_data, str):
+                if not tier_data.strip():
+                    errors.append(f"{tier_path} model must be non-empty")
+                continue
+            if not isinstance(tier_data, dict):
+                errors.append(f"{tier_path} must be a string or mapping")
+                continue
+            tier_model = tier_data.get("model")
+            tier_fallbacks = tier_data.get("fallback_models")
+            if _is_blank(tier_model) and tier_fallbacks:
+                errors.append(f"{tier_path}.model is required")
+            if tier_fallbacks is not None and not isinstance(
+                tier_fallbacks, (list, tuple)
+            ):
+                errors.append(f"{tier_path}.fallback_models must be a list")
+
     hitl_required_stages = _get_by_path(data, "security.hitl_required_stages")
     if hitl_required_stages is not None:
         if not isinstance(hitl_required_stages, list):
@@ -1324,6 +1368,7 @@ def validate_config(
 
 def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
     acp_data = data.get("acp") or {}
+    tiers_data = data.get("model_tiers") or {}
     roles_data = data.get("roles") or {}
     roles: dict[str, RoleConfig] = {}
     if isinstance(roles_data, dict):
@@ -1370,6 +1415,22 @@ def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
                 session_name=str(raw_role.get("session_name", "") or ""),
                 tools=tuple(str(tool) for tool in (raw_role.get("tools") or ())),
             )
+
+    def _parse_model_tier(name: str) -> ModelTierConfig:
+        raw_tier = tiers_data.get(name, {}) if isinstance(tiers_data, dict) else {}
+        if isinstance(raw_tier, str):
+            return ModelTierConfig(model=raw_tier.strip())
+        if not isinstance(raw_tier, dict):
+            return ModelTierConfig()
+        return ModelTierConfig(
+            model=str(raw_tier.get("model", "") or ""),
+            fallback_models=tuple(
+                str(model).strip()
+                for model in (raw_tier.get("fallback_models") or ())
+                if str(model).strip()
+            ),
+        )
+
     return LlmConfig(
         provider=data.get("provider", "openai-compatible"),
         base_url=data.get("base_url", ""),
@@ -1387,6 +1448,11 @@ def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
             acpx_command=acp_data.get("acpx_command", ""),
             session_name=acp_data.get("session_name", "researchclaw"),
             timeout_sec=int(acp_data.get("timeout_sec", 1800)),
+        ),
+        model_tiers=ModelTiersConfig(
+            decision=_parse_model_tier("decision"),
+            worker=_parse_model_tier("worker"),
+            utility=_parse_model_tier("utility"),
         ),
         roles=roles,
     )

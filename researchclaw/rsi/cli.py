@@ -55,7 +55,7 @@ _POLICY_DEFAULTS: dict[str, object] = {
     "backoff_max_sec": 900.0,
     "heartbeat_interval_sec": 15.0,
     "control_poll_sec": 1.0,
-    "model": "codebuddy/deepseek-v4-pro-ioa",
+    "model": "codebuddy/claude-sonnet-5",
     "bridge_url": "http://127.0.0.1:8787/v1",
     "api_key_env": "BRIDGE_LOCAL_API_KEY",
     "llm_timeout_sec": 1800,
@@ -136,7 +136,11 @@ def _submit_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-poll-sec", type=float, default=1.0)
     parser.add_argument(
         "--model",
-        default="codebuddy/deepseek-v4-pro-ioa",
+        default="codebuddy/claude-sonnet-5",
+        help=(
+            "backward-compatible default model; explicit llm.model_tiers in "
+            "the base config remain authoritative"
+        ),
     )
     parser.add_argument(
         "--bridge-url",

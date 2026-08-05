@@ -101,7 +101,7 @@ def test_resume_reconstructs_exact_persisted_submit_argv(
             "--control-poll-sec",
             "0.25",
             "--model",
-            "codebuddy/deepseek-v4-pro-ioa",
+            "codebuddy/claude-sonnet-5",
             "--bridge-url",
             "http://127.0.0.1:8787/v1",
             "--api-key-env",

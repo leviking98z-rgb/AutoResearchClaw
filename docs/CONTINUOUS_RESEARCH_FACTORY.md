@@ -591,9 +591,19 @@ idea-000127/result_analyst/pilot-1
 idea-000203/literature_researcher/screen-1
 ```
 
-A global LLM queue enforces backend concurrency and rate limits. Different
-roles may use different providers or models; an Idea cannot bypass the global
-admission limit.
+A global LLM queue enforces backend concurrency and rate limits. Roles retain
+separate prompts and sessions, but production routing intentionally exposes
+only three model classes:
+
+| Tier | Model | Responsibilities |
+| --- | --- | --- |
+| Decision | `gpt-5.6-sol` | topic selection, continue/pivot/kill, final evidence judgment |
+| Worker | `claude-sonnet-5` | scientific reasoning, experiment/code work, analysis, writing |
+| Utility | `claude-haiku-4.5` | search, extraction, organization, operations, citation formatting |
+
+CodeBuddy is the authenticated CLI runtime used by the local Bridge, not a
+model. Deterministic scheduling, provenance, schema, validity, and budget gates
+do not use an LLM. An Idea cannot bypass the global admission limit.
 
 ## 11. Persistence and recovery
 

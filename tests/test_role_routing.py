@@ -13,6 +13,7 @@ from researchclaw.llm.client import LLMResponse
 from researchclaw.llm.roles import (
     DEFAULT_STAGE_ROLES,
     bind_role_llm_client,
+    model_tier_for_role,
     resolve_role,
     role_for_stage,
 )
@@ -122,6 +123,77 @@ def test_stage_role_map_covers_every_stage() -> None:
     assert role_for_stage(Stage.CODE_GENERATION) == "coding_engineer"
     assert role_for_stage(Stage.PEER_REVIEW) == "skeptical_reviewer"
     assert role_for_stage(Stage.CITATION_VERIFY) == "citation_auditor"
+
+
+def test_roles_map_to_only_three_model_tiers() -> None:
+    assert model_tier_for_role("topic_selector") == "decision"
+    assert model_tier_for_role("campaign_director") == "decision"
+    assert model_tier_for_role("idea_scientist") == "worker"
+    assert model_tier_for_role("coding_engineer") == "worker"
+    assert model_tier_for_role("literature_researcher") == "utility"
+    assert model_tier_for_role("citation_auditor") == "utility"
+
+
+def test_three_model_tiers_route_roles_without_per_role_models(
+    tmp_path: Path,
+) -> None:
+    data = {
+        "project": {"name": "tiers", "mode": "full-auto"},
+        "research": {"topic": "tier routing"},
+        "runtime": {"timezone": "UTC"},
+        "notifications": {"channel": "console"},
+        "knowledge_base": {"backend": "markdown", "root": str(tmp_path / "kb")},
+        "openclaw_bridge": {},
+        "llm": {
+            "provider": "openai-compatible",
+            "base_url": "https://global.example/v1",
+            "api_key_env": "GLOBAL_KEY",
+            "api_key": "global-key",
+            "primary_model": "global-model",
+            "fallback_models": ["global-fallback"],
+            "model_tiers": {
+                "decision": {
+                    "model": "codebuddy/gpt-5.6-sol",
+                    "fallback_models": [],
+                },
+                "worker": {
+                    "model": "codebuddy/claude-sonnet-5",
+                    "fallback_models": ["worker-fallback"],
+                },
+                "utility": {
+                    "model": "codebuddy/claude-haiku-4.5",
+                    "fallback_models": [],
+                },
+            },
+            "roles": {
+                "topic_selector": {
+                    "model": "legacy-topic-model",
+                    "temperature": 0.2,
+                },
+                "coding_engineer": {
+                    "model": "legacy-code-model",
+                    "temperature": 0.1,
+                },
+                "literature_researcher": {
+                    "model": "legacy-search-model",
+                    "temperature": 0.0,
+                },
+            },
+        },
+        "experiment": {"mode": "simulated"},
+    }
+    config = RCConfig.from_dict(data, project_root=tmp_path, check_paths=False)
+
+    decision = resolve_role(config, "topic_selector")
+    worker = resolve_role(config, "coding_engineer")
+    utility = resolve_role(config, "literature_researcher")
+
+    assert decision.model == "codebuddy/gpt-5.6-sol"
+    assert decision.fallback_models == ()
+    assert worker.model == "codebuddy/claude-sonnet-5"
+    assert worker.fallback_models == ("worker-fallback",)
+    assert utility.model == "codebuddy/claude-haiku-4.5"
+    assert utility.fallback_models == ()
 
 
 def test_role_config_parses_and_inherits_global_fields(tmp_path: Path) -> None:

@@ -116,7 +116,7 @@ class SupervisorOptions:
     backoff_max_sec: float = 900.0
     heartbeat_interval_sec: float = 15.0
     control_poll_sec: float = 1.0
-    model: str = "codebuddy/deepseek-v4-pro-ioa"
+    model: str = "codebuddy/claude-sonnet-5"
     bridge_url: str = "http://127.0.0.1:8787/v1"
     api_key_env: str = "BRIDGE_LOCAL_API_KEY"
     llm_timeout_sec: int = 1800

@@ -134,6 +134,11 @@ def test_needs_max_completion_tokens_for_new_models():
     assert any(model.startswith(prefix) for prefix in _NEW_PARAM_MODELS)
 
 
+def test_gpt_5_6_uses_max_completion_tokens():
+    model = "gpt-5.6-sol"
+    assert any(model.startswith(prefix) for prefix in _NEW_PARAM_MODELS)
+
+
 def test_needs_max_completion_tokens_false_for_old_models():
     model = "gpt-4o"
     assert not any(model.startswith(prefix) for prefix in _NEW_PARAM_MODELS)

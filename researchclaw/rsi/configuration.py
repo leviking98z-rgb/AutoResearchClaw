@@ -128,20 +128,37 @@ def prepare_cycle_config(
             "timeout_sec": timeout_sec,
         }
     )
+    tiers = llm.get("model_tiers")
+    has_model_tiers = isinstance(tiers, dict) and any(
+        isinstance(value, str) and bool(value.strip())
+        or isinstance(value, dict)
+        and bool(str(value.get("model", "") or "").strip())
+        for value in tiers.values()
+    )
     roles = llm.get("roles")
     if isinstance(roles, dict):
         for role_data in roles.values():
             if not isinstance(role_data, dict):
                 continue
-            # The campaign CLI pins the approved model/backend for this run.
-            # Preserve role-level behavior/isolation while keeping inherited
-            # model entries in sync with that pin. Explicit alternate
-            # provider/endpoints remain untouched.
+            # ``--model`` remains the backward-compatible default model.
+            # Three-tier routing, when present, is authoritative and survives
+            # cycle materialization. Without tiers, preserve explicit legacy
+            # role models.
             has_alternate_backend = any(
                 str(role_data.get(key, "") or "").strip()
                 for key in ("provider", "base_url", "api_key_env", "api_key")
             )
-            if not has_alternate_backend:
+            has_explicit_model = bool(
+                str(
+                    role_data.get("model", role_data.get("primary_model", ""))
+                    or ""
+                ).strip()
+            )
+            if (
+                not has_model_tiers
+                and not has_alternate_backend
+                and not has_explicit_model
+            ):
                 role_data["model"] = model
                 role_data["fallback_models"] = []
                 role_data["timeout_sec"] = timeout_sec

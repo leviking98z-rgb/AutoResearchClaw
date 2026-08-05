@@ -74,7 +74,7 @@ def test_prepare_cycle_config_wires_bridge_memory_and_safety(tmp_path: Path) -> 
     assert data["llm"]["fallback_models"] == []
     assert (
         data["llm"]["roles"]["idea_scientist"]["model"]
-        == "codebuddy/deepseek-v4-pro-ioa"
+        == "old-model"
     )
     assert data["llm"]["roles"]["idea_scientist"]["temperature"] == 0.8
     assert (
@@ -101,6 +101,65 @@ def test_prepare_cycle_config_wires_bridge_memory_and_safety(tmp_path: Path) -> 
     assert "experiment_run" not in data["prompts"]["extra_prompts"]
     assert "iterative_refine" not in data["prompts"]["extra_prompts"]
     assert "citation_verify" not in data["prompts"]["extra_prompts"]
+
+
+def test_prepare_cycle_config_preserves_three_tier_routing(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base.yaml"
+    base.write_text(
+        yaml.safe_dump(
+            {
+                "project": {"name": "test", "mode": "docs-first"},
+                "research": {"topic": "placeholder"},
+                "knowledge_base": {"backend": "markdown", "root": "kb"},
+                "llm": {
+                    "provider": "openai-compatible",
+                    "model_tiers": {
+                        "decision": {"model": "codebuddy/gpt-5.6-sol"},
+                        "worker": {"model": "codebuddy/claude-sonnet-5"},
+                        "utility": {"model": "codebuddy/claude-haiku-4.5"},
+                    },
+                    "roles": {
+                        "topic_selector": {"temperature": 0.2},
+                        "coding_engineer": {"temperature": 0.1},
+                        "literature_researcher": {"temperature": 0.0},
+                    },
+                },
+                "experiment": {"cli_agent": {"provider": "llm"}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    store = CampaignStore(tmp_path / "campaign")
+    store.initialize()
+
+    output = prepare_cycle_config(
+        base_config=base,
+        output_path=store.runs_dir / "cycle-0001" / "config.yaml",
+        store=store,
+        topic="tiered topic",
+        model="legacy-default-model",
+        bridge_url="http://127.0.0.1:8787/v1",
+        api_key_env="BRIDGE_LOCAL_API_KEY",
+        timeout_sec=1800,
+    )
+    data = yaml.safe_load(output.read_text(encoding="utf-8"))
+
+    assert data["llm"]["primary_model"] == "legacy-default-model"
+    assert data["llm"]["model_tiers"]["decision"]["model"] == (
+        "codebuddy/gpt-5.6-sol"
+    )
+    assert data["llm"]["model_tiers"]["worker"]["model"] == (
+        "codebuddy/claude-sonnet-5"
+    )
+    assert data["llm"]["model_tiers"]["utility"]["model"] == (
+        "codebuddy/claude-haiku-4.5"
+    )
+    assert "model" not in data["llm"]["roles"]["topic_selector"]
+    assert "model" not in data["llm"]["roles"]["coding_engineer"]
+    assert "model" not in data["llm"]["roles"]["literature_researcher"]
 
 
 def test_prepare_cycle_config_separates_meta_brief_from_selected_topic(

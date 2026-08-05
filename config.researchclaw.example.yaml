@@ -51,6 +51,18 @@ llm:
   fallback_models:
     - "gpt-4.1"
     - "gpt-4o-mini"
+  # Optional three-tier routing. Roles without an explicit ``model`` inherit
+  # one of these tiers according to their responsibility.
+  model_tiers:
+    decision:
+      model: "gpt-5.6-sol"
+      fallback_models: []
+    worker:
+      model: "claude-sonnet-5"
+      fallback_models: []
+    utility:
+      model: "claude-haiku-4.5"
+      fallback_models: []
   # Optional per-role routing. Blank fields inherit the global LLM settings.
   # Every role can independently select provider/base_url/credential/model,
   # fallback chain, temperature, token budget, timeout, and ACP session.

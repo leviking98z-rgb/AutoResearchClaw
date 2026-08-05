@@ -432,7 +432,7 @@ def test_single_cycle_runs_diagnosis_aevolve_and_checkpoints(
     assert "--no-graceful-degradation" in commands[0]
     assert "--topic" not in commands[0]
     policy = json.loads(store.policy_path.read_text(encoding="utf-8"))
-    assert policy["model"] == "codebuddy/deepseek-v4-pro-ioa"
+    assert policy["model"] == "codebuddy/claude-sonnet-5"
     assert policy["continuous"] is False
 
     events = [event["type"] for event in store.log.read_all()]

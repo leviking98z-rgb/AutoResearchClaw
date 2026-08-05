@@ -607,6 +607,13 @@ llm:
   api_key: ""                      # Or hardcode key here
   primary_model: "gpt-4o"          # Primary model
   fallback_models: ["gpt-4o-mini"] # Fallback chain
+  model_tiers:                     # Optional: exactly three model classes
+    decision:                      # Select, approve, pivot, kill, final judge
+      model: "gpt-5.6-sol"
+    worker:                        # Science, experiments, code, analysis, paper
+      model: "claude-sonnet-5"
+    utility:                       # Search, extraction, organization, formatting
+      model: "claude-haiku-4.5"
   s2_api_key: ""                   # Semantic Scholar API key (optional, higher rate limits)
   acp:                             # Only used when provider: "acp"
     agent: "claude"                # ACP agent CLI command (claude, codex, gemini, etc.)

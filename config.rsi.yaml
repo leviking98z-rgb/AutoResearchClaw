@@ -39,92 +39,91 @@ openclaw_bridge:
   use_web_fetch: false
   use_browser: false
 
-# All reasoning and code generation go through the local Bridge Server's
-# CodeBuddy backend, pinned to DeepSeek V4 Pro.  The key is a non-secret local
-# placeholder required by ResearchClaw's OpenAI-compatible client validation.
+# The local Bridge is the API transport; CodeBuddy is the authenticated CLI
+# runtime behind it, not a model. Research work is deliberately limited to
+# three model tiers so routing remains understandable and auditable.
 llm:
   provider: "openai-compatible"
   base_url: "http://127.0.0.1:8787/v1"
   wire_api: "chat_completions"
   api_key_env: "BRIDGE_LOCAL_API_KEY"
   api_key: ""
-  primary_model: "codebuddy/deepseek-v4-pro-ioa"
+  primary_model: "codebuddy/claude-sonnet-5"
   fallback_models: []
   timeout_sec: 1800
 
-  # First-class research roles.  They currently inherit the same approved
-  # Bridge/CodeBuddy backend, but have independent routing policy, generation
-  # defaults, audit logs, and (for stateful ACP providers) isolated sessions.
-  # Set provider/base_url/api_key_env/model on any role to move it to another
-  # backend without changing the remaining pipeline.
+  model_tiers:
+    # Final topic/continue/pivot/kill and claim-evidence decisions.
+    decision:
+      model: "codebuddy/gpt-5.6-sol"
+      fallback_models: []
+    # Main scientific reasoning, experiment/code work, analysis, and writing.
+    worker:
+      model: "codebuddy/claude-sonnet-5"
+      fallback_models: []
+    # High-volume search/extraction/organization/operations work.
+    utility:
+      model: "codebuddy/claude-haiku-4.5"
+      fallback_models: []
+
+  # Roles keep separate prompts, tools, sessions, and audit logs. When these
+  # tiers are configured, roles cannot override their tier's model.
   roles:
     topic_selector:
-      model: "codebuddy/deepseek-v4-pro-ioa"
       temperature: 0.65
       max_tokens: 16000
       isolated_session: true
       tools: ["campaign_brief", "topic_history"]
     campaign_director:
-      model: "codebuddy/deepseek-v4-pro-ioa"
       temperature: 0.2
       max_tokens: 6000
       isolated_session: true
       tools: ["cycle_evidence", "topic_history"]
     research_director:
-      model: "codebuddy/deepseek-v4-pro-ioa"
       temperature: 0.3
       max_tokens: 8192
       isolated_session: true
     literature_researcher:
-      model: "codebuddy/deepseek-v4-pro-ioa"
       temperature: 0.2
       max_tokens: 8192
       isolated_session: true
       tools: ["openalex", "semantic_scholar", "arxiv", "web_search"]
     idea_scientist:
-      model: "codebuddy/deepseek-v4-pro-ioa"
       temperature: 0.75
       max_tokens: 12288
       isolated_session: true
       tools: ["literature_evidence", "novelty_check"]
     experiment_designer:
-      model: "codebuddy/deepseek-v4-pro-ioa"
       temperature: 0.25
       max_tokens: 12288
       isolated_session: true
       tools: ["benchmark_agent", "hardware_profile"]
     coding_engineer:
-      model: "codebuddy/deepseek-v4-pro-ioa"
       temperature: 0.1
       max_tokens: 32768
       isolated_session: true
       tools: ["filesystem", "python", "clusterbridge"]
     compute_operator:
-      model: "codebuddy/deepseek-v4-pro-ioa"
       temperature: 0.1
       max_tokens: 8192
       isolated_session: true
       tools: ["clusterbridge", "ray", "run_logs"]
     result_analyst:
-      model: "codebuddy/deepseek-v4-pro-ioa"
       temperature: 0.1
       max_tokens: 12288
       isolated_session: true
       tools: ["raw_results", "statistics"]
     paper_writer:
-      model: "codebuddy/deepseek-v4-pro-ioa"
       temperature: 0.35
       max_tokens: 32768
       isolated_session: true
       tools: ["verified_evidence", "figures"]
     skeptical_reviewer:
-      model: "codebuddy/deepseek-v4-pro-ioa"
       temperature: 0.0
       max_tokens: 12288
       isolated_session: true
       tools: ["read_only_artifacts", "raw_results"]
     citation_auditor:
-      model: "codebuddy/deepseek-v4-pro-ioa"
       temperature: 0.0
       max_tokens: 8192
       isolated_session: true
