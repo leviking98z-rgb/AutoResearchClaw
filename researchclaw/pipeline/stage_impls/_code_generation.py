@@ -76,6 +76,47 @@ def _missing_generated_imports(files: dict[str, str]) -> list[tuple[str, str]]:
                 missing.append((filename, module))
     return missing
 
+
+def _confirmed_ablation_duplicates(review: Any) -> bool:
+    """Require an explicit boolean and concrete duplicate-pair evidence."""
+
+    if not isinstance(review, dict) or review.get("has_duplicates") is not True:
+        return False
+    pairs = review.get("duplicate_pairs")
+    if not isinstance(pairs, list) or not pairs:
+        return False
+    return any(
+        isinstance(pair, dict)
+        and str(pair.get("left", "")).strip()
+        and str(pair.get("right", "")).strip()
+        and str(pair.get("evidence", "")).strip()
+        for pair in pairs
+    )
+
+
+def _ablation_review_context(files: dict[str, str]) -> str:
+    """Show the reviewer orchestration and implementation files, not a prefix."""
+
+    ordered_names = sorted(
+        files,
+        key=lambda name: (
+            0 if name == "main.py" else
+            1 if "model" in name.casefold() else
+            2,
+            name,
+        ),
+    )
+    sections: list[str] = []
+    remaining = 48_000
+    for name in ordered_names:
+        if remaining <= 0:
+            break
+        code = files[name]
+        excerpt = code[:remaining]
+        sections.append(f"# --- {name} ---\n{excerpt}")
+        remaining -= len(excerpt)
+    return "\n\n".join(sections)
+
 # Improvement G: Continuous-action environments that are incompatible with DQN
 _CONTINUOUS_ENVS = {
     "pendulum", "halfcheetah", "hopper", "walker2d", "ant", "humanoid",
@@ -2764,12 +2805,20 @@ def _execute_code_generation(
     main_code = files.get("main.py", "")
     if llm is not None and main_code and "condition" in main_code.lower():
         try:
+            ablation_context = _ablation_review_context(files)
             ablation_prompt = (
-                f"Examine this experiment code:\n```python\n{main_code[:6000]}\n```\n\n"
+                f"Examine this multi-file experiment code:\n"
+                f"```python\n{ablation_context}\n```\n\n"
                 "Check if any experimental conditions (methods/ablations) have "
                 "IDENTICAL configurations (same hyperparameters, same code paths). "
+                "Only report duplicates when the implementation is visible and "
+                "you can name the concrete duplicate pair and code evidence. "
+                "If evidence is incomplete or uncertain, set has_duplicates=false. "
                 "Answer JSON: "
-                '{"has_duplicates": true/false, "details": "which conditions are identical"}'
+                '{"has_duplicates": true/false, "duplicate_pairs": ['
+                '{"left": "condition_a", "right": "condition_b", '
+                '"evidence": "specific identical implementation"}], '
+                '"details": "short explanation"}'
             )
             abl_resp = llm.chat(
                 [{"role": "user", "content": ablation_prompt}],
@@ -2777,7 +2826,7 @@ def _execute_code_generation(
                 max_tokens=512,
             )
             abl_data = _safe_json_loads(abl_resp.content, {})
-            if isinstance(abl_data, dict) and abl_data.get("has_duplicates"):
+            if _confirmed_ablation_duplicates(abl_data):
                 logger.warning(
                     "Stage 10: Duplicate ablation conditions detected: %s",
                     abl_data.get("details", ""),

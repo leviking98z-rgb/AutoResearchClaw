@@ -18,6 +18,8 @@ from researchclaw.pipeline.stage_impls._code_generation import (
     _assess_pilot_envelope,
     _assess_implementation_manifest,
     _assess_scientific_code_alignment,
+    _ablation_review_context,
+    _confirmed_ablation_duplicates,
     _implementation_contract,
     _load_scientific_contract,
     _missing_generated_imports,
@@ -82,6 +84,37 @@ def test_cross_import_check_reports_missing_local_module() -> None:
     assert _missing_generated_imports(files) == [
         ("main.py", "missing_adapter"),
     ]
+
+
+def test_ablation_duplicates_require_boolean_and_pair_evidence() -> None:
+    assert not _confirmed_ablation_duplicates({
+        "has_duplicates": "cannot confirm",
+        "details": "implementations were not visible",
+    })
+    assert not _confirmed_ablation_duplicates({
+        "has_duplicates": True,
+        "duplicate_pairs": [],
+    })
+    assert _confirmed_ablation_duplicates({
+        "has_duplicates": True,
+        "duplicate_pairs": [{
+            "left": "baseline",
+            "right": "ablation",
+            "evidence": "both call the same function with the same arguments",
+        }],
+    })
+
+
+def test_ablation_review_context_includes_model_implementation() -> None:
+    context = _ablation_review_context({
+        "data_utils.py": "x" * 40_000,
+        "models.py": "class DistinctGate:\n    pass\n",
+        "main.py": "def main():\n    pass\n",
+    })
+
+    assert "# --- main.py ---" in context
+    assert "# --- models.py ---" in context
+    assert "class DistinctGate" in context
 
 
 def _config(
