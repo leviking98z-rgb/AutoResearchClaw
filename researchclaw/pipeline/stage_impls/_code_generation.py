@@ -2326,6 +2326,11 @@ def _execute_code_generation(
                 stage=Stage.CODE_GENERATION,
                 status=StageStatus.FAILED,
                 artifacts=("validation_report.md",),
+                error=(
+                    "Critical generated-code validation issues remain after "
+                    f"{max_repair} repair attempts"
+                ),
+                decision="code_validation_failed",
                 evidence_refs=(),
             )
 

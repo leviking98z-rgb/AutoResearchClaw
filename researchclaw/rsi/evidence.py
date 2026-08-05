@@ -151,6 +151,12 @@ def load_stage_results(run_dir: Path) -> list[StageResult]:
     """Reconstruct ``StageResult`` objects from per-stage ``decision.json``."""
 
     results: list[StageResult] = []
+    summary = _read_mapping(run_dir / "pipeline_summary.json")
+    try:
+        from_stage = int(summary.get("from_stage"))
+        final_stage = int(summary.get("final_stage"))
+    except (TypeError, ValueError):
+        from_stage = final_stage = 0
     for stage_dir in sorted(run_dir.glob("stage-[0-9][0-9]")):
         decision = _read_mapping(stage_dir / "decision.json")
         try:
@@ -158,6 +164,12 @@ def load_stage_results(run_dir: Path) -> list[StageResult]:
             stage = Stage(stage_num)
             status = StageStatus(str(decision.get("status", "failed")))
         except (TypeError, ValueError):
+            continue
+        # A resumed run reuses earlier stage directories. Those historical
+        # decisions are prerequisites/artifacts, not failures executed by the
+        # current pipeline invocation. Restrict evidence to the summary's
+        # authoritative execution window when available.
+        if from_stage and final_stage and not from_stage <= stage_num <= final_stage:
             continue
         artifacts = decision.get("output_artifacts", ())
         evidence_refs = decision.get("evidence_refs", ())

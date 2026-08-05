@@ -738,7 +738,8 @@ class CodeAgent:
 
             if attempt >= self._cfg.hard_validation_max_repairs:
                 self._log_event(
-                    "  Max repair attempts reached — proceeding with warnings"
+                    "  Max repair attempts reached — preserving critical "
+                    "validation failures for the outer fail-closed gate"
                 )
                 return files
 
@@ -962,6 +963,9 @@ class CodeAgent:
             "4. nn.Module layers must be created in __init__(), not forward()\n"
             "5. All cross-file imports must reference names that actually exist\n"
             "6. Output ALL files in ```filename:xxx.py``` format\n"
+            "7. For every affected file, return the COMPLETE file from its "
+            "first line through its final line. Never return a prefix, suffix, "
+            "ellipsis, or truncated function.\n"
         )
 
         sys_prompt = self._pm.system("code_generation")
@@ -970,16 +974,49 @@ class CodeAgent:
         fixed = self._extract_files(resp.content)
         if fixed:
             merged = dict(files)
-            merged.update(fixed)
+            accepted: list[str] = []
+            rejected: list[str] = []
+            affected = affected_files & set(files)
+            from researchclaw.experiment.validator import validate_syntax
+
+            for filename, code in fixed.items():
+                # A repair response may include unaffected context files. Keep
+                # those only when valid, but never let an invalid replacement
+                # overwrite the last known-good version.
+                syntax = validate_syntax(code) if filename.endswith(".py") else None
+                if syntax is not None and not syntax.ok:
+                    rejected.append(filename)
+                    continue
+                merged[filename] = code
+                accepted.append(filename)
+
+            # If an affected file was omitted or returned with invalid syntax,
+            # preserve its previous contents and make that explicit in the log.
+            rejected.extend(
+                sorted(
+                    filename
+                    for filename in affected
+                    if filename not in fixed
+                )
+            )
             self._persist_files(
                 merged,
                 phase="hard_validation_repair",
-                detail=f"updated {len(fixed)} file(s)",
+                detail=(
+                    f"accepted {len(accepted)} repair file(s); "
+                    f"rejected/omitted {len(set(rejected))}"
+                ),
             )
-            self._log_event(
-                f"  Repair updated {len(fixed)} file(s): "
-                f"{', '.join(sorted(fixed))}"
-            )
+            if accepted:
+                self._log_event(
+                    f"  Repair accepted {len(accepted)} file(s): "
+                    f"{', '.join(sorted(accepted))}"
+                )
+            if rejected:
+                self._log_event(
+                    "  Repair rejected invalid or omitted affected file(s): "
+                    f"{', '.join(sorted(set(rejected)))}"
+                )
             return merged
 
         self._log_event("  WARNING: Repair produced no extractable files")

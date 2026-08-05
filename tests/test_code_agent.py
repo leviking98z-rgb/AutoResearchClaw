@@ -173,6 +173,56 @@ class TestPhase1Architecture:
 
 
 class TestPhase2ExecFix:
+    def test_hard_repair_rejects_truncated_replacement(
+        self, stage_dir: Path, pm: PromptManager,
+    ) -> None:
+        original = {
+            "main.py": (
+                "def main():\n"
+                "    print('ok')\n\n"
+                "if __name__ == '__main__':\n"
+                "    main()\n"
+            ),
+            "data_utils.py": (
+                "def load_data():\n"
+                "    return [1]\n"
+            ),
+        }
+        truncated = (
+            "```filename:data_utils.py\n"
+            "def load_data():\n"
+            "    \"\"\"unterminated\n"
+            "```"
+        )
+        llm = FakeLLM(responses=[truncated])
+        agent = CodeAgent(
+            llm=llm,
+            prompts=pm,
+            config=CodeAgentConfig(
+                architecture_planning=False,
+                hard_validation=True,
+                hard_validation_max_repairs=1,
+                exec_fix_max_iterations=0,
+                review_max_rounds=0,
+            ),
+            stage_dir=stage_dir,
+        )
+
+        repaired = agent._repair_critical_issues(
+            original,
+            ["[data_utils.py] Syntax error: invalid syntax (line 1)"],
+            "topic",
+            "plan",
+            "metric",
+            "blueprint",
+        )
+
+        assert repaired["data_utils.py"] == original["data_utils.py"]
+        assert any(
+            "rejected invalid or omitted affected file" in entry
+            for entry in agent._log
+        )
+
     def test_single_shot_persists_progress_and_work_in_progress(
         self, stage_dir: Path, pm: PromptManager,
     ) -> None:

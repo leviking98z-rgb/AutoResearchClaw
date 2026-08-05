@@ -190,6 +190,44 @@ def test_collect_evidence_reconstructs_pipeline_results(tmp_path: Path) -> None:
     assert json.loads((run_dir / "rsi_evidence.json").read_text()) == evidence
 
 
+def test_resumed_evidence_ignores_historical_failed_stage(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "resumed"
+    for stage_num, status, error in (
+        (4, "failed", "historical literature failure"),
+        (10, "failed", "current code validation failure"),
+    ):
+        stage_dir = run_dir / f"stage-{stage_num:02d}"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            stage_dir / "decision.json",
+            {
+                "status": status,
+                "decision": "retry",
+                "error": error,
+                "output_artifacts": [],
+                "evidence_refs": [],
+            },
+        )
+    _write_json(
+        run_dir / "pipeline_summary.json",
+        {
+            "run_id": "rc-resumed",
+            "from_stage": 10,
+            "final_stage": 10,
+            "stages_executed": 1,
+            "stages_failed": 1,
+            "final_status": "failed",
+        },
+    )
+
+    results = load_stage_results(run_dir)
+
+    assert [int(result.stage) for result in results] == [10]
+    assert results[0].error == "current code validation failure"
+
+
 def test_collects_all_requested_artifacts_and_scores_deterministically(
     tmp_path: Path,
 ) -> None:
