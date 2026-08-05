@@ -830,6 +830,110 @@ def test_continuous_mode_ignores_cycle_plateau_and_stop_recommendation(
     assert state["status"] == "stopped"
 
 
+def test_continuous_mode_pauses_on_repeated_failure_signature(
+    tmp_path: Path,
+) -> None:
+    options = replace(
+        _options(tmp_path, max_cycles=1),
+        continuous=True,
+        max_consecutive_failures=3,
+    )
+    failed = {
+        "run_id": "same-failure",
+        "stages_executed": 1,
+        "stages_done": 0,
+        "stages_paused": 0,
+        "stages_blocked": 0,
+        "stages_failed": 1,
+        "final_status": "failed",
+    }
+    supervisor = CampaignSupervisor(
+        options,
+        popen_factory=_pipeline_factory([failed] * 3, [1] * 3, []),
+        sleep=lambda _seconds: None,
+        llm_factory=lambda _path: object(),
+        diagnosis_fn=lambda **_kwargs: {
+            "summary": "repair",
+            "repair_prompt_patch": "Recreate the missing runtime dependency.",
+            "stop_recommended": False,
+        },
+        aevolve_fn=lambda **_kwargs: [],
+    )
+
+    assert supervisor.run() == 1
+    store = CampaignStore(options.campaign_dir)
+    state = store.load_state()
+    assert state["status"] == "paused_failure_threshold"
+    assert state["consecutive_same_failure"] == 3
+    assert state["failure_recovery_action"] == "quarantine"
+    events = store.log.read_all()
+    recovery = [
+        event
+        for event in events
+        if event["type"] == "failure_repair_evaluated"
+    ]
+    assert [event["recovery_action"] for event in recovery] == [
+        "auto_repair",
+        "regenerate",
+        "quarantine",
+    ]
+    threshold = [
+        event for event in events if event["type"] == "failure_threshold_reached"
+    ][-1]
+    assert threshold["threshold_kind"] == "same_failure_signature"
+
+
+def test_failure_signature_normalizes_paths_and_numbers() -> None:
+    first, _ = CampaignSupervisor._failure_signature(
+        {
+            "pipeline_summary": {"final_status": "failed"},
+            "failures": [
+                {
+                    "stage": 10,
+                    "stage_name": "CODE_GENERATION",
+                    "status": "failed",
+                    "error": "Missing /tmp/run-123/data at attempt 2",
+                }
+            ],
+        },
+        returncode=1,
+        topic_id="idea-a",
+    )
+    second, _ = CampaignSupervisor._failure_signature(
+        {
+            "pipeline_summary": {"final_status": "failed"},
+            "failures": [
+                {
+                    "stage": 10,
+                    "stage_name": "CODE_GENERATION",
+                    "status": "failed",
+                    "error": "Missing /tmp/run-999/data at attempt 8",
+                }
+            ],
+        },
+        returncode=1,
+        topic_id="idea-a",
+    )
+    different_idea, _ = CampaignSupervisor._failure_signature(
+        {
+            "pipeline_summary": {"final_status": "failed"},
+            "failures": [
+                {
+                    "stage": 10,
+                    "stage_name": "CODE_GENERATION",
+                    "status": "failed",
+                    "error": "Missing /tmp/run-999/data at attempt 8",
+                }
+            ],
+        },
+        returncode=1,
+        topic_id="idea-b",
+    )
+
+    assert first == second
+    assert first != different_idea
+
+
 def test_load_run_policy_prefers_durable_policy_file(tmp_path: Path) -> None:
     store = CampaignStore(tmp_path / "campaign")
     store.initialize()

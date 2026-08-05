@@ -97,6 +97,7 @@ def prepare_cycle_config(
     bridge_url: str,
     api_key_env: str,
     timeout_sec: int,
+    cycle: int | None = None,
 ) -> Path:
     """Write a self-contained cycle config with campaign memory attached."""
 
@@ -219,6 +220,30 @@ def prepare_cycle_config(
             ).strip()
     except (FileNotFoundError, OSError, UnicodeError, yaml.YAMLError):
         topic_patch_context = ""
+    repair_patch_context = ""
+    repair_patch_meta: dict[str, Any] = {}
+    try:
+        repair_patch_data = yaml.safe_load(
+            store.shared_repair_patch_path.read_text(encoding="utf-8")
+        )
+        if isinstance(repair_patch_data, dict):
+            expires_after = int(repair_patch_data.get("expires_after_cycle", 0))
+            is_active = cycle is None or cycle <= expires_after
+            if is_active:
+                repair_patch_context = str(
+                    repair_patch_data.get("repair_prompt_patch", "") or ""
+                ).strip()
+                repair_patch_meta = repair_patch_data
+    except (
+        FileNotFoundError,
+        OSError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        yaml.YAMLError,
+    ):
+        repair_patch_context = ""
+        repair_patch_meta = {}
     for stage in _PROMPT_STAGES:
         prior = str(extras.get(stage, "") or "").strip()
         merged = store.shared_prompts_dir / f"{stage}.md"
@@ -249,6 +274,24 @@ def prepare_cycle_config(
                 f"{topic_patch_context}\n\n"
                 "This refines the incumbent question without replacing its "
                 "candidate identity or weakening campaign policy."
+            )
+        if repair_patch_context:
+            failure_signature = str(
+                repair_patch_meta.get("failure_signature", "unknown")
+            )
+            recovery_action = str(
+                repair_patch_meta.get("recovery_action", "auto_repair")
+            )
+            sections.append(
+                "## Transient Failed-Cycle Engineering Repair\n\n"
+                f"Failure signature: `{failure_signature}`\n\n"
+                f"Recovery action: `{recovery_action}`\n\n"
+                f"{repair_patch_context}\n\n"
+                "This repair is temporary and may only fix implementation, "
+                "dependency, data-loading, resource, or reproducibility "
+                "defects. It must not lower or bypass quality gates, alter "
+                "the hypothesis to manufacture success, fabricate evidence, "
+                "disable verification, or relax safety/publication policy."
             )
         if campaign_brief:
             sections.append(

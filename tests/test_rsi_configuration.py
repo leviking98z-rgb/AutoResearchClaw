@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
@@ -218,3 +219,71 @@ def test_prepare_cycle_config_separates_meta_brief_from_selected_topic(
     assert "not the concrete research topic" in prompt_text
     assert "already implemented by the outer RSI supervisor" in prompt_text
     assert "Do not require experiment code to reimplement" in prompt_text
+
+
+def test_prepare_cycle_config_materializes_only_unexpired_repair(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base.yaml"
+    base.write_text(
+        yaml.safe_dump(
+            {
+                "project": {"name": "test"},
+                "research": {"topic": "placeholder"},
+                "knowledge_base": {"backend": "markdown", "root": "kb"},
+                "llm": {"provider": "openai-compatible"},
+                "experiment": {"cli_agent": {"provider": "llm"}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    store = CampaignStore(tmp_path / "campaign")
+    store.initialize()
+    store.shared_repair_patch_path.write_text(
+        json.dumps(
+            {
+                "failure_signature": "sig-1",
+                "source_cycle": 2,
+                "expires_after_cycle": 4,
+                "recovery_action": "regenerate",
+                "repair_prompt_patch": "Use the verified dataset cache path.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    active = prepare_cycle_config(
+        base_config=base,
+        output_path=tmp_path / "active.yaml",
+        store=store,
+        topic="topic",
+        model="model",
+        bridge_url="http://bridge/v1",
+        api_key_env="KEY",
+        timeout_sec=10,
+        cycle=4,
+    )
+    active_data = yaml.safe_load(active.read_text(encoding="utf-8"))
+    active_text = Path(
+        active_data["prompts"]["extra_prompts"]["code_generation"]
+    ).read_text(encoding="utf-8")
+    assert "Transient Failed-Cycle Engineering Repair" in active_text
+    assert "verified dataset cache path" in active_text
+
+    expired = prepare_cycle_config(
+        base_config=base,
+        output_path=tmp_path / "expired.yaml",
+        store=store,
+        topic="topic",
+        model="model",
+        bridge_url="http://bridge/v1",
+        api_key_env="KEY",
+        timeout_sec=10,
+        cycle=5,
+    )
+    expired_data = yaml.safe_load(expired.read_text(encoding="utf-8"))
+    expired_text = Path(
+        expired_data["prompts"]["extra_prompts"]["code_generation"]
+    ).read_text(encoding="utf-8")
+    assert "Transient Failed-Cycle Engineering Repair" not in expired_text

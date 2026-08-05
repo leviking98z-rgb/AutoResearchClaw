@@ -37,6 +37,10 @@ Return ONLY one JSON object with these fields:
 - weaknesses: array of strings
 - next_cycle_priorities: array of strings
 - prompt_patch: compact guidance to append to every next-cycle stage prompt
+- repair_prompt_patch: when the cycle failed, a bounded engineering repair for
+  the exact observed failure; otherwise "". It may fix code, dependencies,
+  data loading, resource use, or reproducibility, but must never lower gates,
+  change safety policy, fabricate evidence, or redefine failure as success
 - topic_action: one of "keep", "refine", or "pivot"
 - topic_patch: for "refine", a concrete revised topic specification; otherwise ""
 - pivot_reason: for "pivot", the evidence-based reason the incumbent topic
@@ -52,6 +56,88 @@ only for a bounded version of the same falsifiable question, and use "pivot"
 only when cycle evidence invalidates novelty, feasibility, or the primary
 signal.
 """
+
+_UNSAFE_REPAIR_PATTERNS = (
+    r"\b(?:disable|bypass|skip|remove|weaken|lower|relax|ignore)\b.{0,80}"
+    r"\b(?:gate|threshold|verification|validator|review|citation|safety|"
+    r"reproducibility|evidence)\b",
+    r"\b(?:fabricat|fake|forge|invent|hallucinat|hardcode)\w*\b.{0,80}"
+    r"\b(?:result|metric|evidence|citation|output|score)\b",
+    r"\b(?:treat|mark|report|declare)\b.{0,80}\b(?:failure|failed|error)\b"
+    r".{0,80}\b(?:success|passed|valid)\b",
+    r"\b(?:automatic|auto)\w*\b.{0,40}\b(?:publish|submission|release)\b",
+    r"\b(?:change|replace|override|rewrite)\b.{0,80}"
+    r"\b(?:meta-brief|safety policy|campaign policy)\b",
+)
+
+
+def _safe_repair_prompt(diagnosis: dict[str, Any]) -> tuple[str, str]:
+    """Return a bounded repair prompt and a rejection reason.
+
+    Failed-cycle advice is untrusted model output.  Keep this validator
+    deliberately conservative: an unsafe or excessively large patch is
+    archived in the diagnosis but never injected into a later cycle.
+    """
+
+    raw = diagnosis.get("repair_prompt_patch")
+    if not str(raw or "").strip():
+        # Backward compatibility for directors that still emit the historical
+        # prompt_patch field. On failed cycles it is treated as transient,
+        # never as accepted permanent campaign guidance.
+        raw = diagnosis.get("prompt_patch")
+    patch = str(raw or "").strip()
+    if not patch:
+        return "", "empty"
+    if len(patch) > 6000:
+        return "", "exceeds_6000_char_limit"
+    normalized = " ".join(patch.casefold().split())
+    for pattern in _UNSAFE_REPAIR_PATTERNS:
+        if re.search(pattern, normalized, flags=re.IGNORECASE):
+            return "", f"unsafe_pattern:{pattern}"
+    return patch, ""
+
+
+def apply_failure_repair(
+    *,
+    store: CampaignStore,
+    cycle: int,
+    diagnosis: dict[str, Any],
+    failure_signature: str,
+    recovery_action: str,
+    ttl_cycles: int = 2,
+) -> dict[str, Any]:
+    """Persist a safe, transient engineering repair for a failed cycle."""
+
+    diagnosis_path = store.diagnostics_dir / f"cycle-{cycle:04d}.json"
+    atomic_write_json(diagnosis_path, diagnosis)
+    patch, rejection = _safe_repair_prompt(diagnosis)
+    applied = {
+        "repair_applied": False,
+        "repair_rejected": bool(rejection and rejection != "empty"),
+        "repair_rejection_reason": rejection,
+        "diagnosis_path": str(diagnosis_path),
+        "failure_signature": failure_signature,
+        "recovery_action": recovery_action,
+    }
+    if not patch:
+        # Never let an older repair leak into a later failure after the
+        # director emitted no safe replacement (or the validator rejected it).
+        store.shared_repair_patch_path.unlink(missing_ok=True)
+        return applied
+    payload = {
+        "schema_version": 1,
+        "failure_signature": failure_signature,
+        "source_cycle": cycle,
+        "expires_after_cycle": cycle + max(1, int(ttl_cycles)),
+        "recovery_action": recovery_action,
+        "repair_prompt_patch": patch,
+        "updated_at": utc_now(),
+        "automatic_submission_enabled": False,
+    }
+    atomic_write_json(store.shared_repair_patch_path, payload)
+    applied["repair_applied"] = True
+    applied["repair_rejection_reason"] = ""
+    return applied
 
 
 def _json_object(text: str) -> dict[str, Any]:

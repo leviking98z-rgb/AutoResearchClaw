@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -27,6 +29,7 @@ from researchclaw.runtime_dependencies import (
 from .configuration import load_yaml_mapping, prepare_cycle_config
 from .diagnosis import (
     apply_diagnosis,
+    apply_failure_repair,
     build_llm_client,
     diagnose_cycle,
     run_campaign_aevolve,
@@ -291,6 +294,10 @@ class CampaignSupervisor:
                 "successful_cycles": 0,
                 "failed_cycles": 0,
                 "consecutive_failures": 0,
+                "failure_signature": None,
+                "failure_signature_details": None,
+                "consecutive_same_failure": 0,
+                "failure_recovery_action": None,
                 "consecutive_no_improvement": 0,
                 "best_score": None,
                 "best_cycle": None,
@@ -437,11 +444,26 @@ class CampaignSupervisor:
                     )
                     return 0 if outcome else 1
 
-                if (
+                same_failure_count = int(
+                    self.state.get("consecutive_same_failure", 0)
+                )
+                same_failure_threshold = max(
+                    1, self.options.max_consecutive_failures
+                )
+                generic_failure_threshold = (
                     not self.options.continuous
                     and int(self.state.get("consecutive_failures", 0))
-                    >= max(1, self.options.max_consecutive_failures)
+                    >= same_failure_threshold
+                )
+                if (
+                    same_failure_count >= same_failure_threshold
+                    or generic_failure_threshold
                 ):
+                    threshold_kind = (
+                        "same_failure_signature"
+                        if same_failure_count >= same_failure_threshold
+                        else "consecutive_failures"
+                    )
                     self._transition(
                         status="paused_failure_threshold",
                         phase="idle",
@@ -452,7 +474,14 @@ class CampaignSupervisor:
                         "pause",
                         (
                             "automatic pause after "
-                            f"{self.state['consecutive_failures']} consecutive failures"
+                            f"{same_failure_count} repeated failures with the "
+                            "same signature"
+                            if threshold_kind == "same_failure_signature"
+                            else (
+                                "automatic pause after "
+                                f"{self.state['consecutive_failures']} "
+                                "consecutive failures"
+                            )
                         ),
                     )
                     self.store.log.append(
@@ -460,6 +489,9 @@ class CampaignSupervisor:
                         campaign_id=self.campaign_id,
                         cycle=cycle,
                         consecutive_failures=self.state["consecutive_failures"],
+                        consecutive_same_failure=same_failure_count,
+                        failure_signature=self.state.get("failure_signature"),
+                        threshold_kind=threshold_kind,
                     )
                     return 1
 
@@ -660,6 +692,7 @@ class CampaignSupervisor:
                                 bridge_url=self.options.bridge_url,
                                 api_key_env=self.options.api_key_env,
                                 timeout_sec=self.options.llm_timeout_sec,
+                                cycle=cycle,
                             )
                             try:
                                 selector_llm = self._llm_factory(
@@ -734,6 +767,32 @@ class CampaignSupervisor:
                 return "stopped" if action == "stop" else "paused"
             except Exception as exc:  # noqa: BLE001
                 error = f"{type(exc).__name__}: {exc}"
+                (
+                    selection_failure_signature,
+                    selection_failure_details,
+                ) = self._failure_signature_from_parts(
+                    topic_id=str(self.state.get("selected_topic_id") or ""),
+                    stage="topic_selection",
+                    status="failed",
+                    error=error,
+                    returncode=1,
+                    final_status="failed",
+                )
+                previous_signature = str(
+                    self.state.get("failure_signature") or ""
+                )
+                same_failure_count = (
+                    int(self.state.get("consecutive_same_failure", 0)) + 1
+                    if selection_failure_signature == previous_signature
+                    else 1
+                )
+                recovery_action = (
+                    "auto_repair"
+                    if same_failure_count == 1
+                    else "regenerate"
+                    if same_failure_count == 2
+                    else "quarantine"
+                )
                 self._transition(
                     status="running",
                     phase="idle",
@@ -745,6 +804,10 @@ class CampaignSupervisor:
                     consecutive_failures=(
                         int(self.state.get("consecutive_failures", 0)) + 1
                     ),
+                    failure_signature=selection_failure_signature,
+                    failure_signature_details=selection_failure_details,
+                    consecutive_same_failure=same_failure_count,
+                    failure_recovery_action=recovery_action,
                     last_error=error,
                 )
                 self.store.log.append(
@@ -766,6 +829,7 @@ class CampaignSupervisor:
             bridge_url=self.options.bridge_url,
             api_key_env=self.options.api_key_env,
             timeout_sec=self.options.llm_timeout_sec,
+            cycle=cycle,
         )
         command = self._pipeline_command(run_dir, config_path)
         self._transition(
@@ -817,6 +881,35 @@ class CampaignSupervisor:
         success = pipeline_success
         quality_score = evidence.get("quality_score")
         composite_score = evidence.get("composite_score")
+        failure_signature, failure_signature_details = self._failure_signature(
+            evidence,
+            returncode=returncode,
+            topic_id=selected_topic_id,
+        )
+        previous_failure_signature = str(
+            self.state.get("failure_signature") or ""
+        )
+        previous_same_failure = int(
+            self.state.get("consecutive_same_failure", 0)
+        )
+        if success:
+            same_failure_count = 0
+            failure_signature = ""
+            failure_signature_details = None
+            recovery_action = None
+        else:
+            same_failure_count = (
+                previous_same_failure + 1
+                if failure_signature
+                and failure_signature == previous_failure_signature
+                else 1
+            )
+            if same_failure_count <= 1:
+                recovery_action = "auto_repair"
+            elif same_failure_count == 2:
+                recovery_action = "regenerate"
+            else:
+                recovery_action = "quarantine"
 
         diagnosis: dict[str, Any] = {}
         mutations: list[str] = []
@@ -874,6 +967,21 @@ class CampaignSupervisor:
                             diagnosis=diagnosis,
                         )
                         self._promote_cycle_evolution(run_dir, cycle)
+                    elif not success:
+                        repair_result = apply_failure_repair(
+                            store=self.store,
+                            cycle=cycle,
+                            diagnosis=diagnosis,
+                            failure_signature=failure_signature,
+                            recovery_action=str(recovery_action),
+                        )
+                        self.store.log.append(
+                            "failure_repair_evaluated",
+                            campaign_id=self.campaign_id,
+                            cycle=cycle,
+                            **repair_result,
+                        )
+                        mutations = []
                     else:
                         atomic_write_json(
                             self.store.diagnostics_dir
@@ -897,6 +1005,7 @@ class CampaignSupervisor:
         failures = int(self.state.get("consecutive_failures", 0))
         if success:
             failures = 0
+            self.store.shared_repair_patch_path.unlink(missing_ok=True)
         else:
             failures += 1
         no_improvement = int(
@@ -932,6 +1041,10 @@ class CampaignSupervisor:
             "successful_cycles": successful,
             "failed_cycles": failed,
             "consecutive_failures": failures,
+            "failure_signature": failure_signature or None,
+            "failure_signature_details": failure_signature_details,
+            "consecutive_same_failure": same_failure_count,
+            "failure_recovery_action": recovery_action,
             "consecutive_no_improvement": no_improvement,
             "last_run_dir": str(run_dir),
             "last_pipeline_returncode": returncode,
@@ -979,6 +1092,9 @@ class CampaignSupervisor:
             composite_score=composite_score,
             accepted_as_best=accepted,
             consecutive_failures=failures,
+            consecutive_same_failure=same_failure_count,
+            failure_signature=failure_signature or None,
+            failure_recovery_action=recovery_action,
             consecutive_no_improvement=no_improvement,
             mutations=mutations,
             diagnosis_error=diagnostic_error,
@@ -1028,6 +1144,14 @@ class CampaignSupervisor:
         """
 
         if cycle <= 1 or (run_dir / "checkpoint.json").is_file():
+            return None
+        if str(self.state.get("failure_recovery_action") or "") == "regenerate":
+            self.store.log.append(
+                "cycle_resume_skipped_for_regeneration",
+                campaign_id=self.campaign_id,
+                cycle=cycle,
+                previous_failure_signature=self.state.get("failure_signature"),
+            )
             return None
         pending = self.state.get("pending_topic_action")
         if isinstance(pending, Mapping):
@@ -1680,6 +1804,82 @@ class CampaignSupervisor:
                     f"{first.get('error') or first.get('status')}"
                 )
         return f"pipeline exit {returncode} or incomplete summary"
+
+    @staticmethod
+    def _failure_signature(
+        evidence: Mapping[str, Any],
+        *,
+        returncode: int,
+        topic_id: str,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Build a stable idea+stage+error signature for circuit breaking."""
+
+        stage = "pipeline"
+        stage_number: int | None = None
+        error = ""
+        status = ""
+        failures = evidence.get("failures")
+        if isinstance(failures, Sequence) and not isinstance(
+            failures, (str, bytes, bytearray)
+        ):
+            for item in failures:
+                if not isinstance(item, Mapping):
+                    continue
+                stage = str(item.get("stage_name") or item.get("stage") or stage)
+                try:
+                    stage_number = int(item.get("stage"))
+                except (TypeError, ValueError):
+                    stage_number = None
+                error = str(item.get("error") or "")
+                status = str(item.get("status") or "")
+                break
+        summary = evidence.get("pipeline_summary")
+        final_status = (
+            str(summary.get("final_status") or "")
+            if isinstance(summary, Mapping)
+            else ""
+        )
+        normalized_error = " ".join(error.casefold().split())
+        # Volatile paths, IDs, and counters should not defeat repeat detection.
+        normalized_error = re.sub(r"/[^\s:]+", "<path>", normalized_error)
+        normalized_error = re.sub(r"\b\d+\b", "<n>", normalized_error)
+        normalized_error = normalized_error[:1000]
+        return CampaignSupervisor._failure_signature_from_parts(
+            topic_id=topic_id,
+            stage=stage,
+            stage_number=stage_number,
+            status=status,
+            error=normalized_error,
+            returncode=returncode,
+            final_status=final_status,
+        )
+
+    @staticmethod
+    def _failure_signature_from_parts(
+        *,
+        topic_id: str,
+        stage: str,
+        status: str,
+        error: str,
+        returncode: int,
+        final_status: str,
+        stage_number: int | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        normalized_error = " ".join(str(error).casefold().split())
+        normalized_error = re.sub(r"/[^\s:]+", "<path>", normalized_error)
+        normalized_error = re.sub(r"\b\d+\b", "<n>", normalized_error)[:1000]
+        details = {
+            "topic_id": str(topic_id or "__campaign__"),
+            "stage": str(stage or "pipeline"),
+            "stage_number": stage_number,
+            "status": str(status or ""),
+            "error": normalized_error,
+            "returncode": int(returncode),
+            "final_status": str(final_status or ""),
+        }
+        canonical = json.dumps(details, sort_keys=True, ensure_ascii=False)
+        signature = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+        return signature, details
 
     def _install_signal_handlers(self) -> None:
         if threading.current_thread() is not threading.main_thread():

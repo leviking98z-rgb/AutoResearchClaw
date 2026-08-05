@@ -207,6 +207,11 @@ class CampaignStore:
         # Topic refinements live separately so diagnosis cannot silently
         # weaken that contract or the no-publication boundary.
         self.shared_topic_patch_path = self.shared_dir / "topic_patch.json"
+        # Failed-cycle engineering guidance is transient and scoped to a
+        # concrete failure signature.  It must never be appended permanently
+        # to campaign guidance because a stale workaround can corrupt later
+        # topics or silently weaken scientific gates.
+        self.shared_repair_patch_path = self.shared_dir / "repair_patch.json"
         self.shared_topic_candidates_path = (
             self.shared_dir / "topic_candidates.json"
         )
