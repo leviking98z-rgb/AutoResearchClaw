@@ -306,6 +306,12 @@ def test_run_service_stop_does_not_wait_for_non_cancellable_llm_work(
     assert elapsed < 1.0
     assert controller.store._writer_lock_stream is None
     assert controller.store.list_jobs(statuses={JobStatus.RUNNING})
+    from concurrent.futures import thread as thread_module
+
+    assert all(
+        worker not in thread_module._threads_queues
+        for worker in controller._pool._threads
+    )
 
 
 def test_max_ticks_does_not_schedule_unbounded_downstream_work(

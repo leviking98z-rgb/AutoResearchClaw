@@ -177,6 +177,12 @@ class V2Controller:
             # refund/requeue them.
             if self._stop:
                 self._pool.shutdown(wait=False, cancel_futures=True)
+                # ThreadPoolExecutor registers a private atexit hook that joins
+                # every worker even after shutdown(wait=False). Service stops
+                # intentionally recover durable RUNNING jobs on the next
+                # process, so these non-cancellable CLI-backed workers must be
+                # removed from that interpreter-exit join registry.
+                self._pool.detach_workers_for_process_exit()
                 if self.gpu_broker is not None:
                     self.gpu_broker.close()
                 self.store.release_writer_lock()
@@ -1760,3 +1766,13 @@ class _ControllerThreadPool(concurrent.futures.ThreadPoolExecutor):
             )
         finally:
             self._on_shutdown()
+
+    def detach_workers_for_process_exit(self) -> None:
+        """Prevent Python's executor atexit hook from rejoining live workers."""
+
+        try:
+            from concurrent.futures import thread as thread_module
+        except ImportError:
+            return
+        for worker in tuple(self._threads):
+            thread_module._threads_queues.pop(worker, None)
