@@ -224,7 +224,7 @@ experiment:
   # Multi-node execution through the prepared 4-node / 32-GPU Ray pool.
   # Pool claim/cleanup/spin/Ray lifecycle is owned by bin/cluster-pool.
   clusterbridge_pool:
-    config_file: "/data/workspace/autoresearch-stack/AutoResearchClaw/config.cluster32.yaml"
+    config_file: "config.cluster32.yaml"
     remote_python: "/opt/conda/envs/torch-base/bin/python3"
     setup_commands: []
     # Full `unshare --net` cannot reach Ray GCS. Keep the Ray control plane

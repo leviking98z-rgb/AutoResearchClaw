@@ -36,7 +36,12 @@ def test_prepare_cycle_config_wires_bridge_memory_and_safety(tmp_path: Path) -> 
                     },
                 },
                 "security": {"allow_publish_without_approval": True},
-                "experiment": {"cli_agent": {"provider": "cursor"}},
+                "experiment": {
+                    "cli_agent": {"provider": "cursor"},
+                    "clusterbridge_pool": {
+                        "config_file": "config.cluster32.yaml"
+                    },
+                },
                 "prompts": {
                     "extra_prompts": {"experiment_design": "experiment.md"}
                 },
@@ -88,6 +93,9 @@ def test_prepare_cycle_config_wires_bridge_memory_and_safety(tmp_path: Path) -> 
     assert str(store.shared_skills_dir) in data["skills"]["custom_dirs"]
     assert Path(data["knowledge_base"]["root"]).is_absolute()
     assert Path(data["memory"]["store_dir"]).is_absolute()
+    assert data["experiment"]["clusterbridge_pool"]["config_file"] == str(
+        (base_dir / "config.cluster32.yaml").resolve()
+    )
 
     merged = Path(data["prompts"]["extra_prompts"]["experiment_design"])
     assert merged.is_file()

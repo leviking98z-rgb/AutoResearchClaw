@@ -344,6 +344,17 @@ def prepare_cycle_config(
         memory_path = Path(memory_dir).expanduser()
         if not memory_path.is_absolute():
             memory["store_dir"] = str((base_dir / memory_path).resolve())
+    experiment = _mapping(data, "experiment")
+    clusterbridge_pool = _mapping(experiment, "clusterbridge_pool")
+    pool_config_file = str(
+        clusterbridge_pool.get("config_file", "") or ""
+    ).strip()
+    if pool_config_file:
+        pool_config_path = Path(pool_config_file).expanduser()
+        if not pool_config_path.is_absolute():
+            clusterbridge_pool["config_file"] = str(
+                (base_dir / pool_config_path).resolve()
+            )
     raw_builtin = str(skills.get("builtin_dir", "") or "").strip()
     if raw_builtin:
         builtin_path = Path(raw_builtin).expanduser()
