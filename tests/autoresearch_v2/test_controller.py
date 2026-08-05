@@ -199,6 +199,48 @@ def test_restart_recovers_running_job_without_spending_retry_budget(
     restarted._pool.shutdown(wait=True)
 
 
+def test_restart_refund_removes_incomplete_candidate_workspace(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=store,
+        generator=StaticIdeaGenerator([_candidate(1)]),
+        executors={kind: _InterruptedExecutor() for kind in JobKind},
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    controller.tick()
+    running = store.list_jobs(statuses={JobStatus.RUNNING})[0]
+    attempt = store.get_attempt(running.attempt_id)
+    assert attempt is not None
+    candidate = store.prepare_candidate(attempt)
+    (candidate / "partial.json").write_text("{}", encoding="utf-8")
+    controller._pool.shutdown(wait=True)
+
+    restarted = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([]),
+        executors={kind: _SlowExecutor() for kind in JobKind},
+        sleep=lambda _: None,
+    )
+    restarted.initialize()
+
+    assert not candidate.exists()
+    recovered = restarted.store.get_job(running.job_id)
+    assert recovered is not None
+    assert recovered.attempt == 0
+    restarted.tick()
+    redispatched = restarted.store.get_job(running.job_id)
+    assert redispatched is not None
+    assert redispatched.status is JobStatus.RUNNING
+    assert redispatched.attempt_id == running.attempt_id
+    restarted.request_stop()
+    restarted._pool.shutdown(wait=True)
+
+
 def test_repeated_restart_interruption_never_quarantines_or_spends_budget(
     tmp_path: Path,
 ) -> None:

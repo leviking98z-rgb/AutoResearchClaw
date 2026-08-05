@@ -1494,8 +1494,10 @@ class V2Controller:
                 continue
             refunded = False
             interrupted_attempt_id = job.attempt_id
+            interrupted_attempt: AttemptRecord | None = None
             if job.attempt_id:
                 attempt = self.store.get_attempt(job.attempt_id)
+                interrupted_attempt = attempt
                 if (
                     attempt is not None
                     and attempt.status
@@ -1515,6 +1517,15 @@ class V2Controller:
                     if job.attempt == attempt.number:
                         job.attempt = max(0, job.attempt - 1)
                         refunded = True
+            if refunded and interrupted_attempt is not None:
+                # A refunded interruption reuses the same scientific attempt
+                # number. Preserve the failed attempt row for audit, but remove
+                # only its incomplete candidate workspace so prepare_candidate
+                # or snapshot_current can recreate it cleanly.
+                shutil.rmtree(
+                    self.store.attempt_dir(interrupted_attempt) / "candidate",
+                    ignore_errors=True,
+                )
             job.status = JobStatus.RETRY_WAIT
             job.retry_not_before = datetime.now(UTC).isoformat(
                 timespec="milliseconds"
