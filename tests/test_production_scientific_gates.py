@@ -921,10 +921,64 @@ SEEDS = [0, 1, 2, 3]
     assert report["observed"]["seed_count"] == 4
     assert max(report["observed"]["examples"]) == 512
     assert max(report["observed"]["iterations"]) == 8
-    assert any("more than 3 seeds" in reason for reason in report["reasons"])
+    assert any("more seeds" in reason for reason in report["reasons"])
     assert any(
-        "more than 200 examples" in reason for reason in report["reasons"]
+        "more examples" in reason for reason in report["reasons"]
     )
+
+
+def test_pilot_gate_enforces_explicit_selected_topic_envelope() -> None:
+    selected = {
+        **_selected_topic(),
+        "pilot_envelope": {
+            "max_gpus": 1,
+            "max_seeds": 1,
+            "max_iterations": 1,
+            "max_examples": 50,
+        },
+    }
+    files = {
+        "main.py": """
+NUM_GPUS = 2
+NUM_ITERATIONS = 3
+NUM_EXAMPLES = 100
+SEEDS = [0, 1]
+""",
+    }
+
+    report = _assess_pilot_envelope(files, selected)
+
+    assert report["aligned"] is False
+    assert report["declared_gpu_limit"] == 1
+    assert report["declared_seed_limit"] == 1
+    assert report["declared_iteration_limit"] == 1
+    assert report["declared_example_limit"] == 50
+    assert len(report["reasons"]) == 4
+
+
+def test_pilot_gate_accepts_exact_selected_topic_envelope() -> None:
+    selected = {
+        **_selected_topic(),
+        "pilot_envelope": {
+            "max_gpus": 1,
+            "max_seeds": 1,
+            "max_iterations": 1,
+            "max_examples": 50,
+        },
+    }
+    files = {
+        "main.py": """
+NUM_GPUS = 1
+NUM_ITERATIONS = 1
+NUM_EXAMPLES = 50
+SEEDS = [0]
+""",
+    }
+
+    report = _assess_pilot_envelope(files, selected)
+
+    assert report["aligned"] is True
+    assert report["reasons"] == []
 
 
 def test_stage10_scientific_gate_does_not_treat_generic_open_as_dataset_load() -> None:

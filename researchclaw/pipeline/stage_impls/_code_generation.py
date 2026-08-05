@@ -528,7 +528,10 @@ def _assess_pilot_envelope(
     compute = selected_topic.get("compute")
     if not isinstance(compute, dict):
         compute = {}
-    if not cheap_pilot and not compute:
+    declared_envelope = selected_topic.get("pilot_envelope")
+    if not isinstance(declared_envelope, dict):
+        declared_envelope = {}
+    if not cheap_pilot and not compute and not declared_envelope:
         return {
             "aligned": True,
             "cheap_pilot_declared": False,
@@ -546,7 +549,7 @@ def _assess_pilot_envelope(
         return [
             int(match.group(1))
             for match in re.finditer(
-                rf"(?m)^\s*(?:{escaped})\s*(?::[^=\n]+)?=\s*(\d+)\b",
+                rf"(?mi)^\s*(?:{escaped})\s*(?::[^=\n]+)?=\s*(\d+)\b",
                 combined,
             )
         ]
@@ -667,6 +670,8 @@ def _assess_pilot_envelope(
     }
 
     declared_gpu_count = compute.get("gpu_count", compute.get("max_gpu"))
+    if declared_envelope.get("max_gpus") is not None:
+        declared_gpu_count = declared_envelope.get("max_gpus")
     try:
         declared_gpu_limit = int(declared_gpu_count)
     except (TypeError, ValueError):
@@ -676,6 +681,20 @@ def _assess_pilot_envelope(
         r"\b(?:one|1)[ -]?gpu\b", pilot_lower
     ):
         declared_gpu_limit = 1
+
+    def optional_positive_int(key: str) -> int | None:
+        value = declared_envelope.get(key)
+        if value is None:
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    declared_seed_limit = optional_positive_int("max_seeds")
+    declared_iteration_limit = optional_positive_int("max_iterations")
+    declared_example_limit = optional_positive_int("max_examples")
 
     reasons: list[str] = []
     if (
@@ -691,20 +710,28 @@ def _assess_pilot_envelope(
     # These are conservative production-canary ceilings.  They allow the
     # selected topic's usual 3-5 round / 100-200 example pilot while blocking
     # accidental full-scale campaigns before Stage 11 can apply resources.
-    if observed["seed_count"] > 3:
+    seed_limit = declared_seed_limit or 3
+    if observed["seed_count"] > seed_limit:
         reasons.append(
-            "generated cheap-pilot code hard-codes more than 3 seeds "
-            f"({observed['seed_count']})"
+            "generated cheap-pilot code hard-codes more seeds than the "
+            f"selected topic permits ({observed['seed_count']} > {seed_limit})"
         )
-    if observed["iterations"] and max(observed["iterations"]) > 5:
+    iteration_limit = declared_iteration_limit or 5
+    if (
+        observed["iterations"]
+        and max(observed["iterations"]) > iteration_limit
+    ):
         reasons.append(
-            "generated cheap-pilot code hard-codes more than 5 iterations "
-            f"({max(observed['iterations'])})"
+            "generated cheap-pilot code hard-codes more iterations than the "
+            "selected topic permits "
+            f"({max(observed['iterations'])} > {iteration_limit})"
         )
-    if observed["examples"] and max(observed["examples"]) > 200:
+    example_limit = declared_example_limit or 200
+    if observed["examples"] and max(observed["examples"]) > example_limit:
         reasons.append(
-            "generated cheap-pilot code hard-codes more than 200 examples "
-            f"({max(observed['examples'])})"
+            "generated cheap-pilot code hard-codes more examples than the "
+            f"selected topic permits ({max(observed['examples'])} > "
+            f"{example_limit})"
         )
     contract_text = " ".join(
         _normalize_contract_values(selected_topic)
@@ -723,6 +750,9 @@ def _assess_pilot_envelope(
         "cheap_pilot_declared": True,
         "cheap_pilot": cheap_pilot,
         "declared_gpu_limit": declared_gpu_limit,
+        "declared_seed_limit": declared_seed_limit,
+        "declared_iteration_limit": declared_iteration_limit,
+        "declared_example_limit": declared_example_limit,
         "observed": observed,
         "reasons": reasons,
     }
