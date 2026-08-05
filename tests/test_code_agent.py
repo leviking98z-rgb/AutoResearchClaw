@@ -173,6 +173,48 @@ class TestPhase1Architecture:
 
 
 class TestPhase2ExecFix:
+    def test_single_shot_persists_progress_and_work_in_progress(
+        self, stage_dir: Path, pm: PromptManager,
+    ) -> None:
+        code = (
+            "```filename:main.py\n"
+            "def main():\n"
+            "    print('metric: 1.0')\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+            "```"
+        )
+        llm = FakeLLM(responses=[code])
+        agent = CodeAgent(
+            llm=llm,
+            prompts=pm,
+            config=CodeAgentConfig(
+                architecture_planning=False,
+                hard_validation=False,
+                exec_fix_max_iterations=0,
+                review_max_rounds=0,
+            ),
+            stage_dir=stage_dir,
+            sandbox_factory=None,
+        )
+
+        result = agent.generate(
+            topic="test", exp_plan="plan", metric="metric", pkg_hint="",
+        )
+
+        assert result.files["main.py"].startswith("def main")
+        assert (
+            stage_dir / "work-in-progress" / "main.py"
+        ).read_text(encoding="utf-8") == result.files["main.py"]
+        progress = json.loads(
+            (stage_dir / "code_agent_progress.json").read_text(
+                encoding="utf-8",
+            )
+        )
+        assert progress["state"] == "completed"
+        assert progress["llm_calls"] == 1
+        assert progress["detail"]
+
     def test_exec_fix_loop_fixes_crashing_code(
         self, stage_dir: Path, pm: PromptManager,
     ) -> None:

@@ -25,7 +25,9 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -186,6 +188,8 @@ class CodeAgent:
         self._runs = 0
         self._log: list[str] = []
         self._sandbox: _SandboxLike | None = None
+        self._progress_path = self._stage_dir / "code_agent_progress.json"
+        self._wip_dir = self._stage_dir / "work-in-progress"
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -265,6 +269,14 @@ class CodeAgent:
         self._log_event(
             f"CodeAgent.generate() done in {elapsed:.1f}s — "
             f"{self._calls} LLM calls, {self._runs} sandbox runs"
+        )
+        self._write_progress(
+            phase="complete",
+            detail=(
+                f"generation completed with {len(best.files)} file(s), "
+                f"{self._calls} LLM call(s), and {self._runs} sandbox run(s)"
+            ),
+            state="completed",
         )
 
         return CodeAgentResult(
@@ -552,6 +564,11 @@ class CodeAgent:
                 continue
 
             generated_files[file_name] = code
+            self._persist_files(
+                generated_files,
+                phase="sequential_generation",
+                detail=f"generated {file_name}",
+            )
 
             # Build CodeMem summary via AST
             code_memory[file_name] = self._build_code_summary(
@@ -926,6 +943,11 @@ class CodeAgent:
         if fixed:
             merged = dict(files)
             merged.update(fixed)
+            self._persist_files(
+                merged,
+                phase="hard_validation_repair",
+                detail=f"updated {len(fixed)} file(s)",
+            )
             self._log_event(
                 f"  Repair updated {len(fixed)} file(s): "
                 f"{', '.join(sorted(fixed))}"
@@ -956,6 +978,11 @@ class CodeAgent:
         if not files:
             self._log_event("  WARNING: empty generation, returning fallback")
             return files
+        self._persist_files(
+            files,
+            phase="single_shot_generation",
+            detail="initial generation parsed",
+        )
 
         return self._exec_fix_loop(files)
 
@@ -975,6 +1002,11 @@ class CodeAgent:
                 f"stderr={len(result.stderr or '')} chars"
             )
             files = self._fix_runtime_error(files, result)
+            self._persist_files(
+                files,
+                phase="exec_fix",
+                detail=f"completed repair iteration {i + 1}",
+            )
 
         return files
 
@@ -1381,12 +1413,31 @@ class CodeAgent:
     def _chat(self, system: str, user: str, max_tokens: int = 8192) -> Any:
         """Make an LLM call and track count."""
         self._calls += 1
-        messages = [{"role": "user", "content": user}]
-        return self._llm.chat(
-            messages=messages,
-            system=system,
-            max_tokens=max_tokens,
+        self._write_progress(
+            phase="llm_call",
+            detail=f"request {self._calls} started",
+            state="running",
         )
+        messages = [{"role": "user", "content": user}]
+        try:
+            response = self._llm.chat(
+                messages=messages,
+                system=system,
+                max_tokens=max_tokens,
+            )
+        except Exception as exc:
+            self._write_progress(
+                phase="llm_call",
+                detail=f"request {self._calls} failed: {type(exc).__name__}",
+                state="failed",
+            )
+            raise
+        self._write_progress(
+            phase="llm_call",
+            detail=f"request {self._calls} completed",
+            state="running",
+        )
+        return response
 
     def _get_or_create_sandbox(self) -> _SandboxLike:
         """Lazily create a single sandbox instance for all validation runs."""
@@ -1489,6 +1540,84 @@ class CodeAgent:
         """Log to both Python logger and the internal validation log."""
         logger.info("[CodeAgent] %s", msg)
         self._log.append(msg)
+        self._write_progress(
+            phase="code_agent",
+            detail=msg,
+            state="running",
+        )
+
+    @staticmethod
+    def _atomic_write_text(path: Path, content: str) -> None:
+        """Atomically persist a small text artifact."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+
+    def _write_progress(
+        self,
+        *,
+        phase: str,
+        detail: str,
+        state: str,
+    ) -> None:
+        """Publish durable Stage 10 progress for monitors and operators."""
+        payload = {
+            "state": state,
+            "phase": phase,
+            "detail": detail,
+            "llm_calls": self._calls,
+            "sandbox_runs": self._runs,
+            "updated_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ",
+                time.gmtime(),
+            ),
+        }
+        try:
+            self._atomic_write_text(
+                self._progress_path,
+                json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            )
+        except OSError:
+            logger.debug("Failed to persist CodeAgent progress", exc_info=True)
+
+    def _persist_files(
+        self,
+        files: dict[str, str],
+        *,
+        phase: str,
+        detail: str,
+    ) -> None:
+        """Checkpoint parsed files without exposing partial file writes."""
+        persisted: list[str] = []
+        root = self._wip_dir.resolve()
+        for filename, content in files.items():
+            target = (self._wip_dir / filename).resolve()
+            if not target.is_relative_to(root):
+                self._log_event(
+                    f"  WARNING: Skipping path-traversal filename: {filename}"
+                )
+                continue
+            self._atomic_write_text(target, content)
+            persisted.append(filename)
+        self._write_progress(
+            phase=phase,
+            detail=f"{detail}; checkpointed {len(persisted)} file(s)",
+            state="running",
+        )
 
 
 # ---------------------------------------------------------------------------
