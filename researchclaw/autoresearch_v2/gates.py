@@ -121,6 +121,9 @@ class LLMDecisionGate:
         idea: IdeaRecord,
         plan: Mapping[str, Any],
     ) -> GateVerdict:
+        preflight = _design_preflight(idea)
+        if preflight is not None:
+            return preflight
         result = self._design.call(
             f"""\
 Review this preregistered design before implementation.
@@ -238,4 +241,38 @@ def _verdict(value: Mapping[str, Any], tokens: int) -> GateVerdict:
         ),
         tokens=max(0, int(tokens)),
         raw=dict(value),
+    )
+
+
+def _design_preflight(idea: IdeaRecord) -> GateVerdict | None:
+    evidence = idea.candidate.get("novelty_evidence", {})
+    if not isinstance(evidence, Mapping):
+        reason = "novelty evidence is missing"
+    elif evidence.get("available") is not True:
+        reason = "literature service was unavailable during novelty review"
+    elif not evidence.get("closest_papers"):
+        reason = (
+            "novelty search returned no grounded closest papers; refresh "
+            "focused literature queries before spending a design-model call"
+        )
+    else:
+        return None
+    raw = {
+        "decision": "reject",
+        "reason": reason,
+        "confidence": 1.0,
+        "risks": ["unsupported novelty claim"],
+        "required_changes": [
+            "regenerate or refresh the Idea with grounded closest prior work"
+        ],
+    }
+    return GateVerdict(
+        decision="reject",
+        reason=reason,
+        confidence=1.0,
+        risks=("unsupported novelty claim",),
+        required_changes=(
+            "regenerate or refresh the Idea with grounded closest prior work",
+        ),
+        raw=raw,
     )

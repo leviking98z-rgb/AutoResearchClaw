@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from researchclaw.autoresearch_v2.gpu import (
     AdaptiveGPUScheduler,
+    GPUBroker,
     GPULease,
 )
 from researchclaw.autoresearch_v2.models import JobKind, JobRecord
@@ -66,3 +67,60 @@ def test_short_job_backfill_breaks_equal_priority_ties() -> None:
         priorities={"long": 0.8, "short": 0.8},
     )
     assert [job.idea_id for job in ordered] == ["short", "long"]
+
+
+def test_broker_owns_keepalive_but_never_releases_adopted_pool() -> None:
+    class Pool:
+        def __init__(self) -> None:
+            self.started = 0
+            self.stopped = 0
+            self.released = 0
+
+        def start_keepalive(self) -> None:
+            self.started += 1
+
+        def stop_keepalive(self) -> None:
+            self.stopped += 1
+
+        def release(self) -> None:
+            self.released += 1
+
+    pool = Pool()
+    broker = GPUBroker(
+        pool=pool,
+        scheduler=AdaptiveGPUScheduler(total_gpus=8),
+    )
+    assert pool.started == 1
+    broker.close()
+    assert pool.stopped == 1
+    assert pool.released == 0
+
+
+def test_transient_probe_failure_keeps_lease() -> None:
+    class Pool:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def probe_task(self, task_id: str):
+            del task_id
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("temporary bridge timeout")
+            return {"state": "running"}
+
+    broker = GPUBroker(
+        pool=Pool(),
+        scheduler=AdaptiveGPUScheduler(total_gpus=2),
+        probe_failure_threshold=2,
+    )
+    broker.leases["job"] = GPULease(
+        "task",
+        "idea",
+        "job",
+        1,
+    )
+    assert broker.reconcile() == []
+    assert "job" in broker.leases
+    assert broker.leases["job"].probe_failures == 1
+    assert broker.reconcile() == []
+    assert broker.leases["job"].probe_failures == 0

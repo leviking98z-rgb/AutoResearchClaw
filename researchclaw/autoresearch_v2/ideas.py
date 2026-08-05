@@ -186,12 +186,14 @@ class IdeaAdmission:
         duplicate_threshold: float = 0.72,
         max_same_family: int = 2,
         minimum_score: float = 6.0,
-        semantic_duplicate_threshold: float = 0.995,
+        semantic_duplicate_threshold: float = 0.72,
+        require_novelty_evidence: bool = False,
     ) -> None:
         self.duplicate_threshold = duplicate_threshold
         self.max_same_family = max_same_family
         self.minimum_score = minimum_score
         self.semantic_duplicate_threshold = semantic_duplicate_threshold
+        self.require_novelty_evidence = require_novelty_evidence
 
     def decide(
         self,
@@ -204,6 +206,20 @@ class IdeaAdmission:
             return AdmissionDecision(False, "malformed:" + ";".join(errors))
         if idea.score < self.minimum_score:
             return AdmissionDecision(False, "score_below_threshold")
+        if self.require_novelty_evidence:
+            evidence = idea.candidate.get("novelty_evidence", {})
+            if not isinstance(evidence, Mapping):
+                return AdmissionDecision(False, "novelty_evidence_missing")
+            if evidence.get("available") is not True:
+                return AdmissionDecision(
+                    False,
+                    "novelty_evidence_unavailable",
+                )
+            if not evidence.get("closest_papers"):
+                return AdmissionDecision(
+                    False,
+                    "novelty_evidence_empty",
+                )
         current = list(existing)
         for other in current:
             similarity = title_similarity(idea.title, other.title)
@@ -221,7 +237,11 @@ class IdeaAdmission:
                 idea.idea_id == other.idea_id
                 or idea.title.casefold() == other.title.casefold()
                 or similarity >= self.duplicate_threshold
-                or semantic >= self.semantic_duplicate_threshold
+                or (
+                    idea.family == other.family
+                    and semantic >= self.semantic_duplicate_threshold
+                    and similarity >= self.duplicate_threshold * 0.5
+                )
             ):
                 return AdmissionDecision(
                     False,
@@ -231,7 +251,17 @@ class IdeaAdmission:
                     ),
                     other.idea_id,
                 )
-        same_family = sum(other.family == idea.family for other in current)
+        from .models import ACTIVE_IDEA_STATUSES, IdeaStatus
+
+        portfolio_statuses = {
+            IdeaStatus.RESERVOIR,
+            *ACTIVE_IDEA_STATUSES,
+        }
+        same_family = sum(
+            other.family == idea.family
+            and other.status in portfolio_statuses
+            for other in current
+        )
         if same_family >= self.max_same_family:
             return AdmissionDecision(False, "family_quota")
         return AdmissionDecision(True, "admitted")
@@ -263,8 +293,10 @@ class LLMBoardIdeaGenerator:
         llm: Any,
         brief: str,
         literature: LiteratureProvider | None = None,
+        utility_llm: Any | None = None,
     ) -> None:
         self.llm = llm
+        self.utility_llm = utility_llm
         self.brief = brief
         self.literature = literature
         self.round = 0
@@ -283,6 +315,12 @@ class LLMBoardIdeaGenerator:
                 "family": idea.family,
                 "status": idea.status.value,
                 "exit_reason": idea.exit_reason,
+                "research_question": idea.research_question,
+                "falsifiable_hypothesis": idea.falsifiable_hypothesis,
+                "primary_metric": idea.primary_metric,
+                "novelty_gap": str(
+                    idea.candidate.get("novelty_gap", "") or ""
+                ),
             }
             for idea in existing
         ][-80:]
@@ -297,6 +335,15 @@ class LLMBoardIdeaGenerator:
             archive=archive,
             literature=self.last_context,
         )
+        if self.utility_llm is not None:
+            prompt += (
+                "\n\nUtility-tier literature map:\n"
+                + json.dumps(
+                    self._utility_literature_map(self.last_context),
+                    ensure_ascii=False,
+                    indent=2,
+                )[:12000]
+            )
         response = self.llm.chat(
             [{"role": "user", "content": prompt}],
             system=(
@@ -333,8 +380,44 @@ class LLMBoardIdeaGenerator:
                 idea.candidate["novelty_evidence"] = (
                     self.literature.evidence_for_idea(idea)
                 )
+            idea.score = evidence_adjusted_score(idea)
+            idea.priority = round(idea.score / 10.0, 4)
+            idea.candidate["weighted_score"] = idea.score
             ideas.append(idea)
         return sorted(ideas, key=lambda item: (-item.score, item.idea_id))
+
+    def _utility_literature_map(
+        self,
+        literature: LiteratureContext,
+    ) -> dict[str, Any]:
+        response = self.utility_llm.chat(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Extract a compact research landscape from these "
+                        "papers. Return JSON with mechanisms, open_gaps, "
+                        "avoid_duplicates, and suggested_short_queries:\n"
+                        + json.dumps(
+                            list(literature.papers),
+                            ensure_ascii=False,
+                        )[:24000]
+                    ),
+                }
+            ],
+            system=(
+                "You are a low-cost literature organizer. Return only JSON; "
+                "do not select the final research idea."
+            ),
+            json_mode=True,
+            max_tokens=4000,
+            temperature=0.1,
+        )
+        try:
+            value = self._json_object(response.content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return value
 
     def _prompt(
         self,
@@ -398,3 +481,28 @@ All scores are 0-10. Do not select only one winner; produce a diverse board.
             cleaned = re.sub(r"\n?```\s*$", "", cleaned)
         value = json.loads(cleaned)
         return dict(value) if isinstance(value, Mapping) else {}
+
+
+def evidence_adjusted_score(idea: IdeaRecord) -> float:
+    """Temper self-reported board scores with durable novelty evidence."""
+
+    score = float(idea.score)
+    evidence = idea.candidate.get("novelty_evidence", {})
+    if not isinstance(evidence, Mapping):
+        return round(max(0.0, min(10.0, score - 0.5)), 4)
+    papers = evidence.get("closest_papers", [])
+    if not isinstance(papers, list) or not papers:
+        # Missing evidence is uncertainty, never evidence of high novelty.
+        return round(max(0.0, min(10.0, score - 0.75)), 4)
+    try:
+        similarity = float(evidence.get("max_similarity", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        similarity = 0.0
+    if similarity >= 0.72:
+        score -= 1.25
+    elif similarity >= 0.50:
+        score -= 0.55
+    # A grounded nearest-work set is itself valuable even when similarity is
+    # low: the idea can now be designed and reviewed against real precedents.
+    score += min(0.25, len(papers) * 0.025)
+    return round(max(0.0, min(10.0, score)), 4)

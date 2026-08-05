@@ -42,7 +42,11 @@ paper never stops the system.
 ```text
 <state_dir>/
 ├── autoresearch.db
+├── autoresearch.db-wal
+├── controller.lock
+├── control/
 ├── events.jsonl
+├── llm-audit/
 └── ideas/<idea-id>/
     ├── idea.json
     ├── current/                 # latest accepted snapshot
@@ -64,10 +68,12 @@ Only three model clients are constructed:
 |---|---|---|
 | Decision | `codebuddy/gpt-5.6-sol` | Idea board and consequential gates |
 | Worker | `codebuddy/claude-sonnet-5` | Design, implementation, analysis, report |
-| Utility | `codebuddy/claude-haiku-4.5` | High-volume extraction and organization |
+| Utility | `codebuddy/claude-haiku-4.5` | Literature landscape extraction and query organization |
 
 The exact models come from `config.rsi.yaml` model tiers. v2 does not use
-per-stage model proliferation.
+per-stage model proliferation. InfoHub remains the durable retrieval layer;
+the Utility tier extracts a compact landscape for the Idea board, while the
+Decision tier retains final admission and consequential gate authority.
 
 ## GPU policy
 
@@ -85,6 +91,7 @@ The scheduler applies:
 - short-job/backfill ordering;
 - deterministic pool task IDs for idempotent submission;
 - concurrent Pilot/Scale tasks from independent Ideas.
+- bounded tolerance for transient pool probe failures.
 
 Every physical GPU task must write both:
 
@@ -95,10 +102,14 @@ runtime_evidence.json
 
 into the absolute shared attempt output directory. A zero return code without
 those artifacts is an invalid experiment and can never promote `current/`.
+The runtime evidence must agree with the actual GPU allocation and the
+preregistered pilot envelope; Scale must increase example or seed coverage.
+Build admission also requires an executable model loader, benchmark loader,
+artifact writes, and source hashes.
 
-`max_gpu_jobs`, GPU-hour budgets, wall-clock/no-progress limits, exact GPU
-accounting, pool utilization, and per-Idea fair share are enforced by the v2
-Controller.
+`max_gpu_jobs`, GPU-hour budgets, wall-clock/no-progress limits,
+allocated-GPU-time accounting, pool utilization, and per-Idea fair share are
+enforced by the v2 Controller.
 
 ## Decision policy
 
@@ -145,6 +156,19 @@ autoresearch-v2 -c config.autoresearch-v2.yaml status
 autoresearch-v2 -c config.autoresearch-v2.yaml ideas
 ```
 
+`--max-ticks` is a bounded scheduler probe. It waits only for work already
+submitted by the final tick; it does not silently advance every active Idea to
+a terminal state.
+
+## Production preflight
+
+- `state_dir` must be inside `gpu.shared_workspace_root`;
+- the GPU pool must already be claimed and prepared;
+- Bridge and InfoHub must be reachable;
+- missing small runtime packages such as `arxiv` are installed by
+  `bin/researchclaw-ensure-deps`;
+- production GPU-required jobs fail closed when GPU execution is disabled.
+
 ## Current verification
 
 The v2 suite covers:
@@ -160,5 +184,16 @@ The v2 suite covers:
 - strict GPU artifact validation and failed-attempt isolation;
 - explicit `max_gpu_jobs`;
 - persistent reservoir refill/admission;
+- focused InfoHub refresh and grounded novelty admission;
+- preregistration workload/estimand/decision-table checks;
+- real model and benchmark implementation checks;
+- allocation/runtime and Pilot/Scale contract checks;
+- accepted-attempt and interrupted-attempt restart reconciliation;
+- transient GPU probe fault tolerance;
+- bounded `max_ticks` behavior;
 - dashboard data and controls;
 - architecture guard preventing legacy control-plane imports.
+
+The suite is necessary but not sufficient evidence for a 24-hour production
+soak. A real-model GPU canary and long-running fault-injection run remain
+required before declaring the deployment production-complete.

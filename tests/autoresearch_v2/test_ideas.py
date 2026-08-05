@@ -3,6 +3,7 @@ from __future__ import annotations
 from researchclaw.autoresearch_v2.ideas import (
     IdeaAdmission,
     candidate_to_idea,
+    evidence_adjusted_score,
     title_similarity,
     validate_candidate,
 )
@@ -101,3 +102,29 @@ def test_admission_preserves_family_diversity() -> None:
     )
     assert not decision.admitted
     assert decision.reason == "family_quota"
+
+
+def test_admission_can_require_grounded_novelty_evidence() -> None:
+    idea = candidate_to_idea(_candidate())
+    admission = IdeaAdmission(require_novelty_evidence=True)
+    missing = admission.decide(idea, existing=[])
+    assert not missing.admitted
+    assert missing.reason == "novelty_evidence_unavailable"
+
+    idea.candidate["novelty_evidence"] = {
+        "available": True,
+        "closest_papers": [{"title": "Grounded prior"}],
+        "max_similarity": 0.3,
+    }
+    assert admission.decide(idea, existing=[]).admitted
+
+
+def test_missing_novelty_evidence_reduces_self_reported_score() -> None:
+    idea = candidate_to_idea(_candidate())
+    original = idea.score
+    idea.candidate["novelty_evidence"] = {
+        "available": True,
+        "closest_papers": [],
+        "max_similarity": 0.0,
+    }
+    assert evidence_adjusted_score(idea) < original

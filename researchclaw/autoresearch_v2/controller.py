@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import random
 import shlex
 import shutil
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,10 @@ from .models import (
     utc_now,
 )
 from .store import V2Store
-from .validation import validate_experiment_artifacts
+from .validation import (
+    validate_experiment_artifacts,
+    validate_runtime_against_contract,
+)
 
 _KIND_FOR_STATUS = {
     IdeaStatus.NEW: JobKind.DESIGN,
@@ -75,10 +79,26 @@ class V2Controller:
         self.store = store
         self.generator = generator
         self.executors = dict(executors or {})
-        self.default_executor: JobExecutor = SimulatedJobExecutor()
+        self._simulation_mode = (
+            generator.__class__.__name__ == "StaticIdeaGenerator"
+        )
+        self.default_executor: JobExecutor = (
+            SimulatedJobExecutor()
+            if self._simulation_mode
+            else _MissingExecutor()
+        )
         self.gpu_broker = gpu_broker
         self.admission = IdeaAdmission(
-            max_same_family=config.population.max_same_family
+            duplicate_threshold=config.admission.duplicate_threshold,
+            max_same_family=config.population.max_same_family,
+            minimum_score=config.admission.minimum_score,
+            semantic_duplicate_threshold=(
+                config.admission.semantic_duplicate_threshold
+            ),
+            require_novelty_evidence=(
+                config.admission.require_novelty_evidence
+                and not self._simulation_mode
+            ),
         )
         self.sleep = sleep
         self._pool = _ControllerThreadPool(
@@ -92,6 +112,7 @@ class V2Controller:
         self._running: dict[str, _Running] = {}
         self._stop = False
         self._initialized = False
+        self._tick_count = 0
 
     def initialize(self) -> None:
         if self._initialized:
@@ -109,6 +130,8 @@ class V2Controller:
 
     def close(self) -> None:
         self._pool.shutdown(wait=True, cancel_futures=False)
+        if self.gpu_broker is not None:
+            self.gpu_broker.close()
         self.store.release_writer_lock()
         self._initialized = False
 
@@ -122,7 +145,13 @@ class V2Controller:
         ticks = 0
         try:
             while not self._stop:
-                self.tick()
+                try:
+                    self.tick()
+                except Exception as exc:  # noqa: BLE001
+                    self.store.event(
+                        "controller_tick_failed",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
                 ticks += 1
                 if max_ticks is not None and ticks >= max_ticks:
                     break
@@ -138,25 +167,22 @@ class V2Controller:
         return ticks
 
     def _drain_local_futures(self) -> None:
-        # Finish all already-active Ideas without generating or admitting new
-        # ones. This makes a bounded run a consistent checkpoint rather than
-        # stopping between two lifecycle jobs.
-        while True:
-            while self._running:
-                concurrent.futures.wait(
-                    [entry.future for entry in self._running.values()],
-                    return_when=concurrent.futures.FIRST_COMPLETED,
-                )
-                self._collect_finished()
-            self._ensure_jobs()
-            self._dispatch()
-            if not self._running:
-                break
+        # A bounded CLI run is a bounded scheduler probe, not an implicit
+        # request to finish every downstream stage. Drain only work that was
+        # already submitted by the final tick. The next invocation resumes the
+        # durable state and schedules subsequent jobs.
+        while self._running:
+            concurrent.futures.wait(
+                [entry.future for entry in self._running.values()],
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            self._collect_finished()
 
     def request_stop(self) -> None:
         self._stop = True
 
     def tick(self) -> dict[str, Any]:
+        self._tick_count += 1
         if self.store.control_requested("stop"):
             self._stop = True
         self._collect_finished()
@@ -167,6 +193,27 @@ class V2Controller:
             self._admit_reservoir()
             self._ensure_jobs()
             self._dispatch()
+        if (
+            self._tick_count
+            % self.config.retention.maintenance_interval_ticks
+            == 0
+        ):
+            maintenance = self.store.maintain(
+                event_jsonl_max_bytes=(
+                    self.config.retention.event_jsonl_max_mb
+                    * 1024
+                    * 1024
+                ),
+                llm_audit_max_bytes=(
+                    self.config.retention.llm_audit_max_mb
+                    * 1024
+                    * 1024
+                ),
+                keep_failed_attempts_per_job=(
+                    self.config.retention.keep_failed_attempts_per_job
+                ),
+            )
+            self.store.event("maintenance_completed", **maintenance)
         snapshot = self.snapshot()
         self.store.event("controller_tick", **snapshot)
         return snapshot
@@ -383,6 +430,19 @@ class V2Controller:
         ready = self.store.list_jobs(
             statuses={JobStatus.READY, JobStatus.RETRY_WAIT}
         )
+        now = datetime.now(UTC)
+        ready = [
+            job
+            for job in ready
+            if (
+                job.status is JobStatus.READY
+                or not job.retry_not_before
+                or (
+                    (retry_at := _parse_time(job.retry_not_before)) is None
+                    or retry_at <= now
+                )
+            )
+        ]
         priorities = {
             idea.idea_id: idea.priority for idea in self.store.list_ideas()
         }
@@ -391,11 +451,34 @@ class V2Controller:
             for job in ready
             if job.requires_gpu and self.config.gpu.enabled
         ]
+        disabled_gpu = [
+            job
+            for job in ready
+            if (
+                job.requires_gpu
+                and not self.config.gpu.enabled
+                and not self._simulation_mode
+            )
+        ]
         cpu_ready = [
             job
             for job in ready
-            if not job.requires_gpu or not self.config.gpu.enabled
+            if (
+                not job.requires_gpu
+                or (
+                    self._simulation_mode
+                    and not self.config.gpu.enabled
+                )
+            )
         ]
+        for job in disabled_gpu:
+            idea = self.store.get_idea(job.idea_id)
+            if idea is not None:
+                self._reject_budget(
+                    idea,
+                    job,
+                    "gpu_required_but_disabled",
+                )
         if self.gpu_broker is not None:
             gpu_ready = self.gpu_broker.scheduler.order(
                 gpu_ready,
@@ -600,7 +683,15 @@ class V2Controller:
     def _collect_gpu_finished(self) -> None:
         if self.gpu_broker is None:
             return
-        for job_id, result in self.gpu_broker.reconcile():
+        try:
+            completed = self.gpu_broker.reconcile()
+        except Exception as exc:  # noqa: BLE001
+            self.store.event(
+                "gpu_reconcile_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return
+        for job_id, result in completed:
             job = self.store.get_job(job_id)
             if job is None:
                 continue
@@ -645,6 +736,28 @@ class V2Controller:
                 )
             )
             validation = validate_experiment_artifacts(output_dir)
+            plan = self._read_current_json(idea.idea_id, "plan.json")
+            pilot_runtime = (
+                self._read_current_json(
+                    idea.idea_id,
+                    "artifacts/pilot/runtime_evidence.json",
+                )
+                if job.kind is JobKind.SCALE
+                else None
+            )
+            contract_errors = validate_runtime_against_contract(
+                plan=plan,
+                runtime_evidence=validation.get(
+                    "runtime_evidence",
+                    {},
+                ),
+                allocated_gpus=allocated,
+                mode=job.kind.value,
+                pilot_runtime=pilot_runtime,
+            )
+            if contract_errors:
+                validation["errors"].extend(contract_errors)
+                validation["ok"] = False
             attempt.output_manifest = {
                 **dict(result),
                 "output_dir": str(output_dir),
@@ -679,9 +792,6 @@ class V2Controller:
                 )
                 gate_tokens = 0
                 if decision_gate is not None:
-                    plan = self._read_current_json(
-                        idea.idea_id, "plan.json"
-                    )
                     verdict = decision_gate.review_experiment(
                         idea,
                         kind=job.kind,
@@ -821,6 +931,19 @@ class V2Controller:
         if not outcome.success:
             if job.attempt < job.attempt_limit:
                 job.status = JobStatus.RETRY_WAIT
+                delay_sec = (
+                    0.0
+                    if self._simulation_mode
+                    else min(
+                        300.0,
+                        2.0 ** max(0, job.attempt - 1)
+                        + random.uniform(0.0, 1.0),
+                    )
+                )
+                job.retry_not_before = (
+                    datetime.now(UTC)
+                    + timedelta(seconds=delay_sec)
+                ).isoformat(timespec="milliseconds")
                 idea.status = _STATUS_FOR_KIND[job.kind]
             else:
                 job.status = JobStatus.FAILED
@@ -829,6 +952,7 @@ class V2Controller:
                 idea.current_job_id = ""
         else:
             job.status = JobStatus.SUCCEEDED
+            job.retry_not_before = ""
             idea.current_job_id = ""
             if outcome.decision == "promote":
                 idea.status = {
@@ -856,18 +980,17 @@ class V2Controller:
                 idea.status = IdeaStatus.QUARANTINED
                 idea.exit_reason = f"unknown decision: {outcome.decision}"
         idea.last_progress_at = utc_now()
-        self.store.save_job(job)
-        self.store.save_attempt(attempt)
-        self.store.save_idea(idea)
-        self.store.event(
-            "job_finished",
-            idea_id=idea.idea_id,
-            job_id=job.job_id,
-            attempt_id=attempt.attempt_id,
-            success=outcome.success,
-            decision=outcome.decision,
-            reason=outcome.reason,
-            next_status=idea.status.value,
+        self.store.save_transition(
+            idea=idea,
+            job=job,
+            attempt=attempt,
+            event_type="job_finished",
+            payload={
+                "success": outcome.success,
+                "decision": outcome.decision,
+                "reason": outcome.reason,
+                "next_status": idea.status.value,
+            },
         )
 
     def _recover_interrupted_jobs(self) -> None:
@@ -893,12 +1016,62 @@ class V2Controller:
                     task_id=job.submitted_task_id,
                 )
                 continue
+            accepted = (
+                self.store.get_attempt(job.attempt_id)
+                if job.attempt_id
+                else None
+            )
+            if (
+                accepted is not None
+                and accepted.status is AttemptStatus.ACCEPTED
+                and idea is not None
+            ):
+                job.status = JobStatus.SUCCEEDED
+                job.retry_not_before = ""
+                idea.current_job_id = ""
+                idea.status = {
+                    JobKind.DESIGN: IdeaStatus.BUILDING,
+                    JobKind.BUILD: IdeaStatus.PILOTING,
+                    JobKind.PILOT: IdeaStatus.SCALING,
+                    JobKind.SCALE: IdeaStatus.REPORTING,
+                    JobKind.REPORT: IdeaStatus.COMPLETED,
+                }[job.kind]
+                idea.last_progress_at = utc_now()
+                self.store.save_job(job)
+                self.store.save_idea(idea)
+                self.store.event(
+                    "accepted_job_reconciled",
+                    idea_id=job.idea_id,
+                    job_id=job.job_id,
+                    attempt_id=accepted.attempt_id,
+                    status=idea.status.value,
+                )
+                continue
             job.status = (
                 JobStatus.RETRY_WAIT
                 if job.attempt < job.attempt_limit
                 else JobStatus.FAILED
             )
+            if job.status is JobStatus.RETRY_WAIT:
+                job.retry_not_before = datetime.now(UTC).isoformat(
+                    timespec="milliseconds"
+                )
             self.store.save_job(job)
+            if job.attempt_id:
+                attempt = self.store.get_attempt(job.attempt_id)
+                if (
+                    attempt is not None
+                    and attempt.status
+                    in {
+                        AttemptStatus.CREATED,
+                        AttemptStatus.RUNNING,
+                        AttemptStatus.VALIDATING,
+                    }
+                ):
+                    attempt.status = AttemptStatus.FAILED
+                    attempt.error = "controller_interrupted"
+                    attempt.finished_at = utc_now()
+                    self.store.save_attempt(attempt)
             if idea is not None:
                 idea.status = (
                     _STATUS_FOR_KIND[job.kind]
@@ -1076,7 +1249,10 @@ class V2Controller:
         idea_id: str,
         filename: str,
     ) -> dict[str, Any]:
-        path = self.store.current_dir(idea_id) / filename
+        root = self.store.current_dir(idea_id).resolve()
+        path = (root / filename).resolve()
+        if not path.is_relative_to(root):
+            return {}
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, json.JSONDecodeError):
@@ -1092,6 +1268,13 @@ def _parse_time(value: str) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed
+
+
+class _MissingExecutor:
+    def execute(self, **kwargs: Any) -> JobOutcome:
+        job = kwargs.get("job")
+        kind = getattr(job, "kind", "unknown")
+        raise RuntimeError(f"no production executor configured for {kind}")
 
 
 class _ControllerThreadPool(concurrent.futures.ThreadPoolExecutor):

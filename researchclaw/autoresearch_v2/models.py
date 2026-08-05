@@ -151,6 +151,7 @@ class JobRecord:
     expected_output_dir: str = ""
     attempt_id: str = ""
     submitted_task_id: str = ""
+    retry_not_before: str = ""
     result: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
@@ -183,6 +184,9 @@ class JobRecord:
             attempt_id=str(value.get("attempt_id", "") or ""),
             submitted_task_id=str(
                 value.get("submitted_task_id", "") or ""
+            ),
+            retry_not_before=str(
+                value.get("retry_not_before", "") or ""
             ),
             result=dict(value.get("result", {}) or {}),
             created_at=str(value.get("created_at", utc_now())),

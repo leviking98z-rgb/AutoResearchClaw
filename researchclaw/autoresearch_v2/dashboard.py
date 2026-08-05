@@ -153,11 +153,16 @@ class V2Dashboard:
         }
 
     def health(self, stale_after_sec: float = 120.0) -> dict[str, Any]:
-        events = self.store.list_events(limit=1)
+        events = self.store.list_events(limit=500)
+        ticks = [
+            event
+            for event in events
+            if event.get("event_type") == "controller_tick"
+        ]
         age_sec: float | None = None
-        if events:
+        if ticks:
             try:
-                observed = datetime.fromisoformat(events[-1]["timestamp"])
+                observed = datetime.fromisoformat(ticks[-1]["timestamp"])
                 if observed.tzinfo is None:
                     observed = observed.replace(tzinfo=UTC)
                 age_sec = max(
@@ -172,6 +177,7 @@ class V2Dashboard:
             "tick_age_sec": age_sec,
             "stale_after_sec": stale_after_sec,
             "reasons": ["controller_tick_stale"] if stale else [],
+            "writer_lock_present": self.store.writer_lock_path.exists(),
         }
 
     def log(

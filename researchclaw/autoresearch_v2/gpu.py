@@ -37,6 +37,7 @@ class GPULease:
     job_id: str
     allocated_gpus: int
     state: str = "running"
+    probe_failures: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,10 +150,17 @@ class GPUBroker:
         *,
         pool: AsyncGPUPool,
         scheduler: AdaptiveGPUScheduler,
+        probe_failure_threshold: int = 3,
     ) -> None:
         self.pool = pool
         self.scheduler = scheduler
+        self.probe_failure_threshold = max(
+            1,
+            int(probe_failure_threshold),
+        )
         self.leases: dict[str, GPULease] = {}
+        if hasattr(self.pool, "start_keepalive"):
+            self.pool.start_keepalive()
 
     def submit(
         self,
@@ -251,6 +259,10 @@ class GPUBroker:
             try:
                 probe = self.pool.probe_task(lease.task_id)
             except Exception as exc:  # noqa: BLE001
+                lease.probe_failures += 1
+                lease.state = "probe_degraded"
+                if lease.probe_failures < self.probe_failure_threshold:
+                    continue
                 completed.append(
                     (
                         job_id,
@@ -267,6 +279,7 @@ class GPUBroker:
                 continue
             state = str(_value(probe, "state", "unknown"))
             lease.state = state
+            lease.probe_failures = 0
             if state in {"submitted", "running"}:
                 continue
             try:
@@ -311,6 +324,12 @@ class GPUBroker:
             del self.leases[job_id]
         return completed
 
+    def close(self) -> None:
+        # v2 adopts but does not release the physical pool. It does own the
+        # keepalive thread it started for the lifetime of this controller.
+        if hasattr(self.pool, "stop_keepalive"):
+            self.pool.stop_keepalive()
+
     def cancel(self, job_id: str) -> None:
         lease = self.leases.pop(job_id, None)
         if lease is not None:
@@ -339,6 +358,7 @@ class GPUBroker:
                     "job_id": lease.job_id,
                     "allocated_gpus": lease.allocated_gpus,
                     "state": lease.state,
+                    "probe_failures": lease.probe_failures,
                 }
                 for lease in leases
             ],
@@ -351,6 +371,7 @@ def build_clusterbridge_broker(
     reserved_gpus: int,
     max_share_per_idea: float,
     target_utilization: float,
+    probe_failure_threshold: int = 3,
     restore_state: bool = True,
 ) -> GPUBroker:
     """Adopt a prepared ClusterBridge/Ray pool without owning its lifecycle."""
@@ -376,4 +397,5 @@ def build_clusterbridge_broker(
             max_share_per_idea=max_share_per_idea,
             target_utilization=target_utilization,
         ),
+        probe_failure_threshold=probe_failure_threshold,
     )

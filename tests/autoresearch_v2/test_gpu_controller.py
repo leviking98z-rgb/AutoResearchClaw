@@ -121,6 +121,7 @@ def test_controller_submits_multiple_gpu_ideas_into_one_pool(
                 "gpu": {
                     "enabled": True,
                     "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
                     "reserved_gpus": 0,
                     "pilot_max_gpus": 2,
                     "scale_max_gpus": 2,
@@ -200,6 +201,7 @@ def test_controller_enforces_max_gpu_jobs(tmp_path: Path) -> None:
                 "gpu": {
                     "enabled": True,
                     "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
                     "pilot_max_gpus": 2,
                     "scale_max_gpus": 2,
                 },
@@ -263,6 +265,7 @@ def test_missing_gpu_artifacts_retry_without_mutating_current(
                 "gpu": {
                     "enabled": True,
                     "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
                 },
                 "budgets": {
                     "max_job_attempts": 3,

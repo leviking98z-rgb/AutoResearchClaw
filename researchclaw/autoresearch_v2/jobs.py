@@ -29,6 +29,8 @@ from .store import V2Store
 from .validation import (
     validate_experiment_artifacts,
     validate_python_tree,
+    validate_research_implementation,
+    validate_runtime_against_contract,
 )
 
 
@@ -163,12 +165,25 @@ Return exactly:
   }},
   "promotion_rule": "numeric evidence threshold",
   "early_stop_rule": "futility/invalidity threshold",
+  "estimand": "exact unit, treatment contrast and aggregation",
+  "sample_size_rationale": "minimum detectable effect or precision target",
+  "workload_budget": {{
+    "conditions": 2, "models": 1, "examples": 50, "seeds": 1,
+    "max_new_tokens": 512, "estimated_model_calls": 100
+  }},
+  "decision_table": [
+    {{"condition": "all possible metric regions", "decision": "promote|retry|reject"}}
+  ],
   "required_runtime_evidence": [
     "model_loaded", "datasets_loaded", "examples_processed",
     "gpu_count", "gate_decision", "metrics"
   ]
 }}
 The plan must be answerable by the cheap pilot. Keep held-out data isolated.
+Use the Idea's real closest_papers and novelty evidence; never call an empty
+search result proof of novelty. Make metrics comparable across every arm,
+cover all possible outcomes in the decision table, and ensure the workload
+arithmetic fits the stated GPU and wall-clock budget.
 """
 
 
@@ -202,6 +217,14 @@ class BuildJobExecutor:
             target.write_text(content, encoding="utf-8")
         _write_json(candidate / "build.json", output)
         validation = validate_python_tree(candidate)
+        implementation = validate_research_implementation(
+            candidate,
+            plan=plan,
+        )
+        validation["research_contract"] = implementation
+        validation["ok"] = bool(
+            validation.get("ok") and implementation.get("ok")
+        )
         attempt.validation = validation
         attempt.output_manifest = {
             "files": sorted(output["files"]),
@@ -326,6 +349,31 @@ class ExperimentJobExecutor:
         )
         metrics_path = artifacts / "metrics.json"
         validation = validate_experiment_artifacts(artifacts)
+        runtime_errors = validate_runtime_against_contract(
+            plan=_read_json(candidate / "plan.json"),
+            runtime_evidence=validation.get("runtime_evidence", {}),
+            allocated_gpus=int(
+                validation.get("runtime_evidence", {}).get(
+                    "gpu_count",
+                    0,
+                )
+                or 0
+            ),
+            mode=mode,
+            pilot_runtime=(
+                _read_json(
+                    candidate
+                    / "artifacts"
+                    / "pilot"
+                    / "runtime_evidence.json"
+                )
+                if mode == "scale"
+                else None
+            ),
+        )
+        if runtime_errors:
+            validation["errors"].extend(runtime_errors)
+            validation["ok"] = False
         attempt.validation = validation
         attempt.output_manifest = {
             "command": command,

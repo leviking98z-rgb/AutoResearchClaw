@@ -29,6 +29,14 @@ class PopulationConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class AdmissionConfig:
+    minimum_score: float = 6.0
+    duplicate_threshold: float = 0.72
+    semantic_duplicate_threshold: float = 0.72
+    require_novelty_evidence: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class ConcurrencyConfig:
     max_llm_jobs: int = 4
     max_cpu_jobs: int = 8
@@ -48,6 +56,14 @@ class BudgetConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RetentionConfig:
+    event_jsonl_max_mb: int = 256
+    llm_audit_max_mb: int = 256
+    keep_failed_attempts_per_job: int = 4
+    maintenance_interval_ticks: int = 300
+
+
+@dataclass(frozen=True, slots=True)
 class GPUConfig:
     enabled: bool = False
     pool_config: str = ""
@@ -56,6 +72,7 @@ class GPUConfig:
     max_share_per_idea: float = 0.50
     pilot_max_gpus: int = 2
     scale_max_gpus: int = 8
+    probe_failure_threshold: int = 3
     shared_workspace_root: str = (
         "/root/shared/.clusters/.workdir/autoresearch-v2/runs"
     )
@@ -90,8 +107,10 @@ class V2Config:
     state_dir: str = "workspace/autoresearch-v2"
     topic_brief: str = ""
     population: PopulationConfig = field(default_factory=PopulationConfig)
+    admission: AdmissionConfig = field(default_factory=AdmissionConfig)
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
     budgets: BudgetConfig = field(default_factory=BudgetConfig)
+    retention: RetentionConfig = field(default_factory=RetentionConfig)
     gpu: GPUConfig = field(default_factory=GPUConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
     literature: LiteratureConfig = field(default_factory=LiteratureConfig)
@@ -114,6 +133,24 @@ class V2Config:
                     data.get("population"), "population"
                 ).items()
             }
+        )
+        admission_raw = _mapping(data.get("admission"), "admission")
+        admission = AdmissionConfig(
+            minimum_score=float(
+                admission_raw.get("minimum_score", 6.0)
+            ),
+            duplicate_threshold=float(
+                admission_raw.get("duplicate_threshold", 0.72)
+            ),
+            semantic_duplicate_threshold=float(
+                admission_raw.get(
+                    "semantic_duplicate_threshold",
+                    0.72,
+                )
+            ),
+            require_novelty_evidence=bool(
+                admission_raw.get("require_novelty_evidence", True)
+            ),
         )
         concurrency_raw = _mapping(data.get("concurrency"), "concurrency")
         concurrency = ConcurrencyConfig(
@@ -146,6 +183,24 @@ class V2Config:
                 budgets_raw.get("max_no_progress_hours", 12.0)
             ),
         )
+        retention_raw = _mapping(data.get("retention"), "retention")
+        retention = RetentionConfig(
+            event_jsonl_max_mb=int(
+                retention_raw.get("event_jsonl_max_mb", 256)
+            ),
+            llm_audit_max_mb=int(
+                retention_raw.get("llm_audit_max_mb", 256)
+            ),
+            keep_failed_attempts_per_job=int(
+                retention_raw.get(
+                    "keep_failed_attempts_per_job",
+                    4,
+                )
+            ),
+            maintenance_interval_ticks=int(
+                retention_raw.get("maintenance_interval_ticks", 300)
+            ),
+        )
         gpu_raw = _mapping(data.get("gpu"), "gpu")
         gpu = GPUConfig(
             enabled=bool(gpu_raw.get("enabled", False)),
@@ -159,6 +214,9 @@ class V2Config:
             ),
             pilot_max_gpus=int(gpu_raw.get("pilot_max_gpus", 2)),
             scale_max_gpus=int(gpu_raw.get("scale_max_gpus", 8)),
+            probe_failure_threshold=int(
+                gpu_raw.get("probe_failure_threshold", 3)
+            ),
             shared_workspace_root=str(
                 gpu_raw.get(
                     "shared_workspace_root",
@@ -226,8 +284,10 @@ class V2Config:
             ),
             topic_brief=str(data.get("topic_brief", "") or ""),
             population=population,
+            admission=admission,
             concurrency=concurrency,
             budgets=budgets,
+            retention=retention,
             gpu=gpu,
             models=models,
             literature=literature,
@@ -248,6 +308,16 @@ class V2Config:
             raise ValueError(
                 "reservoir_target must be >= reservoir_low_watermark"
             )
+        if not 0 <= self.admission.minimum_score <= 10:
+            raise ValueError("admission.minimum_score must be in [0,10]")
+        if not 0 < self.admission.duplicate_threshold <= 1:
+            raise ValueError(
+                "admission.duplicate_threshold must be in (0,1]"
+            )
+        if not 0 < self.admission.semantic_duplicate_threshold <= 1:
+            raise ValueError(
+                "admission.semantic_duplicate_threshold must be in (0,1]"
+            )
         if min(
             self.concurrency.max_llm_jobs,
             self.concurrency.max_cpu_jobs,
@@ -258,12 +328,26 @@ class V2Config:
             raise ValueError("gpu.target_utilization must be in (0,1]")
         if not 0 < self.gpu.max_share_per_idea <= 1:
             raise ValueError("gpu.max_share_per_idea must be in (0,1]")
+        if self.gpu.probe_failure_threshold < 1:
+            raise ValueError(
+                "gpu.probe_failure_threshold must be positive"
+            )
         if self.gpu.enabled and not self.gpu.pool_config:
             raise ValueError("gpu.pool_config is required when GPU is enabled")
         if self.gpu.enabled and not self.gpu.shared_workspace_root:
             raise ValueError(
                 "gpu.shared_workspace_root is required when GPU is enabled"
             )
+        if self.gpu.enabled:
+            state = self.root
+            shared = Path(
+                self.gpu.shared_workspace_root
+            ).expanduser().resolve()
+            if not state.is_relative_to(shared):
+                raise ValueError(
+                    "state_dir must be inside gpu.shared_workspace_root so "
+                    "immutable attempts are visible to ClusterBridge nodes"
+                )
         if min(
             self.budgets.pilot_gpu_hours,
             self.budgets.scale_gpu_hours,
@@ -271,6 +355,13 @@ class V2Config:
             self.budgets.max_no_progress_hours,
         ) <= 0:
             raise ValueError("budget hours must be positive")
+        if min(
+            self.retention.event_jsonl_max_mb,
+            self.retention.llm_audit_max_mb,
+            self.retention.keep_failed_attempts_per_job,
+            self.retention.maintenance_interval_ticks,
+        ) < 1:
+            raise ValueError("retention limits must be positive")
 
     @classmethod
     def from_file(cls, path: str | Path) -> V2Config:

@@ -7,6 +7,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -34,11 +35,13 @@ class V2Store:
         self.writer_lock_path = self.root / "controller.lock"
         self.control_dir = self.root / "control"
         self._writer_lock_stream: Any | None = None
+        self._event_lock = threading.Lock()
 
     def initialize(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.ideas_root.mkdir(parents=True, exist_ok=True)
         self.control_dir.mkdir(parents=True, exist_ok=True)
+        self._recover_filesystem_commits()
         with self.connect() as conn:
             conn.executescript(
                 """
@@ -88,6 +91,24 @@ class V2Store:
                 );
                 """
             )
+
+    def _recover_filesystem_commits(self) -> None:
+        """Repair interrupted current-directory swaps before DB recovery."""
+
+        if not self.ideas_root.is_dir():
+            return
+        for idea_dir in self.ideas_root.iterdir():
+            if not idea_dir.is_dir():
+                continue
+            current = idea_dir / "current"
+            backup = idea_dir / ".current.previous"
+            staged = sorted(idea_dir.glob(".current.*.tmp"))
+            if not current.exists() and backup.is_dir():
+                os.replace(backup, current)
+            elif current.exists() and backup.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+            for path in staged:
+                shutil.rmtree(path, ignore_errors=True)
 
     def acquire_writer_lock(self) -> None:
         if self._writer_lock_stream is not None:
@@ -157,25 +178,228 @@ class V2Store:
             "attempt_id": attempt_id or None,
             **payload,
         }
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO events(
-                    timestamp,event_type,idea_id,job_id,attempt_id,payload_json
-                ) VALUES(?,?,?,?,?,?)
-                """,
-                (
-                    timestamp,
-                    event_type,
-                    idea_id or None,
-                    job_id or None,
-                    attempt_id or None,
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                ),
+        with self._event_lock:
+            with self.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO events(
+                        timestamp,event_type,idea_id,job_id,attempt_id,payload_json
+                    ) VALUES(?,?,?,?,?,?)
+                    """,
+                    (
+                        timestamp,
+                        event_type,
+                        idea_id or None,
+                        job_id or None,
+                        attempt_id or None,
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+            self._append_event_record(record)
+
+    def save_transition(
+        self,
+        *,
+        idea: IdeaRecord,
+        job: JobRecord,
+        attempt: AttemptRecord,
+        event_type: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Atomically persist one lifecycle transition in SQLite."""
+
+        timestamp = utc_now()
+        idea.updated_at = timestamp
+        job.updated_at = timestamp
+        attempt.updated_at = timestamp
+        idea_data = idea.to_dict()
+        job_data = job.to_dict()
+        attempt_data = attempt.to_dict()
+        record = {
+            "timestamp": timestamp,
+            "event_type": event_type,
+            "idea_id": idea.idea_id,
+            "job_id": job.job_id,
+            "attempt_id": attempt.attempt_id,
+            **dict(payload),
+        }
+        with self._event_lock:
+            with self.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO ideas(
+                        idea_id,status,priority,updated_at,data_json
+                    ) VALUES(?,?,?,?,?)
+                    ON CONFLICT(idea_id) DO UPDATE SET
+                        status=excluded.status,
+                        priority=excluded.priority,
+                        updated_at=excluded.updated_at,
+                        data_json=excluded.data_json
+                    """,
+                    (
+                        idea.idea_id,
+                        idea.status.value,
+                        idea.priority,
+                        timestamp,
+                        json.dumps(
+                            idea_data,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO jobs(
+                        job_id,idea_id,kind,status,updated_at,data_json
+                    ) VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                        status=excluded.status,
+                        updated_at=excluded.updated_at,
+                        data_json=excluded.data_json
+                    """,
+                    (
+                        job.job_id,
+                        job.idea_id,
+                        job.kind.value,
+                        job.status.value,
+                        timestamp,
+                        json.dumps(
+                            job_data,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO attempts(
+                        attempt_id,job_id,idea_id,number,status,
+                        updated_at,data_json
+                    ) VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(attempt_id) DO UPDATE SET
+                        status=excluded.status,
+                        updated_at=excluded.updated_at,
+                        data_json=excluded.data_json
+                    """,
+                    (
+                        attempt.attempt_id,
+                        attempt.job_id,
+                        attempt.idea_id,
+                        attempt.number,
+                        attempt.status.value,
+                        timestamp,
+                        json.dumps(
+                            attempt_data,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO events(
+                        timestamp,event_type,idea_id,job_id,attempt_id,
+                        payload_json
+                    ) VALUES(?,?,?,?,?,?)
+                    """,
+                    (
+                        timestamp,
+                        event_type,
+                        idea.idea_id,
+                        job.job_id,
+                        attempt.attempt_id,
+                        json.dumps(
+                            dict(payload),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+            self._atomic_json(
+                self.idea_dir(idea.idea_id) / "idea.json",
+                idea_data,
             )
+            self._atomic_json(
+                self.attempt_dir(attempt) / "attempt.json",
+                attempt_data,
+            )
+            self._append_event_record(record)
+
+    def _append_event_record(self, record: Mapping[str, Any]) -> None:
         self.events_path.parent.mkdir(parents=True, exist_ok=True)
         with self.events_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            stream.write(
+                json.dumps(
+                    dict(record),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
+    def maintain(
+        self,
+        *,
+        event_jsonl_max_bytes: int,
+        llm_audit_max_bytes: int,
+        keep_failed_attempts_per_job: int,
+    ) -> dict[str, int]:
+        rotated = 0
+        pruned = 0
+        if self._rotate_file(
+            self.events_path,
+            max_bytes=event_jsonl_max_bytes,
+        ):
+            rotated += 1
+        audit_root = self.root / "llm-audit"
+        if audit_root.is_dir():
+            for path in audit_root.rglob("*.jsonl"):
+                if self._rotate_file(
+                    path,
+                    max_bytes=llm_audit_max_bytes,
+                ):
+                    rotated += 1
+        keep = max(1, int(keep_failed_attempts_per_job))
+        by_job: dict[str, list[AttemptRecord]] = {}
+        for attempt in self.list_attempts():
+            if attempt.status in {
+                AttemptStatus.REJECTED,
+                AttemptStatus.FAILED,
+                AttemptStatus.CANCELLED,
+            }:
+                by_job.setdefault(attempt.job_id, []).append(attempt)
+        for attempts in by_job.values():
+            attempts.sort(
+                key=lambda item: (item.number, item.attempt_id),
+                reverse=True,
+            )
+            for attempt in attempts[keep:]:
+                candidate = self.attempt_dir(attempt) / "candidate"
+                if candidate.is_dir():
+                    shutil.rmtree(candidate, ignore_errors=True)
+                    pruned += 1
+        with self.connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        return {"rotated_logs": rotated, "pruned_candidates": pruned}
+
+    @staticmethod
+    def _rotate_file(path: Path, *, max_bytes: int) -> bool:
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return False
+        if size <= max(1, int(max_bytes)):
+            return False
+        archive = path.with_suffix(path.suffix + ".1")
+        archive.unlink(missing_ok=True)
+        os.replace(path, archive)
+        path.touch(mode=0o600)
+        return True
 
     def save_idea(self, idea: IdeaRecord) -> None:
         idea.updated_at = utc_now()

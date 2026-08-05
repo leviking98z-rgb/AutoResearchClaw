@@ -55,3 +55,14 @@ def test_config_contains_shared_workspace_and_infohub_defaults() -> None:
     assert config.gpu.shared_workspace_root.startswith("/root/shared/")
     assert config.literature.enabled
     assert "8077" in config.literature.url
+
+
+def test_health_uses_controller_tick_not_unrelated_event(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    store.event("controller_tick")
+    store.event("dashboard_control_used")
+    health = V2Dashboard(store).health(stale_after_sec=120)
+    assert health["status"] == "ok"

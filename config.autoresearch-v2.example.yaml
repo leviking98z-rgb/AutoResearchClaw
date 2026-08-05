@@ -1,7 +1,7 @@
 autoresearch_v2:
   enabled: false
   system_id: rsi-autoresearch-v2
-  state_dir: /root/shared/.clusters/.workdir/autoresearch-v2/rsi
+  state_dir: /root/shared/.clusters/.workdir/autoresearch-v2/runs/rsi
   topic_brief: >-
     Discover mechanistic, falsifiable, compute-efficient research questions
     about recursive self-improvement and self-iterative optimization of LLMs
@@ -14,6 +14,11 @@ autoresearch_v2:
     active_idea_target: 8
     max_active_ideas: 10
     max_same_family: 2
+  admission:
+    minimum_score: 6.0
+    duplicate_threshold: 0.72
+    semantic_duplicate_threshold: 0.72
+    require_novelty_evidence: true
 
   concurrency:
     max_llm_jobs: 4
@@ -30,6 +35,12 @@ autoresearch_v2:
     max_wall_clock_hours_per_idea: 72
     max_no_progress_hours: 12
 
+  retention:
+    event_jsonl_max_mb: 256
+    llm_audit_max_mb: 256
+    keep_failed_attempts_per_job: 4
+    maintenance_interval_ticks: 300
+
   gpu:
     enabled: false
     pool_config: config.cluster32.yaml
@@ -38,6 +49,7 @@ autoresearch_v2:
     max_share_per_idea: 0.50
     pilot_max_gpus: 2
     scale_max_gpus: 8
+    probe_failure_threshold: 3
     # This path must be visible with the same absolute name on all GPU nodes.
     shared_workspace_root: /root/shared/.clusters/.workdir/autoresearch-v2/runs
 

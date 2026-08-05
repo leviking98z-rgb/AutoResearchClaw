@@ -81,8 +81,13 @@ def test_multi_idea_closed_loop_completes_concurrently(tmp_path: Path) -> None:
     controller.run(max_ticks=80)
     snapshot = controller.snapshot()
 
-    assert snapshot["ideas_by_status"].get("completed", 0) >= 4
-    assert snapshot["jobs_by_status"].get("succeeded", 0) >= 20
+    assert snapshot["ideas_by_status"].get("completed", 0) >= 3
+    assert (
+        snapshot["ideas_by_status"].get("completed", 0)
+        + snapshot["ideas_by_status"].get("reporting", 0)
+        >= 4
+    )
+    assert snapshot["jobs_by_status"].get("succeeded", 0) >= 19
     assert all(
         (controller.store.current_dir(idea.idea_id) / "paper.md").is_file()
         for idea in controller.store.list_ideas()
@@ -94,6 +99,13 @@ class _SlowExecutor(SimulatedJobExecutor):
     def execute(self, **kwargs):
         time.sleep(0.05)
         return super().execute(**kwargs)
+
+
+class _InterruptedExecutor:
+    def execute(self, **kwargs):
+        del kwargs
+        time.sleep(0.05)
+        return JobOutcome(False, "retry", "interrupted fixture", {})
 
 
 def test_controller_reaches_configured_parallelism(tmp_path: Path) -> None:
@@ -151,7 +163,7 @@ def test_restart_recovers_running_job_to_retry_wait(tmp_path: Path) -> None:
         config=_config(tmp_path),
         store=store,
         generator=StaticIdeaGenerator([_candidate(1)]),
-        executors={kind: _SlowExecutor() for kind in JobKind},
+        executors={kind: _InterruptedExecutor() for kind in JobKind},
         sleep=lambda _: None,
     )
     controller.initialize()
@@ -170,4 +182,61 @@ def test_restart_recovers_running_job_to_retry_wait(tmp_path: Path) -> None:
     recovered = restarted.store.get_job(running[0].job_id)
     assert recovered is not None
     assert recovered.status is JobStatus.RETRY_WAIT
+    attempt = restarted.store.get_attempt(running[0].attempt_id)
+    assert attempt is not None
+    assert attempt.status.value == "failed"
+    restarted._pool.shutdown(wait=True)
+
+
+def test_max_ticks_does_not_schedule_unbounded_downstream_work(
+    tmp_path: Path,
+) -> None:
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([_candidate(i) for i in range(4)]),
+        executors={kind: SimulatedJobExecutor() for kind in JobKind},
+        sleep=lambda _: None,
+    )
+    controller.run(max_ticks=1)
+    # The final tick may finish its already-submitted Design jobs, but must not
+    # turn a bounded canary into a full lifecycle drain.
+    assert all(
+        job.kind is JobKind.DESIGN
+        for job in controller.store.list_jobs()
+    )
+
+
+def test_restart_reconciles_already_accepted_attempt(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=store,
+        generator=StaticIdeaGenerator([_candidate(0)]),
+        executors={kind: _SlowExecutor() for kind in JobKind},
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    controller.tick()
+    job = store.list_jobs(statuses={JobStatus.RUNNING})[0]
+    attempt = store.get_attempt(job.attempt_id)
+    assert attempt is not None
+    candidate = store.snapshot_current(attempt)
+    (candidate / "plan.json").write_text("{}", encoding="utf-8")
+    store.commit_candidate(attempt)
+    controller._pool.shutdown(wait=True)
+
+    restarted = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([]),
+        sleep=lambda _: None,
+    )
+    restarted.initialize()
+    recovered = restarted.store.get_job(job.job_id)
+    idea = restarted.store.get_idea(job.idea_id)
+    assert recovered is not None and recovered.status is JobStatus.SUCCEEDED
+    assert idea is not None and idea.status is IdeaStatus.BUILDING
     restarted._pool.shutdown(wait=True)

@@ -83,6 +83,7 @@ function render(data) {
   });
   $("pause").disabled = !data.controls?.can_pause;
   $("resume").disabled = !data.controls?.can_resume;
+  $("stop").disabled = !data.controls?.can_stop;
 }
 
 async function loadIdea(ideaId) {
@@ -142,6 +143,11 @@ $("pause").addEventListener("click", async () => {
 });
 $("resume").addEventListener("click", async () => {
   await api("/api/control/resume", { method: "POST", body: JSON.stringify({ reason: "dashboard" }) });
+  refresh();
+});
+$("stop").addEventListener("click", async () => {
+  if (!window.confirm("确认停止 AutoResearch v2 controller？")) return;
+  await api("/api/control/stop", { method: "POST", body: JSON.stringify({ reason: "dashboard" }) });
   refresh();
 });
 refresh();

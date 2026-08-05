@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from typing import Any, Protocol
 
 from .config import LiteratureConfig
 from .models import IdeaRecord
 
 _WORD_RE = re.compile(r"[a-z][a-z0-9_-]{2,}")
+_CAMEL_RE = re.compile(r"(?<=[a-z])(?=[A-Z])")
 _STOP = {
     "the",
     "and",
@@ -28,6 +29,17 @@ _STOP = {
     "model",
     "models",
     "research",
+}
+_QUERY_EXPANSIONS = {
+    "calibration": "uncertainty calibration selective prediction",
+    "credit": "counterfactual credit assignment causal attribution",
+    "memory": "agent memory reflection experience retrieval",
+    "poison": "memory poisoning attack defense correction",
+    "population": "population search evolutionary agent optimization",
+    "reflection": "self reflection self correction iterative refinement",
+    "rollback": "rollback regression gate checkpoint reversible update",
+    "selfplay": "self play curriculum task generation learnability",
+    "verifier": "verifier feedback reward hacking overfitting",
 }
 
 
@@ -112,22 +124,37 @@ class InfoHubLiteratureProvider:
         )
 
     def evidence_for_idea(self, idea: IdeaRecord) -> dict[str, Any]:
-        queries = [
-            idea.title,
-            f"{idea.research_question} {idea.falsifiable_hypothesis}",
-        ]
-        papers: list[Any] = []
-        errors: list[str] = []
-        available = False
-        for query in queries:
-            result = self.client.search(
-                query,
-                limit=self.config.search_limit,
+        queries = self._idea_queries(idea)
+        papers, available, errors = self._search_queries(queries)
+        refreshed = False
+        if (
+            self.config.refresh_on_low_results
+            and len(papers) < self.config.min_results
+        ):
+            refresh = self.client.collect(
+                queries,
+                limit_per_query=max(
+                    1,
+                    self.config.search_limit // max(1, len(queries)),
+                ),
             )
-            available = available or result.available
-            papers.extend(result.papers)
-            if result.error:
-                errors.append(f"{query}: {result.error}")
+            refreshed = refresh.available
+            available = available or refresh.available
+            papers.extend(refresh.papers)
+            if refresh.error:
+                errors.append(refresh.error)
+            # The durable library may rank newly collected records differently
+            # from the adapter response. Search again so evidence is exactly
+            # what later runs will reuse from InfoHub.
+            searched, searched_available, searched_errors = (
+                self._search_queries(queries)
+            )
+            papers.extend(searched)
+            available = available or searched_available
+            errors.extend(searched_errors)
+        from researchclaw.literature.infohub import deduplicate_papers
+
+        papers = deduplicate_papers(papers)
         ranked = sorted(
             (
                 (
@@ -151,6 +178,7 @@ class InfoHubLiteratureProvider:
         return {
             "queries": queries,
             "available": available,
+            "refreshed": refreshed,
             "error": "; ".join(errors),
             "closest_papers": top,
             "max_similarity": max_similarity,
@@ -162,6 +190,66 @@ class InfoHubLiteratureProvider:
                 else "low"
             ),
         }
+
+    def _search_queries(
+        self,
+        queries: Iterable[str],
+    ) -> tuple[list[Any], bool, list[str]]:
+        papers: list[Any] = []
+        errors: list[str] = []
+        available = False
+        for query in queries:
+            result = self.client.search(
+                query,
+                limit=self.config.search_limit,
+            )
+            available = available or result.available
+            papers.extend(result.papers)
+            if result.error:
+                errors.append(f"{query}: {result.error}")
+        return papers, available, errors
+
+    @staticmethod
+    def _idea_queries(idea: IdeaRecord) -> list[str]:
+        text = " ".join(
+            (
+                idea.title,
+                idea.research_question,
+                idea.falsifiable_hypothesis,
+                str(idea.candidate.get("novelty_gap", "") or ""),
+            )
+        )
+        tokens = [
+            token
+            for token in _tokens(text)
+            if token not in _STOP
+        ]
+        weighted: list[str] = []
+        for token in tokens:
+            weighted.extend(
+                _QUERY_EXPANSIONS.get(token, token).split()
+            )
+        unique_weighted = list(dict.fromkeys(weighted))
+        # InfoHub FTS and academic endpoints are much more reliable on a few
+        # focused concepts than on an entire generated hypothesis sentence.
+        primary = " ".join(unique_weighted[:8])
+        family = idea.family.replace("-", " ")
+        family_query = (
+            f"large language model agent {family} "
+            "self improvement"
+        )
+        queries = [
+            primary,
+            family_query,
+            " ".join(unique_weighted[-8:]),
+        ]
+        return [
+            query
+            for query in dict.fromkeys(
+                " ".join(query.split()).strip() for query in queries
+            )
+            if query
+        ][:4]
 
     @staticmethod
     def _board_queries(
@@ -196,15 +284,18 @@ class InfoHubLiteratureProvider:
 def semantic_similarity(left: str, right: str) -> float:
     a = set(_tokens(left))
     b = set(_tokens(right))
-    jaccard = len(a & b) / len(a | b) if a and b else 0.0
-    sequence = SequenceMatcher(None, left.casefold(), right.casefold()).ratio()
-    # Jaccard over research descriptions is often inflated by domain boilerplate
-    # (benchmark/model/metric terms). Require close phrasing as corroboration
-    # instead of treating shared vocabulary alone as a semantic duplicate.
-    return round(jaccard * sequence, 4)
+    if not a or not b:
+        return 0.0
+    intersection = len(a & b)
+    if not intersection:
+        return 0.0
+    # Cosine-style lexical overlap gives useful non-zero novelty ranking for
+    # differently phrased papers while remaining conservative for admission.
+    return round(intersection / math.sqrt(len(a) * len(b)), 4)
 
 
 def _tokens(value: str) -> list[str]:
+    value = _CAMEL_RE.sub(" ", value)
     return [
         token
         for token in _WORD_RE.findall(value.casefold())

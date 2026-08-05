@@ -53,6 +53,7 @@ def build_production_controller(
         llm=router.decision,
         brief=config.topic_brief,
         literature=literature,
+        utility_llm=router.utility,
     )
     decision_gate = LLMDecisionGate(client=router.decision)
     design = DesignJobExecutor(
@@ -93,6 +94,9 @@ def build_production_controller(
             reserved_gpus=config.gpu.reserved_gpus,
             max_share_per_idea=config.gpu.max_share_per_idea,
             target_utilization=config.gpu.target_utilization,
+            probe_failure_threshold=(
+                config.gpu.probe_failure_threshold
+            ),
         )
         if config.gpu.enabled
         else None

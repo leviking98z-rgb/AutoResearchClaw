@@ -11,6 +11,7 @@ h1 { font-size: 28px; letter-spacing: -.02em; }
 small { color: #8facbf; }
 .actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
 button { color: #f3fbff; background: #164568; border: 1px solid #2d709d; padding: 8px 12px; border-radius: 8px; cursor: pointer; }
+.danger { background: #632435; border-color: #a64159; }
 button:disabled { opacity: .38; cursor: default; }
 main { padding: 22px; display: grid; gap: 18px; }
 .metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
