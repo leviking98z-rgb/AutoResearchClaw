@@ -53,18 +53,39 @@ class StructuredRole:
         *,
         max_tokens: int,
         temperature: float,
+        retry_context: Callable[
+            [Mapping[str, Any], list[str]], str
+        ]
+        | None = None,
     ) -> StructuredResult:
         error = ""
         total_prompt = 0
         total_completion = 0
         total_tokens = 0
         last_model = ""
+        previous_value: dict[str, Any] | None = None
         for attempt in range(1, self.max_attempts + 1):
             request = prompt
             if error:
+                repair = ""
+                if retry_context is not None and previous_value is not None:
+                    repair = retry_context(
+                        previous_value,
+                        [
+                            item.strip()
+                            for item in error.split(";")
+                            if item.strip()
+                        ],
+                    )
+                if not repair:
+                    repair = (
+                        "Return a complete corrected JSON object. Preserve all "
+                        "valid fields from your previous response and change "
+                        "only what the validation errors require."
+                    )
                 request += (
-                    "\n\nYour previous response was rejected. Return a complete "
-                    f"corrected JSON object. Validation errors: {error}"
+                    "\n\nYour previous response was rejected by deterministic "
+                    f"validation. Validation errors: {error}\n\n{repair}"
                 )
             response = self.client.chat(
                 [{"role": "user", "content": request}],
@@ -83,10 +104,12 @@ class StructuredRole:
                 value = parse_json_object(response.content)
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 error = f"invalid_json:{exc}"
+                previous_value = None
                 continue
             errors = self.validator(value)
             if errors:
                 error = "; ".join(errors)
+                previous_value = value
                 continue
             return StructuredResult(
                 value=value,

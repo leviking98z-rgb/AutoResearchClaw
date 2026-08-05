@@ -120,6 +120,7 @@ class DesignJobExecutor:
             ),
             max_tokens=10000,
             temperature=0.25,
+            retry_context=self._validation_repair_context,
         )
         _write_json(candidate / "plan.json", result.value)
         gate_tokens = 0
@@ -341,6 +342,39 @@ contract workload_budget.models means model calls per arm-example-seed unit,
 not the count of distinct model identities. Do not set
 an effect threshold below the metric's finite-sample resolution. A promoted
 pilot still requires the confirmatory_followup at Scale.
+"""
+
+    @staticmethod
+    def _validation_repair_context(
+        previous_value: Mapping[str, Any],
+        errors: list[str],
+    ) -> str:
+        """Keep deterministic schema repair local to the rejected draft."""
+
+        return f"""\
+Repair the exact prior JSON below; do not redesign the study, add arms, change
+the Idea, or expand the scientific protocol. Preserve every field not named by
+the validation errors.
+
+For arithmetic errors, recompute declarations from the already stated plan:
+- sample_accounting.total_model_calls =
+  arms * examples_per_arm * seeds * calls_per_example;
+- workload_budget.conditions = sample_accounting.arms;
+- workload_budget.models = sample_accounting.calls_per_example (this field is
+  calls per arm-example-seed unit, not distinct model identities);
+- workload_budget.examples = sample_accounting.examples_per_arm;
+- workload_budget.seeds = sample_accounting.seeds;
+- workload_budget.estimated_model_calls =
+  sample_accounting.total_model_calls.
+For effect_threshold.scale use exactly one of: "proportion",
+"percentage_points", or "absolute". Do not weaken the threshold merely to pass
+validation.
+
+PRIOR JSON TO REPAIR:
+{json.dumps(dict(previous_value), ensure_ascii=False, indent=2)[:24000]}
+
+DETERMINISTIC ERRORS TO FIX:
+{json.dumps(errors, ensure_ascii=False, indent=2)[:8000]}
 """
 
 

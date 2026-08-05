@@ -10,6 +10,7 @@ from researchclaw.autoresearch_v2.jobs import (
     BuildJobExecutor,
     DesignJobExecutor,
 )
+from researchclaw.autoresearch_v2.llm import StructuredRole
 from researchclaw.autoresearch_v2.models import (
     AttemptRecord,
     AttemptStatus,
@@ -74,6 +75,24 @@ class _Gate:
     def review_design(self, idea, plan):
         del idea, plan
         return GateVerdict("promote", "ok", 1.0)
+
+
+class _RetryClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests: list[str] = []
+
+    def chat(self, messages, **kwargs):
+        del kwargs
+        self.requests.append(messages[0]["content"])
+        value = self.responses.pop(0)
+        return SimpleNamespace(
+            content=json.dumps(value),
+            model="worker",
+            prompt_tokens=1,
+            completion_tokens=1,
+            total_tokens=2,
+        )
 
 
 def _plan():
@@ -217,6 +236,37 @@ def test_first_design_attempt_has_no_revision_directive() -> None:
     assert '"split_id": "confirmatory-v1"' in prompt
     assert '"split_role": "screening"' in prompt
     assert "must NOT claim" in prompt
+
+
+def test_design_structured_retry_repairs_prior_json_locally() -> None:
+    invalid = _plan()
+    invalid["effect_threshold"] = {
+        "value": 0.15,
+        "scale": "proportion_points",
+    }
+    client = _RetryClient([invalid, _plan()])
+    role = StructuredRole(
+        client=client,
+        system="return json",
+        validator=lambda value: (
+            []
+            if value["effect_threshold"]["scale"] == "proportion"
+            else ["invalid effect_threshold.scale"]
+        ),
+    )
+
+    result = role.call(
+        "make a plan",
+        max_tokens=100,
+        temperature=0.2,
+        retry_context=DesignJobExecutor._validation_repair_context,
+    )
+
+    assert result.attempts == 2
+    assert "Repair the exact prior JSON below" in client.requests[1]
+    assert '"scale": "proportion_points"' in client.requests[1]
+    assert "do not redesign the study" in client.requests[1]
+    assert "calls per arm-example-seed unit" in client.requests[1]
 
 
 def test_build_smoke_can_defer_to_controller_managed_gpu_environment(
