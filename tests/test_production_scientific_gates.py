@@ -1030,6 +1030,67 @@ if __name__ == "__main__":
     assert report["missing_dataset_execution"] is False
 
 
+def test_stage10_scientific_gate_accepts_class_based_brier_gate() -> None:
+    selected = _selected_topic()
+    files = {
+        "data_utils.py": """
+from datasets import load_dataset
+
+def load_benchmarks():
+    return {
+        "gsm8k": load_dataset("openai/gsm8k", "main", split="train"),
+        "math": load_dataset("EleutherAI/hendrycks_math", "algebra", split="test"),
+        "mbpp": load_dataset("google-research-datasets/mbpp", split="validation"),
+        "humaneval": load_dataset("openai/openai_humaneval", split="test"),
+    }
+""",
+        "models.py": """
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+class QwenSelfRefiner:
+    def __init__(self):
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "Qwen/Qwen2.5-7B-Instruct"
+        )
+        self.model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen2.5-7B-Instruct"
+        )
+
+    def generate(self, batch):
+        return self.model.generate(**batch)
+
+class CalibrationAwareGate:
+    def decide(self, dev_stats):
+        brier_delta = dev_stats["brier1"] - dev_stats["brier0"]
+        if brier_delta <= 0 and dev_stats["acc1"] >= dev_stats["acc0"]:
+            return True, "accepted: calibration and accuracy did not regress"
+        return False, "rejected: retain iteration 0"
+""",
+        "main.py": """
+from data_utils import load_benchmarks
+from models import CalibrationAwareGate, QwenSelfRefiner
+
+def main():
+    benchmarks = load_benchmarks()
+    refiner = QwenSelfRefiner()
+    accept, reason = CalibrationAwareGate().decide({
+        "brier0": 0.2, "brier1": 0.3, "acc0": 0.6, "acc1": 0.5,
+    })
+    print(benchmarks, refiner, accept, reason)
+""",
+    }
+
+    report = _assess_scientific_code_alignment(
+        files,
+        selected,
+        str(selected["title"]),
+    )
+
+    assert report["aligned"] is True
+    assert "calibrationawaregate" in report["acceptance_gate_markers"]
+    assert "brier_delta" in report["calibration_markers"]
+
+
 def test_stage10_scientific_gate_requires_calibration_driven_acceptance_gate() -> None:
     selected = _selected_topic()
     files = {

@@ -873,9 +873,16 @@ def _assess_scientific_code_alignment(
         marker
         for marker in (
             "acceptance_gate",
+            "acceptancegate",
+            "calibrationawaregate",
+            "accept_iter",
+            "accept, reason",
             "should_accept",
             "accept_update",
             "reject_update",
+            "accepted:",
+            "rejected:",
+            "retain iteration",
             "rollback",
             "stopping_gate",
         )
@@ -888,6 +895,9 @@ def _assess_scientific_code_alignment(
             "calibration_error",
             "calibration_gap",
             "brier_score",
+            "brier0",
+            "brier1",
+            "brier_delta",
             "reliability_diagram",
             "ece",
         )
