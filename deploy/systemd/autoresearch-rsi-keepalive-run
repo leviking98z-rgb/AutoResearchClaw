@@ -214,11 +214,23 @@ while [[ ! -e "$STOP_FILE" ]]; do
     write_heartbeat "failed" "claim ownership verification failed"
     exit 1
   fi
-  if renew_central_allocations >>"$LOG_FILE" 2>&1; then
-    renew_mode="central-allocation"
-  elif renew_allocation_compat >>"$LOG_FILE" 2>&1; then
+  renew_mode=""
+  for attempt in 1 2 3; do
+    if renew_central_allocations >>"$LOG_FILE" 2>&1; then
+      renew_mode="central-allocation"
+      break
+    fi
+    # The shared resource-manager socket/queue can transiently time out.
+    # Do not immediately fall through to the legacy per-node alias because
+    # centralized allocations intentionally reject that path.
+    printf '%s renew=retry attempt=%s mode=central-allocation\n' \
+      "$(date -Is)" "$attempt" >>"$LOG_FILE"
+    (( attempt < 3 )) && sleep $((attempt * 5))
+  done
+  if [[ -z "$renew_mode" ]] && renew_allocation_compat >>"$LOG_FILE" 2>&1; then
     renew_mode="compatibility-alias"
-  else
+  fi
+  if [[ -z "$renew_mode" ]]; then
     write_heartbeat "failed" "allocation renewal failed"
     exit 1
   fi
