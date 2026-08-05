@@ -688,6 +688,7 @@ class LLMBoardIdeaGenerator:
         self.literature = literature
         self.round = 0
         self.last_context = LiteratureContext()
+        self.last_rejections: list[dict[str, Any]] = []
 
     def generate(
         self,
@@ -744,17 +745,30 @@ class LLMBoardIdeaGenerator:
         )
         raw = self._json_object(response.content)
         candidates = raw.get("candidates")
-        if not isinstance(candidates, list) or len(candidates) < requested:
-            raise ValueError(
-                f"idea board requires at least {requested} candidates"
-            )
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError("idea board returned no candidate list")
+        self.last_rejections = []
         ideas: list[IdeaRecord] = []
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
             if not isinstance(candidate, Mapping):
-                raise TypeError("candidate must be an object")
+                self.last_rejections.append(
+                    {
+                        "index": index,
+                        "reason": "candidate must be an object",
+                    }
+                )
+                continue
             errors = validate_candidate(candidate)
             if errors:
-                raise ValueError("invalid candidate: " + "; ".join(errors))
+                self.last_rejections.append(
+                    {
+                        "index": index,
+                        "id": str(candidate.get("id", "") or ""),
+                        "title": str(candidate.get("title", "") or ""),
+                        "reason": "; ".join(errors),
+                    }
+                )
+                continue
             idea = candidate_to_idea(candidate)
             idea.candidate["literature_context"] = {
                 "queries": list(self.last_context.queries),
@@ -771,7 +785,19 @@ class LLMBoardIdeaGenerator:
             idea.priority = round(idea.score / 10.0, 4)
             idea.candidate["weighted_score"] = idea.score
             ideas.append(idea)
-        return sorted(ideas, key=lambda item: (-item.score, item.idea_id))
+        if not ideas:
+            reasons = "; ".join(
+                str(item.get("reason", "") or "")
+                for item in self.last_rejections[:3]
+            )
+            raise ValueError(
+                "idea board returned no valid candidates"
+                + (f": {reasons}" if reasons else "")
+            )
+        return sorted(
+            ideas,
+            key=lambda item: (-item.score, item.idea_id),
+        )[:requested]
 
     def _utility_literature_map(
         self,

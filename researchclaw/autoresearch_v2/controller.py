@@ -71,6 +71,12 @@ class _Running:
     attempt_id: str
 
 
+@dataclass(slots=True)
+class _IdeaGeneration:
+    future: concurrent.futures.Future[list[IdeaRecord]]
+    requested: int
+
+
 class V2Controller:
     """One controller, SQLite source of truth, isolated immutable attempts."""
 
@@ -118,7 +124,19 @@ class V2Controller:
             thread_name_prefix="autoresearch-v2",
             on_shutdown=store.release_writer_lock,
         )
+        # Idea generation performs several InfoHub requests and two LLM calls.
+        # It must never block the scheduling/heartbeat thread or occupy a Job
+        # executor worker.  The single worker also guarantees one portfolio
+        # board is generated at a time.
+        self._idea_pool = _ControllerThreadPool(
+            max_workers=1,
+            thread_name_prefix="autoresearch-v2-ideas",
+            on_shutdown=lambda: None,
+        )
         self._running: dict[str, _Running] = {}
+        self._idea_generation: _IdeaGeneration | None = None
+        self._idea_generation_failures = 0
+        self._idea_generation_retry_not_before = 0.0
         self._stop = False
         self._stop_reason = ""
         self._initialized = False
@@ -139,6 +157,7 @@ class V2Controller:
         )
 
     def close(self) -> None:
+        self._idea_pool.shutdown(wait=True, cancel_futures=False)
         self._pool.shutdown(wait=True, cancel_futures=False)
         if self.gpu_broker is not None:
             self.gpu_broker.close()
@@ -176,6 +195,10 @@ class V2Controller:
             # leave those jobs durable as RUNNING and let startup recovery
             # refund/requeue them.
             if self._stop:
+                self._idea_pool.shutdown(
+                    wait=False,
+                    cancel_futures=True,
+                )
                 self._pool.shutdown(wait=False, cancel_futures=True)
                 # ThreadPoolExecutor registers a private atexit hook that joins
                 # every worker even after shutdown(wait=False). Service stops
@@ -183,6 +206,7 @@ class V2Controller:
                 # process, so these non-cancellable CLI-backed workers must be
                 # removed from that interpreter-exit join registry.
                 self._pool.detach_workers_for_process_exit()
+                self._idea_pool.detach_workers_for_process_exit()
                 # Do not synchronously probe or stop a remote pool from a
                 # POSIX-signal path. Any submitted GPU tasks remain durable and
                 # are adopted by startup recovery; the process exiting stops
@@ -199,12 +223,18 @@ class V2Controller:
         # request to finish every downstream stage. Drain only work that was
         # already submitted by the final tick. The next invocation resumes the
         # durable state and schedules subsequent jobs.
-        while self._running:
+        while self._running or self._idea_generation is not None:
+            futures = [
+                entry.future for entry in self._running.values()
+            ]
+            if self._idea_generation is not None:
+                futures.append(self._idea_generation.future)
             concurrent.futures.wait(
-                [entry.future for entry in self._running.values()],
+                futures,
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
             self._collect_finished()
+            self._collect_idea_generation()
 
     def request_stop(self, reason: str = "requested") -> None:
         if self._stop:
@@ -216,6 +246,9 @@ class V2Controller:
                 "controller_stop_requested",
                 reason=self._stop_reason,
                 running_futures=len(self._running),
+                idea_generation_running=(
+                    self._idea_generation is not None
+                ),
                 running_gpu_jobs=(
                     len(self.gpu_broker.leases)
                     if self.gpu_broker is not None
@@ -228,13 +261,20 @@ class V2Controller:
         if self.store.control_requested("stop"):
             self.request_stop(reason="control_stop")
         self._collect_finished()
+        self._collect_idea_generation()
         self._collect_gpu_finished()
         self._enforce_liveness_budgets()
         if not self.store.control_requested("pause") and not self._stop:
-            self._maintain_reservoir()
+            # Static generators are test/simulation fixtures and complete
+            # synchronously.  Production generation runs after dispatch so
+            # ready scientific work always has first claim on LLM capacity.
+            if self._simulation_mode:
+                self._maintain_reservoir()
             self._admit_reservoir()
             self._ensure_jobs()
             self._dispatch()
+            if not self._simulation_mode:
+                self._maintain_reservoir()
         if (
             self._tick_count
             % self.config.retention.maintenance_interval_ticks
@@ -272,7 +312,13 @@ class V2Controller:
         gpu_running = bool(
             self.gpu_broker and self.gpu_broker.leases
         )
-        return not active and not ready and not self._running and not gpu_running
+        return (
+            not active
+            and not ready
+            and not self._running
+            and self._idea_generation is None
+            and not gpu_running
+        )
 
     def _maintain_reservoir(self) -> None:
         ideas = self.store.list_ideas()
@@ -285,18 +331,91 @@ class V2Controller:
             self.config.population.generation_batch_size,
             self.config.population.reservoir_target - len(reservoir),
         )
-        try:
-            generated = self.generator.generate(
-                count=needed,
-                existing=ideas,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.store.event(
-                "idea_generation_failed",
+        if self._simulation_mode:
+            try:
+                generated = self.generator.generate(
+                    count=needed,
+                    existing=ideas,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.store.event(
+                    "idea_generation_failed",
+                    requested=needed,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                return
+            self._apply_generated_ideas(
+                generated,
                 requested=needed,
-                error=f"{type(exc).__name__}: {exc}",
             )
             return
+        if self._idea_generation is not None:
+            return
+        if time.monotonic() < self._idea_generation_retry_not_before:
+            return
+        if self._running_llm_count() >= self.config.concurrency.max_llm_jobs:
+            return
+        existing = tuple(ideas)
+        future = self._idea_pool.submit(
+            self.generator.generate,
+            count=needed,
+            existing=existing,
+        )
+        self._idea_generation = _IdeaGeneration(
+            future=future,
+            requested=needed,
+        )
+        self.store.event(
+            "idea_generation_started",
+            requested=needed,
+            reservoir_size=len(reservoir),
+        )
+
+    def _collect_idea_generation(self) -> None:
+        running = self._idea_generation
+        if running is None or not running.future.done():
+            return
+        self._idea_generation = None
+        try:
+            generated = running.future.result()
+        except Exception as exc:  # noqa: BLE001
+            self._idea_generation_failures += 1
+            delay_sec = min(
+                300.0,
+                30.0 * (2 ** (self._idea_generation_failures - 1)),
+            )
+            self._idea_generation_retry_not_before = (
+                time.monotonic() + delay_sec
+            )
+            self.store.event(
+                "idea_generation_failed",
+                requested=running.requested,
+                error=f"{type(exc).__name__}: {exc}",
+                retry_in_sec=delay_sec,
+            )
+            return
+        result = self._apply_generated_ideas(
+            generated,
+            requested=running.requested,
+        )
+        if result["reservoir_added"] > 0:
+            self._idea_generation_failures = 0
+            self._idea_generation_retry_not_before = 0.0
+            return
+        self._idea_generation_failures += 1
+        delay_sec = min(
+            300.0,
+            30.0 * (2 ** (self._idea_generation_failures - 1)),
+        )
+        self._idea_generation_retry_not_before = time.monotonic() + delay_sec
+
+    def _apply_generated_ideas(
+        self,
+        generated: list[IdeaRecord],
+        *,
+        requested: int,
+    ) -> dict[str, int]:
+        ideas = self.store.list_ideas()
         added = 0
         rejected = 0
         known = list(ideas)
@@ -327,11 +446,29 @@ class V2Controller:
             added += 1
         self.store.event(
             "idea_generation_batch",
-            requested=needed,
+            requested=requested,
             generated=len(generated),
             reservoir_added=added,
             rejected=rejected,
+            invalid_generated=len(
+                getattr(self.generator, "last_rejections", ())
+            ),
         )
+        return {
+            "generated": len(generated),
+            "reservoir_added": added,
+            "rejected": rejected,
+        }
+
+    def _running_llm_count(self) -> int:
+        return sum(
+            1
+            for entry in self._running.values()
+            if (
+                (job := self.store.get_job(entry.job_id)) is not None
+                and job.kind in _LLM_KINDS
+            )
+        ) + int(self._idea_generation is not None)
 
     def _admit_reservoir(self) -> None:
         ideas = self.store.list_ideas()
@@ -501,14 +638,7 @@ class V2Controller:
         )
 
     def _dispatch(self) -> None:
-        running_llm = sum(
-            1
-            for entry in self._running.values()
-            if (
-                (job := self.store.get_job(entry.job_id)) is not None
-                and job.kind in _LLM_KINDS
-            )
-        )
+        running_llm = self._running_llm_count()
         running_cpu = len(self._running)
         running_gpu = len(self.gpu_broker.leases) if self.gpu_broker else 0
         ready = self.store.list_jobs(
@@ -1715,6 +1845,9 @@ class V2Controller:
             "jobs_total": len(jobs),
             "jobs_by_status": jobs_by_status,
             "running_futures": len(self._running),
+            "idea_generation_running": (
+                self._idea_generation is not None
+            ),
             "running_gpu_jobs": len(gpu.get("leases", [])),
             "llm_tokens_total": sum(
                 idea.llm_tokens_spent for idea in ideas

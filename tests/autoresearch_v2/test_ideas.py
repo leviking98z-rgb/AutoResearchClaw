@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+
 from researchclaw.autoresearch_v2.ideas import (
     IdeaAdmission,
+    LLMBoardIdeaGenerator,
     candidate_to_idea,
     designability_evidence,
     evidence_adjusted_score,
@@ -138,6 +141,34 @@ def test_missing_novelty_evidence_reduces_self_reported_score() -> None:
         "max_similarity": 0.0,
     }
     assert evidence_adjusted_score(idea) < original
+
+
+def test_board_keeps_valid_candidates_when_one_candidate_is_invalid() -> None:
+    valid = _candidate(identifier="valid")
+    invalid = _candidate(identifier="invalid")
+    invalid["baselines"] = ["fixed-depth refinement"]
+
+    class _Response:
+        content = json.dumps({"candidates": [invalid, valid]})
+
+    class _Client:
+        def chat(self, *args, **kwargs):
+            del args, kwargs
+            return _Response()
+
+    generator = LLMBoardIdeaGenerator(
+        llm=_Client(),
+        brief="RSI mechanisms",
+    )
+
+    ideas = generator.generate(count=1, existing=[])
+
+    assert [idea.candidate["id"] for idea in ideas] == ["valid"]
+    assert len(generator.last_rejections) == 1
+    assert (
+        "missing no-self-improvement control"
+        in generator.last_rejections[0]["reason"]
+    )
 
 
 def test_designability_penalizes_reviewable_budget_and_access_uncertainty() -> None:

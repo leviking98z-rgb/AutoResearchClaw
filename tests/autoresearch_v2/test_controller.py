@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
 from researchclaw.autoresearch_v2.config import V2Config
 from researchclaw.autoresearch_v2.controller import V2Controller
-from researchclaw.autoresearch_v2.ideas import StaticIdeaGenerator
+from researchclaw.autoresearch_v2.ideas import (
+    StaticIdeaGenerator,
+    candidate_to_idea,
+)
 from researchclaw.autoresearch_v2.jobs import JobOutcome, SimulatedJobExecutor
 from researchclaw.autoresearch_v2.models import IdeaStatus, JobKind, JobStatus
 from researchclaw.autoresearch_v2.store import V2Store
@@ -112,6 +116,50 @@ class _InterruptedExecutor:
         del kwargs
         time.sleep(0.05)
         return JobOutcome(False, "retry", "interrupted fixture", {})
+
+
+class _BlockingIdeaGenerator:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def generate(self, *, count, existing):
+        del count, existing
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        return [candidate_to_idea(_candidate(99))]
+
+
+def test_production_idea_generation_never_blocks_job_dispatch_or_tick(
+    tmp_path: Path,
+) -> None:
+    generator = _BlockingIdeaGenerator()
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=generator,
+        executors={kind: _SlowExecutor() for kind in JobKind},
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    active = candidate_to_idea(_candidate(0))
+    active.status = IdeaStatus.DESIGNING
+    controller.store.save_idea(active)
+
+    started = time.monotonic()
+    snapshot = controller.tick()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert snapshot["idea_generation_running"] is True
+    assert generator.started.wait(timeout=1)
+    assert controller.store.list_jobs(statuses={JobStatus.RUNNING})
+
+    generator.release.set()
+    controller._idea_generation.future.result(timeout=2)
+    controller._collect_idea_generation()
+    controller._pool.shutdown(wait=True)
+    controller.close()
 
 
 def test_controller_reaches_configured_parallelism(tmp_path: Path) -> None:
