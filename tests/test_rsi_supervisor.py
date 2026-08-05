@@ -1140,6 +1140,41 @@ def test_terminate_child_cancels_recorded_pool_task(
     assert events[-1]["type"] == "remote_pool_task_cancelled"
 
 
+def test_pool_task_cancel_timeout_does_not_crash_supervisor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _options(tmp_path)
+    supervisor = CampaignSupervisor(options)
+    supervisor.initialize()
+    run_dir = supervisor.store.runs_dir / "cycle-0001"
+    metadata = run_dir / "work" / ".clusterbridge_pool_task.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        json.dumps(
+            {
+                "task_id": "rc-pool-timeout-test",
+                "state": "starting",
+            }
+        ),
+        encoding="utf-8",
+    )
+    supervisor.state.update(
+        {"active_run_dir": str(run_dir), "active_cycle": 1}
+    )
+
+    def timeout_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", timeout_run)
+    supervisor._cancel_remote_pool_tasks("pause")
+
+    event = supervisor.store.log.read_all()[-1]
+    assert event["type"] == "remote_pool_task_cancel_timeout"
+    assert event["task_id"] == "rc-pool-timeout-test"
+    assert event["timeout_sec"] == 120
+
+
 def test_reconcile_interrupted_execution_terminates_matching_local_child(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

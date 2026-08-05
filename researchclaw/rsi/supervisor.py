@@ -1418,21 +1418,43 @@ class CampaignSupervisor:
             return
         pool_cli = self.options.repo_root / "bin" / "cluster-pool"
         for task_id in sorted(task_ids):
-            result = subprocess.run(
-                [
-                    str(pool_cli),
-                    "--config",
-                    str(pool_config),
-                    "cancel-task",
-                    task_id,
-                ],
-                cwd=self.options.repo_root,
-                env=os.environ.copy(),
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=120,
-            )
+            try:
+                result = subprocess.run(
+                    [
+                        str(pool_cli),
+                        "--config",
+                        str(pool_config),
+                        "cancel-task",
+                        task_id,
+                    ],
+                    cwd=self.options.repo_root,
+                    env=os.environ.copy(),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=120,
+                )
+            except subprocess.TimeoutExpired as exc:
+                self.store.log.append(
+                    "remote_pool_task_cancel_timeout",
+                    campaign_id=self.campaign_id,
+                    cycle=self.state.get("active_cycle"),
+                    task_id=task_id,
+                    reason=reason,
+                    timeout_sec=120,
+                    detail=str(exc)[-4000:],
+                )
+                continue
+            except OSError as exc:
+                self.store.log.append(
+                    "remote_pool_task_cancel_failed",
+                    campaign_id=self.campaign_id,
+                    cycle=self.state.get("active_cycle"),
+                    task_id=task_id,
+                    reason=reason,
+                    detail=f"{type(exc).__name__}: {exc}"[-4000:],
+                )
+                continue
             self.store.log.append(
                 "remote_pool_task_cancelled",
                 campaign_id=self.campaign_id,
