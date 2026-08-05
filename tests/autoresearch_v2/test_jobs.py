@@ -18,6 +18,7 @@ from researchclaw.autoresearch_v2.models import (
     JobRecord,
 )
 from researchclaw.autoresearch_v2.store import V2Store
+from researchclaw.autoresearch_v2.validation import validate_plan
 
 
 def _idea():
@@ -72,8 +73,12 @@ class _Role:
 
 
 class _Gate:
+    def __init__(self):
+        self.plan = None
+
     def review_design(self, idea, plan):
-        del idea, plan
+        del idea
+        self.plan = plan
         return GateVerdict("promote", "ok", 1.0)
 
 
@@ -174,6 +179,35 @@ def _plan():
     }
 
 
+def _typed_draft():
+    plan = _plan()
+    return {
+        key: value
+        for key, value in plan.items()
+        if key
+        not in {
+            "study_phase",
+            "datasets",
+            "sample_accounting",
+            "decision_table",
+            "required_runtime_evidence",
+        }
+    } | {
+        "protocol_template": "calibration_verifier",
+        "dataset": "GSM8K",
+        "call_ledger": {
+            "components": [
+                {
+                    "name": "final_evaluation",
+                    "scope": "per_arm_example_seed",
+                    "dataset_role": "screening",
+                    "calls_per_unit": 1,
+                }
+            ]
+        },
+    }
+
+
 def test_design_retry_edits_previous_plan_and_review(tmp_path: Path) -> None:
     store = V2Store(tmp_path)
     store.initialize()
@@ -225,17 +259,58 @@ def test_design_retry_edits_previous_plan_and_review(tmp_path: Path) -> None:
     assert "Do not design a different study" in role.prompts[0]
 
 
+def test_design_executor_compiles_typed_draft_before_decision_gate(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="typed-design",
+        idea_id=idea.idea_id,
+        kind=JobKind.DESIGN,
+    )
+    attempt = AttemptRecord(
+        attempt_id="typed-design-attempt-01",
+        idea_id=idea.idea_id,
+        job_id=job.job_id,
+        number=1,
+        status=AttemptStatus.RUNNING,
+    )
+    gate = _Gate()
+
+    outcome = DesignJobExecutor(
+        _Role(_typed_draft()),
+        decision_gate=gate,
+    ).execute(
+        idea=idea,
+        job=job,
+        attempt=attempt,
+        store=store,
+    )
+
+    assert outcome.success
+    assert gate.plan is not None
+    assert gate.plan["compiler"]["version"] == 1
+    assert gate.plan["sample_accounting"]["total_model_calls"] == 64
+    assert validate_plan(gate.plan) == []
+    assert (
+        store.current_dir(idea.idea_id) / "plan.json"
+    ).is_file()
+
+
 def test_first_design_attempt_has_no_revision_directive() -> None:
     prompt = DesignJobExecutor._prompt(
         _idea(),
         prior_failure={},
     )
     assert "This is a REVISION attempt" not in prompt
-    assert '"study_phase": "screening_pilot"' in prompt
+    assert '"protocol_template": "calibration_verifier"' in prompt
     assert '"confirmatory_followup": {' in prompt
-    assert '"split_id": "confirmatory-v1"' in prompt
-    assert '"split_role": "screening"' in prompt
-    assert "must NOT claim" in prompt
+    assert '"call_ledger": {' in prompt
+    assert "Controller creates disjoint" in prompt
+    assert "Mechanical fields that the Controller owns" in prompt
 
 
 def test_design_structured_retry_repairs_prior_json_locally() -> None:

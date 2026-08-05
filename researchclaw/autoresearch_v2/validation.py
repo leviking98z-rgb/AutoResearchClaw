@@ -249,6 +249,8 @@ def validate_plan(value: dict[str, Any]) -> list[str]:
     phase_aware = "study_phase" in value or any(
         field in value for field in _SCREENING_FIELDS
     )
+    if phase_aware:
+        _validate_protocol_compiler_contract(value, errors)
 
     pilot = value.get("pilot")
     pilot_numbers: dict[str, int] = {}
@@ -268,15 +270,20 @@ def validate_plan(value: dict[str, Any]) -> list[str]:
 
     workload = value.get("workload_budget")
     workload_numbers: dict[str, int] = {}
+    compiled_ledger = isinstance(value.get("call_ledger"), Mapping)
     if isinstance(workload, dict):
-        for field in (
+        workload_fields = [
             "conditions",
-            "models",
             "examples",
             "seeds",
             "max_new_tokens",
             "estimated_model_calls",
-        ):
+        ]
+        if not compiled_ledger:
+            workload_fields.insert(1, "models")
+        if "development_examples" in workload:
+            workload_fields.append("development_examples")
+        for field in workload_fields:
             number = _positive_number(
                 workload,
                 field,
@@ -296,6 +303,7 @@ def validate_plan(value: dict[str, Any]) -> list[str]:
             errors,
             pilot_numbers=pilot_numbers,
             workload_numbers=workload_numbers,
+            compiled_ledger=compiled_ledger,
         )
 
     _validate_decision_table(
@@ -304,6 +312,98 @@ def validate_plan(value: dict[str, Any]) -> list[str]:
         structured=phase_aware,
     )
     return _deduplicate(errors)
+
+
+def _validate_protocol_compiler_contract(
+    value: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    protocol = value.get("protocol_template")
+    if protocol is not None:
+        from .protocols import SUPPORTED_PROTOCOLS
+
+        if protocol not in SUPPORTED_PROTOCOLS:
+            errors.append(
+                "protocol_template must be one of: "
+                + ", ".join(sorted(SUPPORTED_PROTOCOLS))
+            )
+    ledger = value.get("call_ledger")
+    if ledger is None:
+        return
+    if not isinstance(ledger, Mapping):
+        errors.append("call_ledger must be an object")
+        return
+    components = ledger.get("components")
+    if not isinstance(components, list) or not components:
+        errors.append("call_ledger.components must be a non-empty list")
+        return
+    compiled_total = 0
+    names: set[str] = set()
+    for index, component in enumerate(components):
+        if not isinstance(component, Mapping):
+            errors.append(
+                f"invalid call_ledger.components[{index}]: must be an object"
+            )
+            continue
+        name = component.get("name")
+        if not isinstance(name, str) or not name.strip():
+            errors.append(
+                f"missing call_ledger.components[{index}].name"
+            )
+        elif name in names:
+            errors.append(f"duplicate call_ledger component {name!r}")
+        else:
+            names.add(name)
+        calls = component.get("calls_per_unit")
+        if (
+            isinstance(calls, bool)
+            or not isinstance(calls, int)
+            or calls <= 0
+        ):
+            errors.append(
+                "invalid call_ledger.components"
+                f"[{index}].calls_per_unit: "
+                "must be a positive integer"
+            )
+        multiplicity = component.get("multiplicity")
+        if (
+            isinstance(multiplicity, bool)
+            or not isinstance(multiplicity, int)
+            or multiplicity <= 0
+        ):
+            errors.append(
+                f"invalid call_ledger.components[{index}].multiplicity"
+            )
+        total_calls = component.get("total_calls")
+        if (
+            isinstance(calls, int)
+            and not isinstance(calls, bool)
+            and isinstance(multiplicity, int)
+            and not isinstance(multiplicity, bool)
+            and total_calls != calls * multiplicity
+        ):
+            errors.append(
+                f"call_ledger.components[{index}].total_calls="
+                f"{total_calls} does not equal calls_per_unit * "
+                f"multiplicity={calls * multiplicity}"
+            )
+        if isinstance(total_calls, int) and not isinstance(total_calls, bool):
+            compiled_total += total_calls
+    accounting = value.get("sample_accounting")
+    if not isinstance(accounting, Mapping) or compiled_total <= 0:
+        return
+    declared_total = ledger.get("total_model_calls")
+    if declared_total != compiled_total:
+        errors.append(
+            "call_ledger.total_model_calls="
+            f"{declared_total} does not equal component total={compiled_total}"
+        )
+    if accounting.get("total_model_calls") != compiled_total:
+        errors.append(
+            "sample_accounting.total_model_calls="
+            f"{accounting.get('total_model_calls')} does not equal "
+            f"call_ledger total={compiled_total}"
+        )
 
 
 def _positive_number(
@@ -344,6 +444,7 @@ def _validate_screening_plan(
     *,
     pilot_numbers: Mapping[str, int],
     workload_numbers: Mapping[str, int],
+    compiled_ledger: bool,
 ) -> None:
     phase = value.get("study_phase")
     if phase is None:
@@ -394,13 +495,17 @@ def _validate_screening_plan(
     if not isinstance(accounting, Mapping):
         errors.append("sample_accounting must be an object")
     else:
-        for field in (
+        accounting_fields = [
             "arms",
             "examples_per_arm",
             "seeds",
-            "calls_per_example",
             "total_model_calls",
-        ):
+        ]
+        if not compiled_ledger:
+            accounting_fields.insert(3, "calls_per_example")
+        if "development_examples" in accounting:
+            accounting_fields.append("development_examples")
+        for field in accounting_fields:
             number = _positive_number(
                 accounting,
                 field,
@@ -422,27 +527,29 @@ def _validate_screening_plan(
             f"{declared_arms} does not match len(arms)={arm_count}"
         )
 
-    factors = (
-        accounting_numbers.get("arms"),
-        accounting_numbers.get("examples_per_arm"),
-        accounting_numbers.get("seeds"),
-        accounting_numbers.get("calls_per_example"),
-    )
-    if all(number is not None for number in factors):
-        expected_calls = math.prod(int(number) for number in factors)
-        total_calls = accounting_numbers.get("total_model_calls")
-        if total_calls is not None and total_calls != expected_calls:
-            errors.append(
-                "sample_accounting.total_model_calls="
-                f"{total_calls} does not equal arms * examples_per_arm * "
-                f"seeds * calls_per_example={expected_calls}"
-            )
+    if not compiled_ledger:
+        factors = (
+            accounting_numbers.get("arms"),
+            accounting_numbers.get("examples_per_arm"),
+            accounting_numbers.get("seeds"),
+            accounting_numbers.get("calls_per_example"),
+        )
+        if all(number is not None for number in factors):
+            expected_calls = math.prod(int(number) for number in factors)
+            total_calls = accounting_numbers.get("total_model_calls")
+            if total_calls is not None and total_calls != expected_calls:
+                errors.append(
+                    "sample_accounting.total_model_calls="
+                    f"{total_calls} does not equal arms * examples_per_arm * "
+                    f"seeds * calls_per_example={expected_calls}"
+                )
 
     _validate_workload_arithmetic(
         accounting_numbers,
         workload_numbers,
         pilot_numbers,
         errors,
+        compiled_ledger=compiled_ledger,
     )
     _validate_effect_threshold(value, accounting_numbers, errors)
     _validate_dataset_isolation(value, errors)
@@ -677,30 +784,42 @@ def _validate_workload_arithmetic(
     workload: Mapping[str, int],
     pilot: Mapping[str, int],
     errors: list[str],
+    *,
+    compiled_ledger: bool,
 ) -> None:
-    workload_factors = (
-        workload.get("conditions"),
-        workload.get("models"),
-        workload.get("examples"),
-        workload.get("seeds"),
-    )
-    if all(number is not None for number in workload_factors):
-        expected = math.prod(int(number) for number in workload_factors)
-        estimated = workload.get("estimated_model_calls")
-        if estimated is not None and estimated != expected:
-            errors.append(
-                "workload_budget.estimated_model_calls="
-                f"{estimated} does not equal conditions * models * examples "
-                f"* seeds={expected}"
-            )
+    if not compiled_ledger:
+        workload_factors = (
+            workload.get("conditions"),
+            workload.get("models"),
+            workload.get("examples"),
+            workload.get("seeds"),
+        )
+        if all(number is not None for number in workload_factors):
+            expected = math.prod(int(number) for number in workload_factors)
+            estimated = workload.get("estimated_model_calls")
+            if estimated is not None and estimated != expected:
+                errors.append(
+                    "workload_budget.estimated_model_calls="
+                    f"{estimated} does not equal conditions * models * "
+                    f"examples * seeds={expected}"
+                )
 
-    for accounting_field, workload_field in (
+    field_pairs = [
         ("arms", "conditions"),
         ("examples_per_arm", "examples"),
         ("seeds", "seeds"),
-        ("calls_per_example", "models"),
         ("total_model_calls", "estimated_model_calls"),
+    ]
+    if not compiled_ledger:
+        field_pairs.insert(3, ("calls_per_example", "models"))
+    if (
+        "development_examples" in accounting
+        or "development_examples" in workload
     ):
+        field_pairs.append(
+            ("development_examples", "development_examples")
+        )
+    for accounting_field, workload_field in field_pairs:
         left = accounting.get(accounting_field)
         right = workload.get(workload_field)
         if left is not None and right is not None and left != right:
@@ -1861,6 +1980,46 @@ def validate_runtime_evidence_file(path: Path) -> dict[str, Any]:
         errors.append(
             "dataset_roles requires split identifiers for declared roles"
         )
+    if "call_counts" in value:
+        call_counts = value["call_counts"]
+        if not isinstance(call_counts, Mapping) or not call_counts:
+            errors.append("call_counts must be a non-empty object")
+        else:
+            for name, count in call_counts.items():
+                if (
+                    not isinstance(name, str)
+                    or not name.strip()
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count < 0
+                ):
+                    errors.append(
+                        "call_counts must map non-empty component names "
+                        "to non-negative integers"
+                    )
+                    break
+    if "examples_by_role" in value:
+        examples_by_role = value["examples_by_role"]
+        if not isinstance(examples_by_role, Mapping) or not examples_by_role:
+            errors.append("examples_by_role must be a non-empty object")
+        else:
+            for role, count in examples_by_role.items():
+                normalized_role = _dataset_role(role)
+                if (
+                    normalized_role not in {
+                        "development",
+                        "screening",
+                        "confirmatory",
+                    }
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count < 0
+                ):
+                    errors.append(
+                        "examples_by_role must map valid dataset roles "
+                        "to non-negative integers"
+                    )
+                    break
     if not isinstance(value.get("metrics"), dict) or not value.get("metrics"):
         errors.append("runtime evidence metrics must be a non-empty object")
     else:
@@ -1976,6 +2135,33 @@ def validate_runtime_against_contract(
             errors.append(
                 f"seed count={len(seeds)} exceeds pilot max_seeds={max_seeds}"
             )
+        _validate_runtime_call_ledger(
+            plan=plan,
+            runtime_evidence=runtime_evidence,
+            errors=errors,
+        )
+        if isinstance(plan.get("call_ledger"), Mapping):
+            examples_by_role = runtime_evidence.get("examples_by_role")
+            if not isinstance(examples_by_role, Mapping):
+                errors.append(
+                    "runtime_evidence.examples_by_role is required by "
+                    "compiled protocol"
+                )
+            else:
+                for role, maximum_field in (
+                    ("development", "development_examples"),
+                    ("screening", "max_examples"),
+                ):
+                    try:
+                        actual = int(examples_by_role.get(role, -1))
+                        maximum = int(pilot.get(maximum_field, -1))
+                    except (TypeError, ValueError):
+                        continue
+                    if maximum >= 0 and actual > maximum:
+                        errors.append(
+                            f"examples_by_role[{role}]={actual} exceeds "
+                            f"pilot {maximum_field}={maximum}"
+                        )
     if mode == "scale" and pilot_runtime:
         try:
             scale_examples = int(
@@ -2018,6 +2204,72 @@ def validate_runtime_against_contract(
                 errors=errors,
             )
     return errors
+
+
+def _validate_runtime_call_ledger(
+    *,
+    plan: Mapping[str, Any],
+    runtime_evidence: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    ledger = plan.get("call_ledger")
+    if not isinstance(ledger, Mapping):
+        return
+    expected_components = ledger.get("components")
+    if not isinstance(expected_components, list):
+        return
+    actual = runtime_evidence.get("call_counts")
+    if not isinstance(actual, Mapping):
+        errors.append(
+            "runtime_evidence.call_counts is required by compiled protocol"
+        )
+        return
+    expected = {
+        str(component.get("name", "") or ""): int(
+            component.get("total_calls", -1)
+        )
+        for component in expected_components
+        if isinstance(component, Mapping)
+        and str(component.get("name", "") or "")
+    }
+    actual_names = {
+        str(name)
+        for name, count in actual.items()
+        if isinstance(name, str)
+        and not isinstance(count, bool)
+        and isinstance(count, int)
+        and count >= 0
+    }
+    missing = sorted(set(expected) - actual_names)
+    if missing:
+        errors.append(
+            "runtime_evidence.call_counts missing components: "
+            + ", ".join(missing)
+        )
+    try:
+        actual_total = sum(int(actual[name]) for name in expected)
+        maximum = int(ledger.get("total_model_calls", -1))
+    except (KeyError, TypeError, ValueError):
+        return
+    if maximum >= 0 and actual_total > maximum:
+        errors.append(
+            f"runtime model calls={actual_total} exceed compiled "
+            f"call_ledger.total_model_calls={maximum}"
+        )
+    for name, maximum_component_calls in expected.items():
+        try:
+            actual_component_calls = int(actual[name])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            maximum_component_calls >= 0
+            and actual_component_calls > maximum_component_calls
+        ):
+            errors.append(
+                f"runtime call_counts[{name}]={actual_component_calls} "
+                f"exceed compiled component budget="
+                f"{maximum_component_calls}"
+            )
 
 
 def _is_production_screening_plan(plan: Mapping[str, Any]) -> bool:

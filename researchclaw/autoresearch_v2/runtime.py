@@ -18,8 +18,9 @@ from .jobs import (
 from .literature import InfoHubLiteratureProvider
 from .llm import RoleRouter, StructuredRole
 from .models import JobKind
+from .protocols import validate_protocol_draft
 from .store import V2Store
-from .validation import validate_build_output, validate_plan
+from .validation import validate_build_output
 
 
 def _validate_report(value: dict[str, Any]) -> list[str]:
@@ -63,7 +64,7 @@ def build_production_controller(
                 "You are a rigorous experiment designer. Return only JSON; "
                 "make the cheapest experiment scientifically discriminating."
             ),
-            validator=validate_plan,
+            validator=validate_protocol_draft,
         ),
         decision_gate=decision_gate,
     )

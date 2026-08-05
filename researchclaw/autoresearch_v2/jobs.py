@@ -26,6 +26,11 @@ from .models import (
     JobKind,
     JobRecord,
 )
+from .protocols import (
+    SUPPORTED_PROTOCOLS,
+    compile_screening_protocol,
+    infer_protocol_template,
+)
 from .store import V2Store
 from .validation import (
     validate_execution_argv,
@@ -122,10 +127,30 @@ class DesignJobExecutor:
             temperature=0.25,
             retry_context=self._validation_repair_context,
         )
-        _write_json(candidate / "plan.json", result.value)
+        try:
+            plan = compile_screening_protocol(idea, result.value)
+        except (TypeError, ValueError) as exc:
+            attempt.validation = {
+                "ok": False,
+                "protocol_compiler": {
+                    "error": str(exc),
+                },
+            }
+            attempt.status = AttemptStatus.REJECTED
+            attempt.error = f"protocol_compile_failed: {exc}"
+            store.save_attempt(attempt)
+            return JobOutcome(
+                False,
+                "retry",
+                attempt.error,
+                {"validation": attempt.validation},
+                tokens=result.total_tokens,
+                elapsed_sec=time.monotonic() - started,
+            )
+        _write_json(candidate / "plan.json", plan)
         gate_tokens = 0
         if self.decision_gate is not None:
-            verdict = self.decision_gate.review_design(idea, result.value)
+            verdict = self.decision_gate.review_design(idea, plan)
             gate_tokens = verdict.tokens
             _write_json(
                 candidate / "design_review.json",
@@ -221,8 +246,18 @@ PRIOR PLAN TO EDIT:
 PRIOR DESIGN REVIEW TO RESOLVE:
 {json.dumps(previous_review, ensure_ascii=False, indent=2)[:10000]}
 """
+        inferred_template = infer_protocol_template(idea)
         return f"""\
-Create an executable SCREENING-PILOT plan for this Idea:
+Fill the scientific variables for one supported typed SCREENING-PILOT.
+The Controller will compile all mechanical fields after your response.
+
+SUPPORTED PROTOCOL TEMPLATES:
+{json.dumps(sorted(SUPPORTED_PROTOCOLS), ensure_ascii=False)}
+
+INFERRED TEMPLATE FOR THIS IDEA:
+{json.dumps(inferred_template, ensure_ascii=False)}
+
+IDEA:
 {json.dumps(idea.candidate, ensure_ascii=False, indent=2)}
 
 Prior failed attempt feedback, if any:
@@ -231,7 +266,7 @@ Prior failed attempt feedback, if any:
 
 Return exactly:
 {{
-  "study_phase": "screening_pilot",
+  "protocol_template": "{inferred_template or 'one supported template'}",
   "pilot_objective": "one sentence: feasibility, protocol validation, or coarse go/no-go signal",
   "pilot_claim_scope": "what this small pilot can and cannot conclude",
   "research_question": "...",
@@ -239,26 +274,7 @@ Return exactly:
   "primary_metric": "...",
   "metric_direction": "maximize|minimize",
   "unit_of_analysis": "one paired example, task, modification, or stream",
-  "datasets": [
-    {{
-      "name": "one public benchmark development partition",
-      "split_role": "dev",
-      "split_id": "development-v1",
-      "used_for_adaptation": true
-    }},
-    {{
-      "name": "one public benchmark screening-evaluation partition",
-      "split_role": "screening",
-      "split_id": "screening-v1",
-      "used_for_adaptation": false
-    }},
-    {{
-      "name": "one public benchmark confirmatory partition",
-      "split_role": "heldout_confirmatory",
-      "split_id": "confirmatory-v1",
-      "used_for_adaptation": false
-    }}
-  ],
+  "dataset": "one public benchmark; Controller creates disjoint dev/screening/confirmatory split IDs",
   "models": [{{"name": "...", "role": "subject|verifier"}}],
   "baselines": ["include no-self-improvement"],
   "ablations": ["..."],
@@ -267,12 +283,25 @@ Return exactly:
     {{"name": "no-self-improvement", "role": "control"}}
   ],
   "pilot": {{
-    "max_gpus": 1, "max_examples": 32, "max_seeds": 1,
-    "timeout_sec": 7200
+    "max_gpus": 1, "development_examples": 16,
+    "max_examples": 32, "max_seeds": 1, "timeout_sec": 7200
   }},
-  "sample_accounting": {{
-    "arms": 2, "examples_per_arm": 32, "seeds": 1,
-    "calls_per_example": 1, "total_model_calls": 64
+  "call_ledger": {{
+    "components": [
+      {{
+        "name": "candidate_generation",
+        "scope": "per_example_seed",
+        "dataset_role": "screening",
+        "calls_per_unit": 1
+      }},
+      {{
+        "name": "verifier_scoring",
+        "scope": "per_arm_example_seed",
+        "dataset_role": "screening",
+        "arms": ["treatment"],
+        "calls_per_unit": 1
+      }}
+    ]
   }},
   "effect_threshold": {{
     "value": 0.15, "scale": "proportion"
@@ -281,67 +310,41 @@ Return exactly:
   "early_stop_rule": "disjoint futility or protocol-invalidity threshold",
   "estimand": "exact unit, treatment contrast and aggregation",
   "sample_size_rationale": "screening precision/resolution, not confirmatory power",
-  "workload_budget": {{
-    "conditions": 2, "models": 1, "examples": 32, "seeds": 1,
-    "max_new_tokens": 512, "estimated_model_calls": 64
-  }},
-  "decision_table": [
-    {{
-      "condition": {{"evidence_valid": false}},
-      "decision": "retry"
-    }},
-    {{
-      "condition": {{
-        "evidence_valid": true,
-        "effect_threshold_met": true
-      }},
-      "decision": "promote"
-    }},
-    {{
-      "condition": {{
-        "evidence_valid": true,
-        "effect_threshold_met": false
-      }},
-      "decision": "reject"
-    }}
-  ],
+  "workload_budget": {{"max_new_tokens": 512}},
   "confirmatory_followup": {{
-    "required": true,
-    "changes": [
-      "increase examples beyond the screening pilot",
-      "increase independent seed coverage",
-      "use the preregistered untouched confirmatory split"
-    ],
-    "claim": "the stronger paper-level claim that only Scale may support",
-    "examples": 100,
-    "independent_seeds": [11, 22, 33],
-    "split_id": "confirmatory-v1",
-    "untouched": true
-  }},
-  "required_runtime_evidence": [
-    "model_loaded", "datasets_loaded", "examples_processed",
-    "gpu_count", "gate_decision", "metrics", "dataset_roles",
-    "split_identifiers"
-  ]
+    "claim": "the stronger paper-level claim that only Scale may support"
+  }}
 }}
-This phase asks whether the protocol runs and whether a coarse signal merits
-Scale. It must NOT claim that 16-50 examples and one seed establish a
-paper-level confirmatory effect. Use only 2-3 primary arms, one public
-benchmark initially, 16-50 examples, and one seed. Use paired outcomes and
-report uncertainty. Keep held-out confirmatory data completely isolated from
-prompting, memory writing, calibration, selection, and adaptation.
-Every dataset entry must use an explicit, stable split_id. The screening and
-confirmatory split IDs must differ, and confirmatory_followup.split_id must
-exactly match the heldout_confirmatory dataset entry.
-Use the Idea's real closest_papers and novelty evidence; never call an empty
-search result proof of novelty. Make metrics comparable across every arm,
-cover all possible outcomes in the decision table, and ensure the workload
-arithmetic is exact: arms × examples_per_arm × seeds × calls_per_example must
-equal total_model_calls and workload_budget.estimated_model_calls. In this
-contract workload_budget.models means model calls per arm-example-seed unit,
-not the count of distinct model identities. Do not set
-an effect threshold below the metric's finite-sample resolution. A promoted
-pilot still requires the confirmatory_followup at Scale.
+
+Scientific responsibilities that remain yours:
+- choose the protocol template, intervention, 2-3 arms, estimand, metric,
+  threshold, pilot claim, and exact per-unit model-call components;
+- include an independent no-self-improvement/reference control;
+- distinguish adaptation calls from final evaluation calls;
+- never use heldout outcomes for selection, calibration, prompts, memory,
+  inheritance, stopping thresholds, or any other adaptation.
+
+Mechanical fields that the Controller owns and will overwrite:
+- dataset roles and stable split identifiers;
+- sample_accounting and workload arithmetic;
+- exhaustive retry/promote/reject decision regions;
+- Scale examples/seeds and untouched confirmatory split;
+- required runtime evidence.
+
+Allowed call_ledger component names are:
+adaptation, candidate_generation, verifier_scoring, calibration,
+memory_writing, shadow_continuation, baseline_reference, final_evaluation.
+Allowed scopes are:
+- per_arm_example_seed: multiplied by selected arms, dataset examples, seeds;
+- per_example_seed: one shared call per dataset example and seed;
+- per_arm_seed: fixed per selected arm and seed, without example multiplier;
+- per_seed: fixed shared calls per seed;
+- fixed: one fixed call.
+For scopes containing "arm", omit arms to apply to all arms or name the exact
+subset. For scopes containing "example", dataset_role must be development or
+screening. Other scopes use dataset_role=none. Include zero-cost operations in
+prose, not as components. This pilot must use 16-50 screening examples, at most
+50 development examples, one seed and one GPU.
 """
 
     @staticmethod
