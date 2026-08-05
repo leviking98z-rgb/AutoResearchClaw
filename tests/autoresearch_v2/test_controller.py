@@ -101,6 +101,12 @@ class _SlowExecutor(SimulatedJobExecutor):
         return super().execute(**kwargs)
 
 
+class _VerySlowExecutor(SimulatedJobExecutor):
+    def execute(self, **kwargs):
+        time.sleep(2)
+        return super().execute(**kwargs)
+
+
 class _InterruptedExecutor:
     def execute(self, **kwargs):
         del kwargs
@@ -280,6 +286,26 @@ def test_request_stop_prevents_new_admission_and_drains_started_work(
         if job.job_id in started
     )
     controller.close()
+
+
+def test_run_service_stop_does_not_wait_for_non_cancellable_llm_work(
+    tmp_path: Path,
+) -> None:
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([_candidate(i) for i in range(4)]),
+        executors={kind: _VerySlowExecutor() for kind in JobKind},
+        sleep=lambda _: controller.request_stop(reason="SIGTERM"),
+    )
+
+    started = time.monotonic()
+    controller.run()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert controller.store._writer_lock_stream is None
+    assert controller.store.list_jobs(statuses={JobStatus.RUNNING})
 
 
 def test_max_ticks_does_not_schedule_unbounded_downstream_work(

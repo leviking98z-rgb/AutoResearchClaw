@@ -171,9 +171,19 @@ class V2Controller:
         finally:
             # Bounded CLI/test runs stop scheduling at max_ticks, but work
             # already admitted in the final tick must still be collected into
-            # durable state before the process exits.
-            self._drain_local_futures()
-            self.close()
+            # durable state before the process exits. A service/terminal stop
+            # must not wait for long, non-cancellable CLI-backed LLM calls:
+            # leave those jobs durable as RUNNING and let startup recovery
+            # refund/requeue them.
+            if self._stop:
+                self._pool.shutdown(wait=False, cancel_futures=True)
+                if self.gpu_broker is not None:
+                    self.gpu_broker.close()
+                self.store.release_writer_lock()
+                self._initialized = False
+            else:
+                self._drain_local_futures()
+                self.close()
         return ticks
 
     def _drain_local_futures(self) -> None:
