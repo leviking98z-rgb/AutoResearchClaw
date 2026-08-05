@@ -6,6 +6,7 @@ import ast
 import json
 import logging
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,48 @@ from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
+
+_GENERATED_RUNTIME_MODULES = {
+    # Injected by every supported experiment sandbox before execution.
+    "experiment_harness",
+}
+
+
+def _missing_generated_imports(files: dict[str, str]) -> list[tuple[str, str]]:
+    """Return imports that are neither generated nor available at runtime."""
+
+    known_modules = {
+        filename.removesuffix(".py")
+        for filename in files
+        if filename.endswith(".py")
+    }
+    common_third_party = {
+        "numpy", "np", "torch", "torchvision", "gymnasium", "gym",
+        "sklearn", "scipy", "pandas", "matplotlib", "PIL", "tqdm",
+        "einops", "timm", "transformers", "datasets", "peft",
+        "stable_baselines3",
+    }
+    available_modules = (
+        set(sys.stdlib_module_names)
+        | common_third_party
+        | _GENERATED_RUNTIME_MODULES
+    )
+    missing: list[tuple[str, str]] = []
+    for filename, code in files.items():
+        if not filename.endswith(".py"):
+            continue
+        for module in re.findall(
+            r"^(?:from|import)\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+            code,
+            re.MULTILINE,
+        ):
+            if (
+                module not in known_modules
+                and module not in available_modules
+                and not module.startswith("_")
+            ):
+                missing.append((filename, module))
+    return missing
 
 # Improvement G: Continuous-action environments that are incompatible with DQN
 _CONTINUOUS_ENVS = {
@@ -2239,34 +2282,12 @@ def _execute_code_generation(
     # local module that doesn't exist in the files dict.  This catches the
     # case where Beast Mode/CodeAgent produced an intermediate file that
     # got lost during repair iterations.
-    _known_modules = {
-        f.replace(".py", "") for f in files if f.endswith(".py")
-    }
-    _stdlib_and_common = {
-        "os", "sys", "json", "math", "time", "copy", "re", "random",
-        "pathlib", "argparse", "logging", "collections", "functools",
-        "itertools", "abc", "typing", "dataclasses", "enum", "io",
-        "csv", "pickle", "glob", "shutil", "subprocess", "datetime",
-        "numpy", "np", "torch", "torchvision", "gymnasium", "gym",
-        "sklearn", "scipy", "pandas", "matplotlib", "PIL", "tqdm",
-        "einops", "timm", "transformers", "datasets", "peft",
-        "stable_baselines3",
-    }
-    for fname, code in list(files.items()):
-        if not fname.endswith(".py"):
-            continue
-        for _m in re.findall(
-            r"^(?:from|import)\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-            code, re.MULTILINE,
-        ):
-            if (_m not in _known_modules
-                    and _m not in _stdlib_and_common
-                    and not _m.startswith("_")):
-                logger.warning(
-                    "BUG-184: %s imports '%s' which is not in generated "
-                    "files — experiment may crash on import",
-                    fname, _m,
-                )
+    for fname, module in _missing_generated_imports(files):
+        logger.warning(
+            "BUG-184: %s imports '%s' which is not in generated "
+            "files — experiment may crash on import",
+            fname, module,
+        )
 
     # --- Write experiment directory ---
     exp_dir = stage_dir / "experiment"

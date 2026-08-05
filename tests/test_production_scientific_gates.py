@@ -20,6 +20,7 @@ from researchclaw.pipeline.stage_impls._code_generation import (
     _assess_scientific_code_alignment,
     _implementation_contract,
     _load_scientific_contract,
+    _missing_generated_imports,
 )
 from researchclaw.pipeline.stage_impls._paper_writing import (
     _collect_raw_experiment_metrics,
@@ -54,6 +55,33 @@ class _RetryLLM(_FakeLLM):
     ) -> LLMResponse:
         self.calls.append(messages)
         return LLMResponse(content=next(self._responses), model="fake")
+
+
+def test_cross_import_check_accepts_stdlib_and_injected_harness() -> None:
+    files = {
+        "main.py": (
+            "import contextlib\n"
+            "import importlib\n"
+            "import tempfile\n"
+            "import threading\n"
+            "import traceback\n"
+            "from experiment_harness import ExperimentHarness\n"
+            "from models import Model\n"
+        ),
+        "models.py": "class Model:\n    pass\n",
+    }
+
+    assert _missing_generated_imports(files) == []
+
+
+def test_cross_import_check_reports_missing_local_module() -> None:
+    files = {
+        "main.py": "from missing_adapter import Adapter\n",
+    }
+
+    assert _missing_generated_imports(files) == [
+        ("main.py", "missing_adapter"),
+    ]
 
 
 def _config(
