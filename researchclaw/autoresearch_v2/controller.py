@@ -196,7 +196,18 @@ class V2Controller:
             self.config.population.generation_batch_size,
             self.config.population.reservoir_target - len(reservoir),
         )
-        generated = self.generator.generate(count=needed, existing=ideas)
+        try:
+            generated = self.generator.generate(
+                count=needed,
+                existing=ideas,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.store.event(
+                "idea_generation_failed",
+                requested=needed,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return
         added = 0
         rejected = 0
         known = list(ideas)
