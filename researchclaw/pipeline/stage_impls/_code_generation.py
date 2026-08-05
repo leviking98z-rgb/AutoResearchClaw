@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -109,6 +110,36 @@ _DATASET_EXECUTION_MARKERS = (
     "read_csv(",
     "read_json(",
     "json.load(",
+)
+_LLM_PROXY_MARKERS = (
+    "fashionmnist",
+    "fashion mnist",
+    "mnist",
+    "cifar",
+    "imagenet",
+    "small mlp",
+    "multilayer perceptron",
+    "image classification",
+    "torchvision.datasets",
+)
+_LLM_MODEL_IMPLEMENTATION_MARKERS = (
+    "qwen",
+    "llama",
+    "mistral",
+    "gemma",
+    "phi-",
+    "from_pretrained(",
+    "automodelforcausallm",
+    "vllm",
+    "litellm",
+    "openai(",
+    "anthropic(",
+)
+_LLM_BENCHMARK_IMPLEMENTATION_MARKERS = (
+    "gsm8k",
+    "math",
+    "mbpp",
+    "humaneval",
 )
 _EXPLICIT_SIMULATION_PATTERNS = (
     (
@@ -342,6 +373,19 @@ def _assess_scientific_code_alignment(
     dataset_execution_markers = sorted(
         marker for marker in _DATASET_EXECUTION_MARKERS if marker in lowered
     )
+    proxy_markers_found = sorted(
+        marker for marker in _LLM_PROXY_MARKERS if marker in lowered
+    )
+    llm_model_implementation_markers = sorted(
+        marker
+        for marker in _LLM_MODEL_IMPLEMENTATION_MARKERS
+        if marker in lowered
+    )
+    llm_benchmark_implementation_markers = sorted(
+        marker
+        for marker in _LLM_BENCHMARK_IMPLEMENTATION_MARKERS
+        if marker in lowered
+    )
     generic_model_subject_found = any(
         marker in lowered for marker in _GENERIC_MODEL_MARKERS
     )
@@ -405,6 +449,33 @@ def _assess_scientific_code_alignment(
             "authoritative experiment declares a named real benchmark but "
             "generated code has no executable benchmark loading path"
         )
+    if authoritative and requires_llm_subject and proxy_markers_found:
+        reasons.append(
+            "authoritative LLM experiment was replaced with an image/"
+            "small-model proxy: " + ", ".join(proxy_markers_found)
+        )
+    if (
+        authoritative
+        and requires_llm_subject
+        and not llm_model_implementation_markers
+    ):
+        reasons.append(
+            "authoritative LLM experiment has no concrete LLM checkpoint, "
+            "causal-LM loader, or executable LLM inference adapter"
+        )
+    if (
+        authoritative
+        and requires_named_benchmark
+        and any(
+            marker in contract_text
+            for marker in _LLM_BENCHMARK_IMPLEMENTATION_MARKERS
+        )
+        and not llm_benchmark_implementation_markers
+    ):
+        reasons.append(
+            "generated code omits every declared LLM benchmark family "
+            "(GSM8K/MATH/MBPP/HumanEval)"
+        )
 
     return {
         "aligned": not reasons,
@@ -423,6 +494,13 @@ def _assess_scientific_code_alignment(
         "dataset_markers_found": dataset_markers_found,
         "model_execution_markers": model_execution_markers,
         "dataset_execution_markers": dataset_execution_markers,
+        "proxy_markers_found": proxy_markers_found,
+        "llm_model_implementation_markers": (
+            llm_model_implementation_markers
+        ),
+        "llm_benchmark_implementation_markers": (
+            llm_benchmark_implementation_markers
+        ),
         "generic_model_subject_found": generic_model_subject_found,
         "generic_dataset_subject_found": generic_dataset_subject_found,
         "missing_model_execution": missing_model_execution,
@@ -461,6 +539,7 @@ def _assess_pilot_envelope(
     combined = "\n\n".join(
         code for name, code in sorted(files.items()) if name.endswith(".py")
     )
+    lowered = combined.casefold()
 
     def int_assignments(*names: str) -> list[int]:
         escaped = "|".join(re.escape(name) for name in names)
@@ -473,8 +552,44 @@ def _assess_pilot_envelope(
         ]
 
     seed_count = 0
+    literal_assignments: dict[str, list[Any]] = {}
+    for name, code in sorted(files.items()):
+        if not name.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            target_names: list[str] = []
+            value: ast.AST | None = None
+            if isinstance(node, ast.Assign):
+                value = node.value
+                target_names.extend(
+                    target.id
+                    for target in node.targets
+                    if isinstance(target, ast.Name)
+                )
+            elif isinstance(node, ast.AnnAssign):
+                value = node.value
+                if isinstance(node.target, ast.Name):
+                    target_names.append(node.target.id)
+            if value is None:
+                continue
+            try:
+                literal = ast.literal_eval(value)
+            except (ValueError, TypeError):
+                continue
+            for target_name in target_names:
+                literal_assignments.setdefault(
+                    target_name.casefold(), []
+                ).append(literal)
+
+    for literal in literal_assignments.get("seeds", []):
+        if isinstance(literal, (list, tuple, set)):
+            seed_count = max(seed_count, len(literal))
     for match in re.finditer(
-        r"(?m)^\s*seeds\s*(?::[^=\n]+)?=\s*(?:field\([^=\n]*"
+        r"(?mi)^\s*seeds\s*(?::[^=\n]+)?=\s*(?:field\([^=\n]*"
         r"default_factory\s*=\s*lambda:\s*)?\[([^\]]*)\]",
         combined,
     ):
@@ -482,6 +597,46 @@ def _assess_pilot_envelope(
             seed_count,
             len(re.findall(r"(?<![\w.])-?\d+(?![\w.])", match.group(1))),
         )
+
+    dict_example_keys = (
+        "seed_size",
+        "pool_size",
+        "dev_size",
+        "test_size",
+        "num_examples",
+        "max_examples",
+        "pilot_examples",
+        "sample_size",
+        "prompts_per_round",
+    )
+    dict_iteration_keys = (
+        "iterations",
+        "num_iterations",
+        "max_iterations",
+        "pilot_rounds",
+        "max_self_improvement_rounds",
+        "rounds",
+    )
+    literal_examples: list[int] = []
+    literal_iterations: list[int] = []
+    for values in literal_assignments.values():
+        for literal in values:
+            if not isinstance(literal, dict):
+                continue
+            for raw_key, raw_value in literal.items():
+                if isinstance(raw_value, bool) or not isinstance(
+                    raw_value, int
+                ):
+                    continue
+                key = str(raw_key).casefold()
+                if key in dict_example_keys:
+                    literal_examples.append(raw_value)
+                if key in dict_iteration_keys:
+                    literal_iterations.append(raw_value)
+
+    proxy_markers_found = sorted(
+        marker for marker in _LLM_PROXY_MARKERS if marker in lowered
+    )
 
     observed = {
         "gpu_counts": int_assignments(
@@ -496,14 +651,19 @@ def _assess_pilot_envelope(
             "max_self_improvement_rounds",
             "max_iterations",
             "num_iterations",
-        ),
+        ) + literal_iterations,
         "examples": int_assignments(
             "prompts_per_round",
             "num_examples",
             "max_examples",
             "pilot_examples",
             "sample_size",
-        ),
+            "seed_size",
+            "pool_size",
+            "dev_size",
+            "test_size",
+        ) + literal_examples,
+        "proxy_markers_found": proxy_markers_found,
     }
 
     declared_gpu_count = compute.get("gpu_count", compute.get("max_gpu"))
@@ -545,6 +705,17 @@ def _assess_pilot_envelope(
         reasons.append(
             "generated cheap-pilot code hard-codes more than 200 examples "
             f"({max(observed['examples'])})"
+        )
+    contract_text = " ".join(
+        _normalize_contract_values(selected_topic)
+    ).casefold()
+    if (
+        any(marker in contract_text for marker in _LLM_SUBJECT_MARKERS)
+        and proxy_markers_found
+    ):
+        reasons.append(
+            "generated cheap pilot substitutes an image/small-model proxy "
+            "for the declared LLM experiment"
         )
 
     return {

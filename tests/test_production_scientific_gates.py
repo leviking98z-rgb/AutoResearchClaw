@@ -871,6 +871,62 @@ class Config:
     assert report["reasons"] == []
 
 
+def test_stage10_gate_rejects_fashionmnist_proxy_for_llm_rsi() -> None:
+    selected = _selected_topic()
+    files = {
+        "main.py": """
+from torchvision import datasets
+
+SEEDS = [0, 1, 2]
+
+def main():
+    dataset = datasets.FashionMNIST(
+        root="/opt/datasets", train=True, download=False
+    )
+    print("Real FashionMNIST + a small MLP proxy", len(dataset))
+""",
+    }
+
+    report = _assess_scientific_code_alignment(
+        files,
+        selected,
+        str(selected["title"]),
+    )
+
+    assert report["aligned"] is False
+    assert "fashionmnist" in report["proxy_markers_found"]
+    assert report["llm_model_implementation_markers"] == []
+    assert report["llm_benchmark_implementation_markers"] == []
+    assert any("image/" in reason for reason in report["reasons"])
+
+
+def test_pilot_gate_detects_uppercase_seeds_and_dict_example_counts() -> None:
+    selected = _selected_topic()
+    files = {
+        "main.py": """
+HYPERPARAMETERS = {
+    "seed_size": 300,
+    "pool_size": 512,
+    "dev_size": 256,
+    "test_size": 512,
+    "iterations": 8,
+}
+SEEDS = [0, 1, 2, 3]
+""",
+    }
+
+    report = _assess_pilot_envelope(files, selected)
+
+    assert report["aligned"] is False
+    assert report["observed"]["seed_count"] == 4
+    assert max(report["observed"]["examples"]) == 512
+    assert max(report["observed"]["iterations"]) == 8
+    assert any("more than 3 seeds" in reason for reason in report["reasons"])
+    assert any(
+        "more than 200 examples" in reason for reason in report["reasons"]
+    )
+
+
 def test_stage10_scientific_gate_does_not_treat_generic_open_as_dataset_load() -> None:
     selected = _selected_topic()
     files = {
