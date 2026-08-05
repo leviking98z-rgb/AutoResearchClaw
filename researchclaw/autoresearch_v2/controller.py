@@ -256,6 +256,10 @@ class V2Controller:
                 ),
             )
 
+    @property
+    def stop_reason(self) -> str:
+        return self._stop_reason
+
     def tick(self) -> dict[str, Any]:
         self._tick_count += 1
         if self.store.control_requested("stop"):

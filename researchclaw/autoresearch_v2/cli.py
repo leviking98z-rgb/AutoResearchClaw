@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 from collections.abc import Callable
 from pathlib import Path
@@ -114,6 +115,14 @@ def main(argv: list[str] | None = None) -> int:
         controller.run(max_ticks=args.max_ticks)
     finally:
         _restore_signal_handlers(previous_handlers)
+    if controller.stop_reason:
+        # A service stop intentionally leaves non-cancellable CLI-backed LLM
+        # calls durable as RUNNING so startup recovery can refund them. Python
+        # otherwise waits for every non-daemon executor thread during
+        # interpreter finalization even after shutdown(wait=False). All
+        # controller state and audit events have already been flushed here;
+        # bypass interpreter finalization so systemd restart remains bounded.
+        os._exit(0)
     return 0
 
 
