@@ -58,11 +58,20 @@ signal.
 """
 
 _UNSAFE_REPAIR_PATTERNS = (
-    r"\b(?:disable|bypass|skip|remove|weaken|lower|relax|ignore)\b.{0,80}"
-    r"\b(?:gate|threshold|verification|validator|review|citation|safety|"
-    r"reproducibility|evidence)\b",
+    r"\b(?:disable|bypass|skip|remove|delete|weaken|lower|relax|ignore|"
+    r"override|replace|turn\s+off|no-?op|set)\b.{0,120}"
+    r"\b(?:gate|quality[_ -]?gate|threshold|verification|validator|review|citation|safety|"
+    r"reviewer|reproducibility|evidence|metric|score|status|export|publish|"
+    r"submission)\b",
+    r"\b(?:gate|quality[_ -]?gate|threshold|verification|validator|review|reviewer|citation|safety|"
+    r"reproducibility|evidence|metric|score|status|export|publish|"
+    r"submission)\b.{0,120}\b(?:false|off|zero|no-?op|ignore|override)\b",
     r"\b(?:fabricat|fake|forge|invent|hallucinat|hardcode)\w*\b.{0,80}"
     r"\b(?:result|metric|evidence|citation|output|score)\b",
+    r"\b(?:synthetic|default|fallback)\b.{0,80}"
+    r"\b(?:metrics?|scores?|results?|evidence)\b",
+    r"\b(?:accept|approve|pass)\b.{0,100}"
+    r"\b(?:regardless|without|missing|invalid|failed|no evidence)\b",
     r"\b(?:treat|mark|report|declare)\b.{0,80}\b(?:failure|failed|error)\b"
     r".{0,80}\b(?:success|passed|valid)\b",
     r"\b(?:automatic|auto)\w*\b.{0,40}\b(?:publish|submission|release)\b",
@@ -91,6 +100,11 @@ def _safe_repair_prompt(diagnosis: dict[str, Any]) -> tuple[str, str]:
     if len(patch) > 6000:
         return "", "exceeds_6000_char_limit"
     normalized = " ".join(patch.casefold().split())
+    if re.search(
+        r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\u0400-\u04ff]",
+        normalized,
+    ):
+        return "", "non_ascii_control_language_not_allowed"
     for pattern in _UNSAFE_REPAIR_PATTERNS:
         if re.search(pattern, normalized, flags=re.IGNORECASE):
             return "", f"unsafe_pattern:{pattern}"
@@ -119,16 +133,21 @@ def apply_failure_repair(
         "failure_signature": failure_signature,
         "recovery_action": recovery_action,
     }
-    if not patch:
+    if not patch or recovery_action != "auto_repair":
         # Never let an older repair leak into a later failure after the
-        # director emitted no safe replacement (or the validator rejected it).
+        # director emitted no safe replacement, the validator rejected it, or
+        # the supervisor escalated to clean regeneration/quarantine.
         store.shared_repair_patch_path.unlink(missing_ok=True)
+        if patch and recovery_action != "auto_repair":
+            applied["repair_rejection_reason"] = (
+                f"recovery_action:{recovery_action}"
+            )
         return applied
     payload = {
         "schema_version": 1,
         "failure_signature": failure_signature,
         "source_cycle": cycle,
-        "expires_after_cycle": cycle + max(1, int(ttl_cycles)),
+        "expires_after_cycle": cycle + 1,
         "recovery_action": recovery_action,
         "repair_prompt_patch": patch,
         "updated_at": utc_now(),

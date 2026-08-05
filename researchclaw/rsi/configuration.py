@@ -244,6 +244,12 @@ def prepare_cycle_config(
     ):
         repair_patch_context = ""
         repair_patch_meta = {}
+    repair_stages = {
+        "experiment_design",
+        "code_generation",
+        "resource_planning",
+        "result_analysis",
+    }
     for stage in _PROMPT_STAGES:
         prior = str(extras.get(stage, "") or "").strip()
         merged = store.shared_prompts_dir / f"{stage}.md"
@@ -275,7 +281,7 @@ def prepare_cycle_config(
                 "This refines the incumbent question without replacing its "
                 "candidate identity or weakening campaign policy."
             )
-        if repair_patch_context:
+        if repair_patch_context and stage in repair_stages:
             failure_signature = str(
                 repair_patch_meta.get("failure_signature", "unknown")
             )

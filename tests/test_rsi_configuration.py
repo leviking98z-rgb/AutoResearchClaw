@@ -270,6 +270,18 @@ def test_prepare_cycle_config_materializes_only_unexpired_repair(
     ).read_text(encoding="utf-8")
     assert "Transient Failed-Cycle Engineering Repair" in active_text
     assert "verified dataset cache path" in active_text
+    topic_text = Path(
+        active_data["prompts"]["extra_prompts"]["topic_init"]
+    ).read_text(encoding="utf-8")
+    gate_text = Path(
+        active_data["prompts"]["extra_prompts"]["quality_gate"]
+    ).read_text(encoding="utf-8")
+    export_text = Path(
+        active_data["prompts"]["extra_prompts"]["export_publish"]
+    ).read_text(encoding="utf-8")
+    assert "Transient Failed-Cycle Engineering Repair" not in topic_text
+    assert "Transient Failed-Cycle Engineering Repair" not in gate_text
+    assert "Transient Failed-Cycle Engineering Repair" not in export_text
 
     expired = prepare_cycle_config(
         base_config=base,

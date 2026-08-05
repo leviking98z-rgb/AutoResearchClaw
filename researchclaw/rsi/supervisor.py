@@ -451,8 +451,7 @@ class CampaignSupervisor:
                     1, self.options.max_consecutive_failures
                 )
                 generic_failure_threshold = (
-                    not self.options.continuous
-                    and int(self.state.get("consecutive_failures", 0))
+                    int(self.state.get("consecutive_failures", 0))
                     >= same_failure_threshold
                 )
                 if (
@@ -983,6 +982,9 @@ class CampaignSupervisor:
                         )
                         mutations = []
                     else:
+                        self.store.shared_repair_patch_path.unlink(
+                            missing_ok=True
+                        )
                         atomic_write_json(
                             self.store.diagnostics_dir
                             / f"cycle-{cycle:04d}.json",
@@ -995,6 +997,7 @@ class CampaignSupervisor:
                 return "stopped" if action == "stop" else "paused"
             except Exception as exc:  # noqa: BLE001
                 diagnostic_error = f"{type(exc).__name__}: {exc}"
+                self.store.shared_repair_patch_path.unlink(missing_ok=True)
                 self.store.log.append(
                     "diagnosis_failed",
                     campaign_id=self.campaign_id,
@@ -1028,6 +1031,8 @@ class CampaignSupervisor:
             # only when the cycle itself is accepted. Evidence-invalidating
             # pivots remain eligible after a negative/failed pilot.
             pending_topic_action = normalize_topic_action(None)
+        if pending_topic_action["topic_action"] == "pivot":
+            self.store.shared_repair_patch_path.unlink(missing_ok=True)
 
         updates: dict[str, Any] = {
             "status": "running",
@@ -1145,7 +1150,10 @@ class CampaignSupervisor:
 
         if cycle <= 1 or (run_dir / "checkpoint.json").is_file():
             return None
-        if str(self.state.get("failure_recovery_action") or "") == "regenerate":
+        if str(self.state.get("failure_recovery_action") or "") in {
+            "regenerate",
+            "quarantine",
+        }:
             self.store.log.append(
                 "cycle_resume_skipped_for_regeneration",
                 campaign_id=self.campaign_id,
@@ -1839,17 +1847,12 @@ class CampaignSupervisor:
             if isinstance(summary, Mapping)
             else ""
         )
-        normalized_error = " ".join(error.casefold().split())
-        # Volatile paths, IDs, and counters should not defeat repeat detection.
-        normalized_error = re.sub(r"/[^\s:]+", "<path>", normalized_error)
-        normalized_error = re.sub(r"\b\d+\b", "<n>", normalized_error)
-        normalized_error = normalized_error[:1000]
         return CampaignSupervisor._failure_signature_from_parts(
             topic_id=topic_id,
             stage=stage,
             stage_number=stage_number,
             status=status,
-            error=normalized_error,
+            error=error,
             returncode=returncode,
             final_status=final_status,
         )
@@ -1867,7 +1870,17 @@ class CampaignSupervisor:
     ) -> tuple[str, dict[str, Any]]:
         normalized_error = " ".join(str(error).casefold().split())
         normalized_error = re.sub(r"/[^\s:]+", "<path>", normalized_error)
-        normalized_error = re.sub(r"\b\d+\b", "<n>", normalized_error)[:1000]
+        normalized_error = re.sub(
+            r"\b(?:pid|request|attempt|retry|run|job|task)[-_ ]?(?:id)?"
+            r"[:=# ]+\d+\b",
+            lambda match: re.sub(r"\d+", "<n>", match.group(0)),
+            normalized_error,
+        )
+        normalized_error = re.sub(
+            r"\b[0-9a-f]{12,}\b",
+            "<id>",
+            normalized_error,
+        )[:1000]
         details = {
             "topic_id": str(topic_id or "__campaign__"),
             "stage": str(stage or "pipeline"),

@@ -892,7 +892,7 @@ def test_failure_signature_normalizes_paths_and_numbers() -> None:
                     "stage": 10,
                     "stage_name": "CODE_GENERATION",
                     "status": "failed",
-                    "error": "Missing /tmp/run-123/data at attempt 2",
+                    "error": "Missing /tmp/run-123/data at attempt: 2",
                 }
             ],
         },
@@ -907,7 +907,7 @@ def test_failure_signature_normalizes_paths_and_numbers() -> None:
                     "stage": 10,
                     "stage_name": "CODE_GENERATION",
                     "status": "failed",
-                    "error": "Missing /tmp/run-999/data at attempt 8",
+                    "error": "Missing /tmp/run-999/data at attempt: 8",
                 }
             ],
         },
@@ -922,7 +922,7 @@ def test_failure_signature_normalizes_paths_and_numbers() -> None:
                     "stage": 10,
                     "stage_name": "CODE_GENERATION",
                     "status": "failed",
-                    "error": "Missing /tmp/run-999/data at attempt 8",
+                    "error": "Missing /tmp/run-999/data at attempt: 8",
                 }
             ],
         },
@@ -932,6 +932,69 @@ def test_failure_signature_normalizes_paths_and_numbers() -> None:
 
     assert first == second
     assert first != different_idea
+
+
+def test_failure_signature_preserves_semantic_status_codes() -> None:
+    error_429, _ = CampaignSupervisor._failure_signature(
+        {
+            "pipeline_summary": {"final_status": "failed"},
+            "failures": [
+                {
+                    "stage": 4,
+                    "stage_name": "LITERATURE_COLLECT",
+                    "status": "failed",
+                    "error": "HTTP 429 from provider request: 998",
+                }
+            ],
+        },
+        returncode=1,
+        topic_id="idea-a",
+    )
+    error_500, _ = CampaignSupervisor._failure_signature(
+        {
+            "pipeline_summary": {"final_status": "failed"},
+            "failures": [
+                {
+                    "stage": 4,
+                    "stage_name": "LITERATURE_COLLECT",
+                    "status": "failed",
+                    "error": "HTTP 500 from provider request: 998",
+                }
+            ],
+        },
+        returncode=1,
+        topic_id="idea-a",
+    )
+    assert error_429 != error_500
+
+
+def test_continuous_mode_has_global_consecutive_failure_budget(
+    tmp_path: Path,
+) -> None:
+    options = replace(
+        _options(tmp_path, max_cycles=1),
+        continuous=True,
+        max_consecutive_failures=3,
+    )
+    supervisor = CampaignSupervisor(options, sleep=lambda _seconds: None)
+    supervisor.initialize()
+    calls = {"count": 0}
+
+    def alternating(_cycle: int):
+        calls["count"] += 1
+        supervisor._transition(
+            next_cycle=calls["count"] + 1,
+            consecutive_failures=calls["count"],
+            consecutive_same_failure=1,
+            failure_signature=f"sig-{calls['count'] % 2}",
+        )
+        return False
+
+    supervisor._run_cycle = alternating  # type: ignore[method-assign]
+    assert supervisor.run() == 1
+    state = CampaignStore(options.campaign_dir).load_state()
+    assert calls["count"] == 3
+    assert state["status"] == "paused_failure_threshold"
 
 
 def test_load_run_policy_prefers_durable_policy_file(tmp_path: Path) -> None:
