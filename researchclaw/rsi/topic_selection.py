@@ -443,6 +443,29 @@ def persist_topic_selection(
     """Persist campaign-shared and cycle-local autonomous selection artifacts."""
 
     selected = dict(selection.selected)
+    # Operator-authored execution envelopes are not part of the scientific
+    # candidate matrix. Preserve them when the incumbent topic is persisted
+    # again on resume, but never carry them across a topic pivot.
+    execution_fields = ("pilot_envelope",)
+    existing_paths = (
+        run_dir / "selected_topic.json",
+        shared_dir / "selected_topic.json",
+    )
+    existing_selected: dict[str, Any] = {}
+    for path in existing_paths:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(value, dict)
+            and str(value.get("id") or "") == str(selected.get("id") or "")
+        ):
+            existing_selected = value
+            break
+    for field in execution_fields:
+        if field not in selected and field in existing_selected:
+            selected[field] = existing_selected[field]
     selected.update(
         {
             "schema_version": TOPIC_SELECTION_SCHEMA_VERSION,

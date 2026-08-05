@@ -123,6 +123,43 @@ def test_select_topics_retries_invalid_json_then_persists(
     assert (shared / "topic_selections" / "selection-0001.md").is_file()
 
 
+def test_persist_topic_selection_preserves_incumbent_pilot_envelope(
+    tmp_path: Path,
+) -> None:
+    selection = validate_selection_document(_document())
+    shared = tmp_path / "shared"
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "selected_topic.json").write_text(
+        json.dumps(
+            {
+                "id": selection.selected["id"],
+                "pilot_envelope": {
+                    "max_gpus": 1,
+                    "max_seeds": 1,
+                    "max_iterations": 1,
+                    "max_examples": 50,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    persist_topic_selection(
+        shared_dir=shared,
+        run_dir=run,
+        selection=selection,
+        cycle=2,
+    )
+
+    for root in (shared, run):
+        selected = json.loads(
+            (root / "selected_topic.json").read_text(encoding="utf-8")
+        )
+        assert selected["pilot_envelope"]["max_gpus"] == 1
+        assert selected["pilot_envelope"]["max_examples"] == 50
+
+
 def test_topic_action_is_fail_closed_and_requires_evidence() -> None:
     assert normalize_topic_action(None)["topic_action"] == "keep"
     assert normalize_topic_action({"topic_action": "unknown"})["topic_action"] == (
