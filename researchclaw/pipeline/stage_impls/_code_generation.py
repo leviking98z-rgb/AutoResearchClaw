@@ -94,6 +94,32 @@ def _confirmed_ablation_duplicates(review: Any) -> bool:
     )
 
 
+def _merge_ablation_repair(
+    files: dict[str, str],
+    repaired_files: dict[str, str],
+) -> tuple[dict[str, str], list[str], list[str]]:
+    """Merge a partial ablation rewrite without losing known-good files.
+
+    LLMs do not reliably obey "return ALL files".  Treat their response as a
+    patch: preserve omitted files, and reject any Python replacement that
+    cannot be parsed instead of replacing a valid implementation with a
+    truncated response.
+    """
+
+    from researchclaw.experiment.validator import validate_syntax
+
+    merged = dict(files)
+    accepted: list[str] = []
+    rejected: list[str] = []
+    for filename, code in repaired_files.items():
+        if filename.endswith(".py") and not validate_syntax(code).ok:
+            rejected.append(filename)
+            continue
+        merged[filename] = code
+        accepted.append(filename)
+    return merged, sorted(accepted), sorted(rejected)
+
+
 def _ablation_review_context(files: dict[str, str]) -> str:
     """Show the reviewer orchestration and implementation files, not a prefix."""
 
@@ -2880,13 +2906,25 @@ def _execute_code_generation(
                         abl_repair_resp.content
                     )
                     if repaired_files and "main.py" in repaired_files:
-                        files = repaired_files
-                        for fname, code in files.items():
+                        files, accepted, rejected = _merge_ablation_repair(
+                            files,
+                            repaired_files,
+                        )
+                        for fname in accepted:
+                            code = files[fname]
                             (exp_dir / fname).write_text(code, encoding="utf-8")
                         logger.info(
-                            "Stage 10: Ablation repair applied — "
-                            "rewrote duplicate conditions"
+                            "Stage 10: Ablation repair merged %d file(s); "
+                            "preserved %d omitted file(s)",
+                            len(accepted),
+                            len(set(files) - set(accepted)),
                         )
+                        if rejected:
+                            logger.warning(
+                                "Stage 10: Rejected syntactically invalid "
+                                "ablation repair file(s): %s",
+                                ", ".join(rejected),
+                            )
                 except Exception as exc:
                     logger.debug("Ablation repair failed: %s", exc)
         except Exception as exc:

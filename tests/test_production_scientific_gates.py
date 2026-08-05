@@ -22,6 +22,7 @@ from researchclaw.pipeline.stage_impls._code_generation import (
     _confirmed_ablation_duplicates,
     _implementation_contract,
     _load_scientific_contract,
+    _merge_ablation_repair,
     _missing_generated_imports,
 )
 from researchclaw.pipeline.stage_impls._paper_writing import (
@@ -115,6 +116,47 @@ def test_ablation_review_context_includes_model_implementation() -> None:
     assert "# --- main.py ---" in context
     assert "# --- models.py ---" in context
     assert "class DistinctGate" in context
+
+
+def test_partial_ablation_repair_preserves_omitted_files() -> None:
+    original = {
+        "main.py": "from data_utils import load_data\n\ndef main():\n    load_data()\n",
+        "data_utils.py": (
+            "from datasets import load_dataset\n\n"
+            "def load_data():\n"
+            "    return load_dataset('openai/gsm8k', 'main', split='train')\n"
+        ),
+        "gates.py": "class CalibrationAwareGate:\n    pass\n",
+    }
+    partial = {
+        "main.py": "from data_utils import load_data\n\ndef main():\n    print(load_data())\n",
+    }
+
+    merged, accepted, rejected = _merge_ablation_repair(original, partial)
+
+    assert accepted == ["main.py"]
+    assert rejected == []
+    assert merged["main.py"] == partial["main.py"]
+    assert merged["data_utils.py"] == original["data_utils.py"]
+    assert merged["gates.py"] == original["gates.py"]
+
+
+def test_ablation_repair_rejects_truncated_replacement() -> None:
+    original = {
+        "main.py": "def main():\n    return 1\n",
+        "data_utils.py": "def load_data():\n    return []\n",
+    }
+    repair = {
+        "main.py": "def main():\n    \"\"\"unterminated\n",
+        "data_utils.py": "def load_data():\n    return [1]\n",
+    }
+
+    merged, accepted, rejected = _merge_ablation_repair(original, repair)
+
+    assert accepted == ["data_utils.py"]
+    assert rejected == ["main.py"]
+    assert merged["main.py"] == original["main.py"]
+    assert merged["data_utils.py"] == repair["data_utils.py"]
 
 
 def _config(
