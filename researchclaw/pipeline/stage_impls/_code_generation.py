@@ -271,10 +271,19 @@ def _load_scientific_contract(
 ) -> dict[str, Any]:
     """Load the authoritative selected topic, with Stage-9 as fallback."""
 
-    selected = _safe_json_loads(
-        _read_prior_artifact(run_dir, "selected_topic.json") or "{}",
-        {},
-    )
+    selected_text = ""
+    for candidate in (
+        run_dir / "selected_topic.json",
+        run_dir / "stage-01" / "selected_topic.json",
+    ):
+        if candidate.is_file():
+            selected_text = candidate.read_text(encoding="utf-8")
+            break
+    if not selected_text:
+        selected_text = (
+            _read_prior_artifact(run_dir, "selected_topic.json") or "{}"
+        )
+    selected = _safe_json_loads(selected_text, {})
     if not isinstance(selected, dict):
         selected = {}
     try:
@@ -306,6 +315,384 @@ def _load_scientific_contract(
                 selected[key] = value
     selected.setdefault("title", config.research.topic)
     return selected
+
+
+def _implementation_contract(
+    selected_topic: dict[str, Any],
+    fallback_topic: str,
+) -> dict[str, Any]:
+    """Compile the selected topic into immutable Stage-10 requirements."""
+
+    contract_text = " ".join(
+        _normalize_contract_values(selected_topic)
+    ).casefold()
+    envelope = selected_topic.get("pilot_envelope")
+    if not isinstance(envelope, dict):
+        envelope = {}
+
+    def positive_int(key: str) -> int | None:
+        try:
+            value = int(envelope.get(key))
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    return {
+        "schema_version": 1,
+        "topic_id": str(selected_topic.get("id", "") or ""),
+        "title": str(
+            selected_topic.get("title", fallback_topic) or fallback_topic
+        ),
+        "research_question": str(
+            selected_topic.get("research_question", "") or ""
+        ),
+        "falsifiable_hypothesis": str(
+            selected_topic.get("falsifiable_hypothesis", "") or ""
+        ),
+        "models": list(
+            selected_topic.get("models")
+            if isinstance(selected_topic.get("models"), list)
+            else _normalize_contract_values(selected_topic.get("models"))
+        ),
+        "datasets": list(
+            selected_topic.get("datasets")
+            if isinstance(selected_topic.get("datasets"), list)
+            else _normalize_contract_values(selected_topic.get("datasets"))
+        ),
+        "primary_metric": str(
+            selected_topic.get("primary_metric", "") or ""
+        ),
+        "cheap_pilot": str(selected_topic.get("cheap_pilot", "") or ""),
+        "required_capabilities": {
+            "real_model_execution": any(
+                marker in contract_text for marker in _GENERIC_MODEL_MARKERS
+            ),
+            "real_dataset_execution": any(
+                marker in contract_text for marker in _GENERIC_DATASET_MARKERS
+            ),
+            "llm_subject": any(
+                marker in contract_text for marker in _LLM_SUBJECT_MARKERS
+            ),
+            "named_llm_benchmark": any(
+                marker in contract_text
+                for marker in _NAMED_BENCHMARK_MARKERS
+            ),
+            "calibration_driven_acceptance_gate": any(
+                marker in contract_text
+                for marker in (
+                    "acceptance gate",
+                    "acceptance/stopping gate",
+                    "calibration-aware gate",
+                    "rollback gate",
+                )
+            ),
+        },
+        "pilot_envelope": {
+            "max_gpus": positive_int("max_gpus"),
+            "max_seeds": positive_int("max_seeds"),
+            "max_iterations": positive_int("max_iterations"),
+            "max_examples": positive_int("max_examples"),
+        },
+        "forbidden_substitutions": [
+            "synthetic or simulated scientific outcomes",
+            "toy, proxy, image-classification, or small-MLP replacement",
+            "mocked benchmark scores or hard-coded metrics",
+            "post-hoc best-round selection presented as an online gate",
+        ],
+    }
+
+
+def _assess_implementation_manifest(
+    manifest: dict[str, Any],
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Deterministically reject a design manifest that violates the contract."""
+
+    implementation = manifest.get("implementation")
+    if not isinstance(implementation, dict):
+        implementation = manifest
+    serialized = json.dumps(
+        implementation,
+        ensure_ascii=False,
+        sort_keys=True,
+    ).casefold()
+    capabilities = contract.get("required_capabilities")
+    if not isinstance(capabilities, dict):
+        capabilities = {}
+    envelope = contract.get("pilot_envelope")
+    if not isinstance(envelope, dict):
+        envelope = {}
+
+    def as_positive_int(value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def first_positive(*keys: str) -> int | None:
+        for key in keys:
+            value = as_positive_int(implementation.get(key))
+            if value is not None:
+                return value
+        resources = implementation.get("resources")
+        if isinstance(resources, dict):
+            for key in keys:
+                value = as_positive_int(resources.get(key))
+                if value is not None:
+                    return value
+        return None
+
+    model = str(implementation.get("model", "") or "").strip()
+    benchmark = str(
+        implementation.get("benchmark", "")
+        or implementation.get("dataset", "")
+        or ""
+    ).strip()
+    calibration_metric = str(
+        implementation.get("calibration_metric", "") or ""
+    ).strip()
+    acceptance_rule = str(
+        implementation.get("acceptance_rule", "")
+        or implementation.get("gate_rule", "")
+        or ""
+    ).strip()
+    rollback_behavior = str(
+        implementation.get("rollback_behavior", "")
+        or implementation.get("rejection_behavior", "")
+        or ""
+    ).strip()
+    gpus = first_positive("gpus", "gpu_count", "max_gpus")
+    seeds = first_positive("seeds", "seed_count", "max_seeds")
+    iterations = first_positive(
+        "iterations",
+        "iteration_count",
+        "max_iterations",
+    )
+    examples = first_positive(
+        "examples",
+        "example_count",
+        "max_examples",
+    )
+
+    reasons: list[str] = []
+    if capabilities.get("real_model_execution") and not model:
+        reasons.append("manifest omits the executable model/checkpoint")
+    if capabilities.get("real_dataset_execution") and not benchmark:
+        reasons.append("manifest omits the executable benchmark/dataset")
+    if capabilities.get("llm_subject") and not any(
+        marker in serialized for marker in _LLM_MODEL_IMPLEMENTATION_MARKERS
+    ):
+        reasons.append(
+            "manifest does not name a concrete LLM checkpoint or inference adapter"
+        )
+    if capabilities.get("named_llm_benchmark") and not any(
+        marker in serialized
+        for marker in _LLM_BENCHMARK_IMPLEMENTATION_MARKERS
+    ):
+        reasons.append(
+            "manifest does not select GSM8K/MATH/MBPP/HumanEval"
+        )
+    if capabilities.get("calibration_driven_acceptance_gate"):
+        if not calibration_metric:
+            reasons.append("manifest omits the calibration metric")
+        if not acceptance_rule:
+            reasons.append("manifest omits the online accept/reject rule")
+        if not rollback_behavior:
+            reasons.append("manifest omits rejection/rollback behavior")
+    if any(
+        marker in serialized
+        for marker in (
+            "synthetic",
+            "simulate",
+            "simulation",
+            "toy model",
+            "small mlp",
+            "fashionmnist",
+            "mnist",
+            "cifar",
+            "imagenet",
+            "mock",
+            "proxy benchmark",
+        )
+    ):
+        reasons.append("manifest proposes a forbidden proxy or simulation")
+
+    observed = {
+        "model": model,
+        "benchmark": benchmark,
+        "calibration_metric": calibration_metric,
+        "acceptance_rule": acceptance_rule,
+        "rollback_behavior": rollback_behavior,
+        "gpus": gpus,
+        "seeds": seeds,
+        "iterations": iterations,
+        "examples": examples,
+    }
+    for observed_key, limit_key in (
+        ("gpus", "max_gpus"),
+        ("seeds", "max_seeds"),
+        ("iterations", "max_iterations"),
+        ("examples", "max_examples"),
+    ):
+        limit = as_positive_int(envelope.get(limit_key))
+        value = observed[observed_key]
+        if limit is not None and value is None:
+            reasons.append(
+                f"manifest omits bounded {observed_key} required by pilot envelope"
+            )
+        elif limit is not None and value is not None and value > limit:
+            reasons.append(
+                f"manifest exceeds pilot {observed_key} ({value} > {limit})"
+            )
+
+    return {
+        "approved": not reasons,
+        "reasons": reasons,
+        "observed": observed,
+        "contract_topic_id": contract.get("topic_id", ""),
+        "checked_at": _utcnow_iso(),
+    }
+
+
+def _implementation_manifest_prompt(
+    contract: dict[str, Any],
+    exp_plan: str,
+    previous_report: dict[str, Any] | None = None,
+) -> str:
+    """Create a compact design-before-code prompt for the decision model."""
+
+    retry_context = ""
+    if previous_report:
+        retry_context = (
+            "\n\nPREVIOUS MANIFEST REJECTION:\n"
+            + json.dumps(previous_report, ensure_ascii=False, indent=2)
+        )
+    return (
+        "Before any experiment code is generated, produce a minimal "
+        "implementation manifest that obeys the authoritative scientific "
+        "contract exactly. Do not simplify the scientific subject into a "
+        "proxy or simulation.\n\n"
+        "AUTHORITATIVE CONTRACT:\n"
+        f"{json.dumps(contract, ensure_ascii=False, indent=2)}\n\n"
+        "STAGE-9 EXPERIMENT PLAN:\n"
+        f"{exp_plan[:12000]}\n"
+        f"{retry_context}\n\n"
+        "Return JSON only with this exact top-level structure:\n"
+        "{\n"
+        '  "implementation": {\n'
+        '    "model": "exact checkpoint or API adapter",\n'
+        '    "benchmark": "exact benchmark and split",\n'
+        '    "examples": 1,\n'
+        '    "seeds": 1,\n'
+        '    "iterations": 1,\n'
+        '    "gpus": 1,\n'
+        '    "calibration_metric": "exact computable metric",\n'
+        '    "acceptance_rule": "online rule evaluated before accepting update",\n'
+        '    "rollback_behavior": "what happens when the update is rejected",\n'
+        '    "raw_artifacts": ["prompts", "outputs", "scores", "token counts"],\n'
+        '    "files": ["main.py"]\n'
+        "  },\n"
+        '  "rationale": "brief explanation"\n'
+        "}\n"
+        "All resource counts must be explicit integers no greater than the "
+        "pilot envelope. If the contract requires a real LLM and benchmark, "
+        "name them explicitly."
+    )
+
+
+def _prepare_implementation_manifest(
+    stage_dir: Path,
+    contract: dict[str, Any],
+    exp_plan: str,
+    llm: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load or create a decision-approved implementation manifest."""
+
+    manifest_path = stage_dir / "implementation_manifest.json"
+    report_path = stage_dir / "implementation_manifest_gate.json"
+    if manifest_path.exists():
+        cached = _safe_json_loads(
+            manifest_path.read_text(encoding="utf-8"),
+            {},
+        )
+        if isinstance(cached, dict):
+            report = _assess_implementation_manifest(cached, contract)
+            report["source"] = "cached"
+            report_path.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            if report["approved"]:
+                return cached, report
+
+    decision_llm = llm
+    for_role = getattr(llm, "for_role", None)
+    if callable(for_role):
+        decision_llm = for_role(
+            "implementation_auditor",
+            stage=Stage.CODE_GENERATION,
+        )
+
+    last_report: dict[str, Any] | None = None
+    last_manifest: dict[str, Any] = {}
+    for attempt in range(2):
+        response = decision_llm.chat(
+            [{
+                "role": "user",
+                "content": _implementation_manifest_prompt(
+                    contract,
+                    exp_plan,
+                    previous_report=last_report,
+                ),
+            }],
+            system=(
+                "You are the decision authority for a scientific code "
+                "generation gate. Produce a precise implementation manifest; "
+                "never replace a real experiment with a proxy."
+            ),
+            max_tokens=2048,
+            json_mode=True,
+        )
+        parsed = _safe_json_loads(response.content, {})
+        last_manifest = parsed if isinstance(parsed, dict) else {}
+        last_report = _assess_implementation_manifest(
+            last_manifest,
+            contract,
+        )
+        last_report["source"] = "generated"
+        last_report["attempt"] = attempt + 1
+        manifest_path.write_text(
+            json.dumps(last_manifest, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        report_path.write_text(
+            json.dumps(last_report, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        if last_report["approved"]:
+            break
+    return last_manifest, last_report or {
+        "approved": False,
+        "reasons": ["manifest generation failed"],
+    }
+
+
+def _implementation_guidance(
+    contract: dict[str, Any],
+    manifest: dict[str, Any],
+) -> str:
+    """Render immutable contract and approved manifest for every code path."""
+
+    return (
+        "\n\n## AUTHORITATIVE SCIENTIFIC CONTRACT — NON-NEGOTIABLE\n"
+        f"{json.dumps(contract, ensure_ascii=False, indent=2)}\n\n"
+        "## DECISION-APPROVED IMPLEMENTATION MANIFEST — IMPLEMENT EXACTLY\n"
+        f"{json.dumps(manifest, ensure_ascii=False, indent=2)}\n\n"
+        "Do not change the selected model, benchmark, calibration metric, "
+        "accept/reject rule, rollback behavior, or pilot resource counts. "
+        "Do not substitute synthetic data, a toy model, or a proxy task."
+    )
 
 
 def _assess_scientific_code_alignment(
@@ -1045,6 +1432,71 @@ def _execute_code_generation(
 
     # --- Detect available packages for sandbox ---
     _pm = prompts or PromptManager()
+    _scientific_contract = _load_scientific_contract(run_dir, config)
+    _compiled_contract = _implementation_contract(
+        _scientific_contract,
+        config.research.topic,
+    )
+    _authoritative_topic = str(
+        _compiled_contract.get("title", config.research.topic)
+        or config.research.topic
+    )
+    (stage_dir / "implementation_contract.json").write_text(
+        json.dumps(
+            _compiled_contract,
+            indent=2,
+            ensure_ascii=False,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    _implementation_manifest: dict[str, Any] = {}
+    if _compiled_contract.get("topic_id"):
+        if llm is None:
+            return StageResult(
+                stage=Stage.CODE_GENERATION,
+                status=StageStatus.PAUSED,
+                artifacts=("implementation_contract.json",),
+                error=(
+                    "Authoritative topic requires an approved implementation "
+                    "manifest before code generation, but no LLM is available"
+                ),
+                decision="implementation_manifest_required",
+                evidence_refs=("stage-10/implementation_contract.json",),
+            )
+        (
+            _implementation_manifest,
+            _manifest_report,
+        ) = _prepare_implementation_manifest(
+            stage_dir,
+            _compiled_contract,
+            exp_plan,
+            llm,
+        )
+        if not _manifest_report.get("approved", False):
+            return StageResult(
+                stage=Stage.CODE_GENERATION,
+                status=StageStatus.PAUSED,
+                artifacts=(
+                    "implementation_contract.json",
+                    "implementation_manifest.json",
+                    "implementation_manifest_gate.json",
+                ),
+                error=(
+                    "Implementation manifest violates the authoritative "
+                    "scientific contract"
+                ),
+                decision="implementation_manifest_rejected",
+                evidence_refs=(
+                    "stage-10/implementation_contract.json",
+                    "stage-10/implementation_manifest_gate.json",
+                ),
+            )
+        _manifest_guidance = _implementation_guidance(
+            _compiled_contract,
+            _implementation_manifest,
+        )
+    else:
+        _manifest_guidance = ""
 
     # --- Hardware-aware package hint ---
     hw_profile = _load_hardware_profile(run_dir)
@@ -1139,10 +1591,22 @@ def _execute_code_generation(
         )
         if _net_policy == "none":
             # Network disabled: inject strict offline-only guidance
-            try:
-                extra_guidance += _pm.block("network_disabled_guidance")
-            except Exception:  # noqa: BLE001
-                pass
+            if _compiled_contract.get("topic_id"):
+                extra_guidance += (
+                    "\n## OFFLINE RUNTIME CONTRACT\n"
+                    "Stage 12 has no public network. The exact approved model "
+                    "checkpoint and benchmark must therefore be pre-cached or "
+                    "staged onto the worker before execution. Do NOT substitute "
+                    "an unrelated pre-cached dataset or toy model. Fail clearly "
+                    "when the approved artifacts are unavailable.\n"
+                )
+            else:
+                try:
+                    extra_guidance += _pm.block(
+                        "network_disabled_guidance"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
         elif _net_policy == "full":
             try:
                 extra_guidance += _pm.block("dataset_guidance")
@@ -1164,11 +1628,23 @@ def _execute_code_generation(
             extra_guidance += _pm.block("hp_reporting")
         except Exception:  # noqa: BLE001
             pass
-        # I-06: Multi-seed enforcement for all experiments
-        try:
-            extra_guidance += _pm.block("multi_seed_enforcement")
-        except Exception:  # noqa: BLE001
-            pass
+        # I-06: Multi-seed defaults apply only when the authoritative pilot
+        # contract has not selected a stricter seed envelope.
+        _seed_limit = _compiled_contract.get("pilot_envelope", {}).get(
+            "max_seeds"
+        )
+        if _seed_limit is None:
+            try:
+                extra_guidance += _pm.block("multi_seed_enforcement")
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            extra_guidance += (
+                "\n## PILOT SEED LIMIT (AUTHORITATIVE)\n"
+                f"Use exactly {_seed_limit} seed(s) in this canary. "
+                "Do not expand to the generic three-seed paper protocol until "
+                "the pilot is explicitly promoted.\n"
+            )
 
     # --- BA: Inject BenchmarkAgent plan from Stage 9 ---
     _bp_path = None
@@ -1213,7 +1689,7 @@ def _execute_code_generation(
         "transformer train", "causal lm", "chat model", "qwen", "llama",
         "mistral", "phi-", "gemma", "pretraining", "tokeniz",
     )
-    topic_lower = config.research.topic.lower()
+    topic_lower = _authoritative_topic.lower()
     is_llm_topic = any(kw in topic_lower for kw in _llm_keywords)
 
     # --- I-08: RL topic detection and step guidance ---
@@ -1236,7 +1712,7 @@ def _execute_code_generation(
         from researchclaw.data import detect_frameworks, load_framework_docs
         _hypothesis_text = _read_prior_artifact(run_dir, "hypotheses.md") or ""
         _fw_ids = detect_frameworks(
-            config.research.topic, _hypothesis_text, exp_plan or ""
+            _authoritative_topic, _hypothesis_text, exp_plan or ""
         )
         if _fw_ids:
             _fw_docs = load_framework_docs(_fw_ids, max_chars=8000)
@@ -1273,7 +1749,7 @@ def _execute_code_generation(
     # --- Domain-specific guidance injection for non-ML domains ---
     try:
         from researchclaw.domains.detector import detect_domain as _dd_s10, is_ml_domain as _is_ml_s10
-        _dp = _dd_s10(topic=config.research.topic)
+        _dp = _dd_s10(topic=_authoritative_topic)
         if not _is_ml_s10(_dp):
             from researchclaw.domains.prompt_adapter import get_adapter as _ga
             _adapter = _ga(_dp)
@@ -1292,6 +1768,12 @@ def _execute_code_generation(
 
     # BUG-R6-01: Add explicit implementation constraints to prevent LLM
     # from substituting unrelated DL models for lightweight algorithms.
+    _requires_gpu_subject = bool(
+        _compiled_contract.get("required_capabilities", {}).get(
+            "llm_subject",
+            False,
+        )
+    )
     extra_guidance += (
         "\n\nIMPLEMENTATION CONSTRAINTS (MUST FOLLOW):\n"
         "- Implement EXACTLY the algorithm/method described in the topic.\n"
@@ -1300,7 +1782,13 @@ def _execute_code_generation(
         "EXPLICITLY requires deep learning.\n"
         "- Prefer lightweight CPU-friendly libraries (numpy, scipy, "
         "sklearn, pandas) unless deep learning is inherent to the topic.\n"
-        "- The experiment MUST be self-contained and runnable without GPU.\n"
+        + (
+            "- Deep learning is inherent to this authoritative topic; use the "
+            "approved real model and the bounded GPU envelope.\n"
+            if _requires_gpu_subject
+            else "- The experiment MUST be self-contained and runnable without GPU.\n"
+        )
+        + _manifest_guidance
     )
 
     # --- Code generation: Beast Mode → CodeAgent → Legacy single-shot ---
@@ -1321,7 +1809,7 @@ def _execute_code_generation(
         _hist_failures = count_historical_failures(run_dir)
         _cplx = score_complexity(
             exp_plan=exp_plan,
-            topic=config.research.topic,
+            topic=_authoritative_topic,
             historical_failures=_hist_failures,
             threshold=_oc_cfg.complexity_threshold,
         )
@@ -1384,7 +1872,7 @@ def _execute_code_generation(
 
                 _oc_result: OpenCodeResult = _bridge.generate(
                     stage_dir=stage_dir,
-                    topic=config.research.topic,
+                    topic=_authoritative_topic,
                     exp_plan=exp_plan,
                     metric=metric,
                     pkg_hint=pkg_hint + "\n" + compute_budget,
@@ -1466,7 +1954,7 @@ def _execute_code_generation(
         try:
             from researchclaw.domains.detector import detect_domain as _dd
             from researchclaw.domains.detector import is_ml_domain as _is_ml
-            _domain_profile = _dd(topic=config.research.topic)
+            _domain_profile = _dd(topic=_authoritative_topic)
             logger.info(
                 "CodeAgent: domain=%s (%s)",
                 _domain_profile.display_name,
@@ -1478,7 +1966,7 @@ def _execute_code_generation(
                     from researchclaw.agents.code_searcher import CodeSearchAgent
                     _cs_agent = CodeSearchAgent(llm=llm)
                     _code_search_result = _cs_agent.search(
-                        topic=config.research.topic,
+                        topic=_authoritative_topic,
                         domain=_domain_profile,
                     )
                     if _code_search_result and _code_search_result.patterns.has_content:
@@ -1516,16 +2004,16 @@ def _execute_code_generation(
                 run_dir,
                 "code_generation",
                 config=config,
-                topic=config.research.topic,
+                topic=_authoritative_topic,
             ),
-            topic=config.research.topic,
+            topic=_authoritative_topic,
             metric=metric,
             pkg_hint=pkg_hint + "\n" + compute_budget + "\n" + extra_guidance,
             exp_plan=exp_plan,
             metric_direction_hint="",
         ).user
         _agent_result = _agent.generate(
-            topic=config.research.topic,
+            topic=_authoritative_topic,
             exp_plan=exp_plan,
             metric=metric,
             pkg_hint=(
@@ -1569,7 +2057,7 @@ def _execute_code_generation(
         )
     elif not _beast_mode_used and llm is not None:
         # ── Legacy single-shot generation ─────────────────────────────────
-        topic = config.research.topic
+        topic = _authoritative_topic
         _md = config.experiment.metric_direction
         _md_hint = (
             f"`{_md}` — use direction={'lower' if _md == 'minimize' else 'higher'} "
@@ -1943,7 +2431,7 @@ def _execute_code_generation(
         review_prompt = (
             f"You are a senior researcher reviewing experiment code for a "
             f"research submission.\n\n"
-            f"TOPIC: {config.research.topic}\n"
+            f"TOPIC: {_authoritative_topic}\n"
             f"EXPERIMENT PLAN:\n{exp_plan[:3000]}\n\n"
             f"CODE:\n```python\n{all_code_review}\n```\n\n"
             f"Review the code and return JSON with this EXACT structure:\n"
@@ -2123,7 +2611,7 @@ def _execute_code_generation(
             f"{_inventory_block}\n\n{_main_block}\n\n{_other_block}"
         )
         align_prompt = (
-            f"Research topic: {config.research.topic}\n\n"
+            f"Research topic: {_authoritative_topic}\n\n"
             f"Experiment code:\n```python\n{all_code_for_check}\n```\n\n"
             "TASK: Evaluate whether this experiment code actually tests the "
             "stated research topic. Answer with JSON:\n"
@@ -2165,19 +2653,17 @@ def _execute_code_generation(
                     regen_prompt = (
                         f"The experiment code you previously generated does NOT align "
                         f"with the research topic.\n\n"
-                        f"TOPIC: {config.research.topic}\n"
+                        f"TOPIC: {_authoritative_topic}\n"
                         f"MISALIGNMENT: {alignment_note}\n"
                         f"SUGGESTIONS: {suggestions}\n\n"
                         f"REGENERATE the experiment code to DIRECTLY test the stated "
                         f"topic. The code MUST implement the core technique described "
                         f"in the topic, not a generic proxy.\n\n"
                         f"CRITICAL CONSTRAINTS:\n"
-                        f"- You MUST implement the EXACT algorithm/method from the topic.\n"
-                        f"- Do NOT substitute a deep-learning proxy (ResNet, BERT, etc.) "
-                        f"when the topic describes a tabular, bandit, or game-theoretic method.\n"
-                        f"- Use ONLY lightweight CPU-friendly libraries (numpy, scipy, "
-                        f"sklearn) unless the topic EXPLICITLY requires deep learning.\n"
-                        f"- The experiment must be self-contained and runnable without GPU.\n\n"
+                        f"- You MUST implement the EXACT approved manifest below.\n"
+                        f"- Do NOT substitute any model, benchmark, method, or "
+                        f"resource count.\n"
+                        f"{_manifest_guidance}\n\n"
                         f"{pkg_hint}\n{compute_budget}\n"
                         f"PLAN:\n{exp_plan}\n\n"
                         f"Return multiple files using ```filename:xxx.py format."
@@ -2224,7 +2710,7 @@ def _execute_code_generation(
                     )
                     recheck_resp = llm.chat(
                         [{"role": "user", "content": (
-                            f"Research topic: {config.research.topic}\n\n"
+                            f"Research topic: {_authoritative_topic}\n\n"
                             f"Experiment code:\n```python\n{recheck_code}\n```\n\n"
                             "TASK: Evaluate whether this experiment code actually tests "
                             "the stated research topic. Only main.py is shown in full; "
@@ -2325,7 +2811,7 @@ def _execute_code_generation(
     scientific_report = _assess_scientific_code_alignment(
         files,
         _load_scientific_contract(run_dir, config),
-        config.research.topic,
+        _authoritative_topic,
     )
     scientific_gate = _scientific_code_alignment_result(
         stage_dir,
@@ -2346,7 +2832,7 @@ def _execute_code_generation(
     spec = f"""# Experiment Specification
 
 ## Topic
-{config.research.topic}
+{_authoritative_topic}
 
 ## Project Structure
 Multi-file experiment project with {len(files)} file(s): {file_list}
@@ -2378,6 +2864,14 @@ Multi-file experiment project with {len(files)} file(s): {file_list}
         "scientific_code_alignment.json",
         "pilot_envelope.json",
     ]
+    if (stage_dir / "implementation_contract.json").exists():
+        artifacts.extend(
+            [
+                "implementation_contract.json",
+                "implementation_manifest.json",
+                "implementation_manifest_gate.json",
+            ]
+        )
     if (stage_dir / "validation_report.md").exists():
         artifacts.append("validation_report.md")
 

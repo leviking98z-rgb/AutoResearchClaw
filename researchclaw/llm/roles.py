@@ -59,6 +59,7 @@ KNOWN_ROLES: frozenset[str] = frozenset(
         "campaign_director",
         "mutation_proposer",
         "mutation_auditor",
+        "implementation_auditor",
     }
 )
 
@@ -69,6 +70,7 @@ ROLE_MODEL_TIERS: dict[str, str] = {
     "research_director": "decision",
     "skeptical_reviewer": "decision",
     "mutation_auditor": "decision",
+    "implementation_auditor": "decision",
     # Main scientific and engineering work.
     "idea_scientist": "worker",
     "experiment_designer": "worker",

@@ -215,6 +215,108 @@ class TestPhase2ExecFix:
         assert progress["llm_calls"] == 1
         assert progress["detail"]
 
+    def test_single_shot_resume_skips_initial_generation(
+        self, stage_dir: Path, pm: PromptManager,
+    ) -> None:
+        code = (
+            "```filename:main.py\n"
+            "def main():\n"
+            "    print('metric: 1.0')\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+            "```"
+        )
+        config = CodeAgentConfig(
+            architecture_planning=False,
+            hard_validation=False,
+            exec_fix_max_iterations=0,
+            review_max_rounds=0,
+        )
+        first_llm = FakeLLM(responses=[code])
+        first = CodeAgent(
+            llm=first_llm,
+            prompts=pm,
+            config=config,
+            stage_dir=stage_dir,
+        )
+        first_result = first.generate(
+            topic="test",
+            exp_plan="plan",
+            metric="metric",
+            pkg_hint="contract",
+        )
+
+        second_llm = FakeLLM(
+            responses=[
+                "```filename:main.py\nraise AssertionError('must not run')\n```"
+            ]
+        )
+        second = CodeAgent(
+            llm=second_llm,
+            prompts=pm,
+            config=config,
+            stage_dir=stage_dir,
+        )
+        second_result = second.generate(
+            topic="test",
+            exp_plan="plan",
+            metric="metric",
+            pkg_hint="contract",
+        )
+
+        assert first_result.files == second_result.files
+        assert second_result.total_llm_calls == 0
+        assert second_llm.calls == []
+
+    def test_resume_fingerprint_mismatch_regenerates(
+        self, stage_dir: Path, pm: PromptManager,
+    ) -> None:
+        first_code = (
+            "```filename:main.py\n"
+            "print('metric: 1.0')\n"
+            "```"
+        )
+        second_code = (
+            "```filename:main.py\n"
+            "print('metric: 2.0')\n"
+            "```"
+        )
+        config = CodeAgentConfig(
+            architecture_planning=False,
+            hard_validation=False,
+            exec_fix_max_iterations=0,
+            review_max_rounds=0,
+        )
+        first = CodeAgent(
+            llm=FakeLLM(responses=[first_code]),
+            prompts=pm,
+            config=config,
+            stage_dir=stage_dir,
+        )
+        first.generate(
+            topic="test",
+            exp_plan="plan A",
+            metric="metric",
+            pkg_hint="contract",
+        )
+
+        second_llm = FakeLLM(responses=[second_code])
+        second = CodeAgent(
+            llm=second_llm,
+            prompts=pm,
+            config=config,
+            stage_dir=stage_dir,
+        )
+        result = second.generate(
+            topic="test",
+            exp_plan="plan B",
+            metric="metric",
+            pkg_hint="contract",
+        )
+
+        assert result.total_llm_calls == 1
+        assert "2.0" in result.files["main.py"]
+
     def test_exec_fix_loop_fixes_crashing_code(
         self, stage_dir: Path, pm: PromptManager,
     ) -> None:

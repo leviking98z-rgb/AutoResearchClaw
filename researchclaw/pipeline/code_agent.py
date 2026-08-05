@@ -23,6 +23,7 @@ returns ``CodeAgentResult`` with the generated files.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import logging
 import os
@@ -190,6 +191,8 @@ class CodeAgent:
         self._sandbox: _SandboxLike | None = None
         self._progress_path = self._stage_dir / "code_agent_progress.json"
         self._wip_dir = self._stage_dir / "work-in-progress"
+        self._checkpoint_path = self._stage_dir / "code_agent_checkpoint.json"
+        self._input_fingerprint = ""
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -203,19 +206,44 @@ class CodeAgent:
     ) -> CodeAgentResult:
         """Execute all enabled phases and return generated files."""
         t0 = time.time()
+        self._input_fingerprint = self._build_input_fingerprint(
+            topic=topic,
+            exp_plan=exp_plan,
+            metric=metric,
+            pkg_hint=pkg_hint,
+            max_tokens=max_tokens,
+        )
         self._log_event("CodeAgent.generate() started")
+        resumed = self._load_checkpoint()
 
         # Phase 1: Blueprint planning
-        arch_spec = ""
+        arch_spec = str(resumed.get("architecture_spec", "")) if resumed else ""
         blueprint = None
-        if self._cfg.architecture_planning:
+        if self._cfg.architecture_planning and not resumed:
             arch_spec, blueprint = self._phase1_blueprint(
                 topic, exp_plan, metric,
             )
 
         # Phase 2: Code generation
         nodes_explored = 0
-        if self._cfg.tree_search_enabled and self._sandbox_factory:
+        if resumed:
+            files = dict(resumed["files"])
+            self._log_event(
+                "Phase 2: Resume checkpoint loaded — skipping initial "
+                f"generation for {len(files)} file(s)"
+            )
+            if self._cfg.hard_validation and files:
+                files = self._hard_validate_and_repair(
+                    files, topic, exp_plan, metric, pkg_hint, arch_spec,
+                )
+            files = self._exec_fix_loop(files)
+            best = SolutionNode(
+                node_id="resumed",
+                files=files,
+                runs_ok=bool(files),
+                score=1.0 if files else 0.0,
+            )
+        elif self._cfg.tree_search_enabled and self._sandbox_factory:
             best, nodes_explored = self._phase3_tree_search(
                 topic, exp_plan, metric, pkg_hint, arch_spec, max_tokens,
             )
@@ -1405,6 +1433,11 @@ class CodeAgent:
             if fixed:
                 files = dict(files)
                 files.update(fixed)
+                self._persist_files(
+                    files,
+                    phase="review_repair",
+                    detail=f"completed review repair round {r + 1}",
+                )
 
         return files, rounds
 
@@ -1618,6 +1651,139 @@ class CodeAgent:
             detail=f"{detail}; checkpointed {len(persisted)} file(s)",
             state="running",
         )
+        if self._input_fingerprint and persisted:
+            file_records = {
+                filename: {
+                    "sha256": hashlib.sha256(
+                        files[filename].encode("utf-8")
+                    ).hexdigest(),
+                    "size": len(files[filename].encode("utf-8")),
+                }
+                for filename in persisted
+            }
+            checkpoint = {
+                "schema_version": 1,
+                "input_fingerprint": self._input_fingerprint,
+                "durable_phase": phase,
+                "expected_files": sorted(persisted),
+                "files": file_records,
+                "updated_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(),
+                ),
+            }
+            self._atomic_write_text(
+                self._checkpoint_path,
+                json.dumps(
+                    checkpoint,
+                    indent=2,
+                    ensure_ascii=False,
+                ) + "\n",
+            )
+
+    def _build_input_fingerprint(
+        self,
+        *,
+        topic: str,
+        exp_plan: str,
+        metric: str,
+        pkg_hint: str,
+        max_tokens: int,
+    ) -> str:
+        payload = {
+            "schema_version": 1,
+            "topic": topic,
+            "exp_plan": exp_plan,
+            "metric": metric,
+            "pkg_hint": pkg_hint,
+            "max_tokens": max_tokens,
+            "config": {
+                key: getattr(self._cfg, key)
+                for key in self._cfg.__dataclass_fields__
+            },
+            "model": str(
+                getattr(
+                    getattr(self._llm, "resolved_role", None),
+                    "model",
+                    "",
+                )
+                or getattr(
+                    getattr(self._llm, "config", None),
+                    "primary_model",
+                    "",
+                )
+            ),
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _load_checkpoint(self) -> dict[str, Any] | None:
+        """Load a complete matching code snapshot, otherwise fail safely."""
+        if not self._checkpoint_path.is_file():
+            return None
+        try:
+            checkpoint = json.loads(
+                self._checkpoint_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            self._write_progress(
+                phase="resume",
+                detail="checkpoint unreadable; starting fresh",
+                state="running",
+            )
+            return None
+        if checkpoint.get("input_fingerprint") != self._input_fingerprint:
+            self._write_progress(
+                phase="resume",
+                detail="checkpoint fingerprint mismatch; starting fresh",
+                state="running",
+            )
+            return None
+        expected = checkpoint.get("expected_files")
+        records = checkpoint.get("files")
+        if not isinstance(expected, list) or not isinstance(records, dict):
+            return None
+        loaded: dict[str, str] = {}
+        root = self._wip_dir.resolve()
+        for filename in expected:
+            if not isinstance(filename, str):
+                return None
+            path = (self._wip_dir / filename).resolve()
+            if not path.is_relative_to(root) or not path.is_file() or path.is_symlink():
+                return None
+            content = path.read_text(encoding="utf-8")
+            record = records.get(filename)
+            if not isinstance(record, dict):
+                return None
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if digest != record.get("sha256"):
+                self._write_progress(
+                    phase="resume",
+                    detail=f"checkpoint hash mismatch for {filename}; starting fresh",
+                    state="running",
+                )
+                return None
+            loaded[filename] = content
+        if "main.py" not in loaded:
+            return None
+        self._write_progress(
+            phase="resume",
+            detail=(
+                f"loaded {len(loaded)} file(s) from "
+                f"{checkpoint.get('durable_phase', 'checkpoint')}"
+            ),
+            state="running",
+        )
+        return {
+            "files": loaded,
+            "architecture_spec": checkpoint.get("architecture_spec", ""),
+        }
 
 
 # ---------------------------------------------------------------------------

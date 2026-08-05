@@ -206,6 +206,7 @@ _SELECTED_TOPIC_CONTRACT_FIELDS = (
     "ablations",
     "failure_safety_tests",
     "cheap_pilot",
+    "pilot_envelope",
     "compute",
     "pivot_policy",
 )
@@ -331,6 +332,10 @@ def _apply_selected_topic_contract(
         merged_compute.update(compute)
         anchored["compute_budget"] = merged_compute
         anchored["selected_compute"] = dict(compute)
+
+    pilot_envelope = selected_topic.get("pilot_envelope")
+    if isinstance(pilot_envelope, dict) and pilot_envelope:
+        anchored["pilot_envelope"] = dict(pilot_envelope)
 
     selected_models = _normalize_plan_field(selected_topic.get("models"))
     if selected_models:

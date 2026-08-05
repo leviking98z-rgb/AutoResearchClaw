@@ -16,7 +16,10 @@ from researchclaw.pipeline.stage_impls._experiment_design import (
 )
 from researchclaw.pipeline.stage_impls._code_generation import (
     _assess_pilot_envelope,
+    _assess_implementation_manifest,
     _assess_scientific_code_alignment,
+    _implementation_contract,
+    _load_scientific_contract,
 )
 from researchclaw.pipeline.stage_impls._paper_writing import (
     _collect_raw_experiment_metrics,
@@ -131,6 +134,66 @@ def _write_selected_topic(run_dir: Path) -> None:
     stage1.mkdir(parents=True, exist_ok=True)
     (stage1 / "selected_topic.json").write_text(
         json.dumps(_selected_topic()), encoding="utf-8"
+    )
+
+
+def test_stage10_contract_loader_prefers_authoritative_run_root_topic(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    stale = {
+        **_selected_topic(),
+        "pilot_envelope": {"max_examples": 200},
+    }
+    current = {
+        **_selected_topic(),
+        "pilot_envelope": {
+            "max_gpus": 1,
+            "max_seeds": 1,
+            "max_iterations": 1,
+            "max_examples": 50,
+        },
+    }
+    stage1 = run_dir / "stage-01"
+    stage1.mkdir(parents=True)
+    (stage1 / "selected_topic.json").write_text(
+        json.dumps(stale),
+        encoding="utf-8",
+    )
+    (run_dir / "selected_topic.json").write_text(
+        json.dumps(current),
+        encoding="utf-8",
+    )
+
+    loaded = _load_scientific_contract(
+        run_dir,
+        _config(tmp_path, topic=str(current["title"])),
+    )
+
+    assert loaded["pilot_envelope"]["max_examples"] == 50
+
+
+def test_stage9_embeds_authoritative_pilot_envelope() -> None:
+    selected = {
+        **_selected_topic(),
+        "pilot_envelope": {
+            "max_gpus": 1,
+            "max_seeds": 1,
+            "max_iterations": 1,
+            "max_examples": 50,
+        },
+    }
+
+    anchored = _apply_selected_topic_contract(
+        _aligned_rsi_plan(),
+        selected,
+        str(selected["title"]),
+    )
+
+    assert anchored["pilot_envelope"]["max_examples"] == 50
+    assert (
+        anchored["selected_topic_contract"]["pilot_envelope"]["max_seeds"]
+        == 1
     )
 
 
@@ -754,6 +817,74 @@ def generate_synthetic_trajectories():
     assert report["missing_model_execution"] is True
     assert report["missing_dataset_execution"] is True
     assert report["simulation_hits"]
+
+
+def test_stage10_manifest_gate_accepts_bounded_real_llm_plan() -> None:
+    selected = {
+        **_selected_topic(),
+        "pilot_envelope": {
+            "max_gpus": 1,
+            "max_seeds": 1,
+            "max_iterations": 1,
+            "max_examples": 50,
+        },
+    }
+    contract = _implementation_contract(
+        selected,
+        str(selected["title"]),
+    )
+    manifest = {
+        "implementation": {
+            "model": "Qwen/Qwen2.5-7B-Instruct via from_pretrained",
+            "benchmark": "GSM8K test via load_dataset",
+            "examples": 40,
+            "seeds": 1,
+            "iterations": 1,
+            "gpus": 1,
+            "calibration_metric": "expected_calibration_error",
+            "acceptance_rule": "accept_update when ECE <= 0.1",
+            "rollback_behavior": "reject_update and rollback to incumbent",
+        }
+    }
+
+    report = _assess_implementation_manifest(manifest, contract)
+
+    assert report["approved"] is True
+    assert report["reasons"] == []
+
+
+def test_stage10_manifest_gate_rejects_proxy_before_code_generation() -> None:
+    selected = {
+        **_selected_topic(),
+        "pilot_envelope": {
+            "max_gpus": 1,
+            "max_seeds": 1,
+            "max_iterations": 1,
+            "max_examples": 50,
+        },
+    }
+    contract = _implementation_contract(
+        selected,
+        str(selected["title"]),
+    )
+    manifest = {
+        "implementation": {
+            "model": "small MLP",
+            "benchmark": "synthetic classification",
+            "examples": 300,
+            "seeds": 5,
+            "iterations": 3,
+            "gpus": 1,
+        }
+    }
+
+    report = _assess_implementation_manifest(manifest, contract)
+
+    assert report["approved"] is False
+    assert any("concrete LLM" in reason for reason in report["reasons"])
+    assert any("GSM8K" in reason for reason in report["reasons"])
+    assert any("forbidden proxy" in reason for reason in report["reasons"])
+    assert any("examples" in reason for reason in report["reasons"])
 
 
 def test_stage10_scientific_gate_rejects_synthetic_mlp_self_training_proxy() -> None:
