@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>AutoResearch v2 · Multi-Idea Lab</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header>
+      <div>
+        <small>TRANSACTIONAL · CONTINUOUS · MULTI-IDEA</small>
+        <h1>AutoResearch v2</h1>
+      </div>
+      <div class="actions">
+        <span id="connection">连接中</span>
+        <button id="pause">暂停准入</button>
+        <button id="resume">恢复</button>
+        <button id="refresh">刷新</button>
+      </div>
+    </header>
+    <main>
+      <section id="metrics" class="metrics"></section>
+      <section id="board" class="board"></section>
+      <section class="lower">
+        <article>
+          <h2>GPU Pool</h2>
+          <div id="gpu"></div>
+        </article>
+        <article>
+          <h2>最近事件</h2>
+          <div id="events"></div>
+        </article>
+      </section>
+      <section class="detail">
+        <div class="detail-head">
+          <div>
+            <h2>Idea / Job / Attempt Drill-down</h2>
+            <p id="detail-title">点击任意 Idea 查看事务与日志</p>
+          </div>
+          <div id="log-actions" class="actions"></div>
+        </div>
+        <div id="detail"></div>
+      </section>
+    </main>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

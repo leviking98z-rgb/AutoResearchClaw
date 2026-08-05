@@ -1,0 +1,282 @@
+"""Small, independent configuration model for AutoResearch v2."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+def _mapping(value: object, name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{name} must be a mapping")
+    return {str(key): item for key, item in value.items()}
+
+
+@dataclass(frozen=True, slots=True)
+class PopulationConfig:
+    reservoir_low_watermark: int = 12
+    reservoir_target: int = 24
+    generation_batch_size: int = 12
+    active_idea_target: int = 8
+    max_active_ideas: int = 10
+    max_same_family: int = 2
+
+
+@dataclass(frozen=True, slots=True)
+class ConcurrencyConfig:
+    max_llm_jobs: int = 4
+    max_cpu_jobs: int = 8
+    max_gpu_jobs: int = 8
+    poll_interval_sec: float = 2.0
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetConfig:
+    max_build_attempts: int = 2
+    max_job_attempts: int = 2
+    pilot_gpu_hours: float = 2.0
+    scale_gpu_hours: float = 32.0
+    max_llm_tokens_per_idea: int = 2_000_000
+    max_wall_clock_hours_per_idea: float = 72.0
+    max_no_progress_hours: float = 12.0
+
+
+@dataclass(frozen=True, slots=True)
+class GPUConfig:
+    enabled: bool = False
+    pool_config: str = ""
+    reserved_gpus: int = 0
+    target_utilization: float = 0.90
+    max_share_per_idea: float = 0.50
+    pilot_max_gpus: int = 2
+    scale_max_gpus: int = 8
+    shared_workspace_root: str = (
+        "/root/shared/.clusters/.workdir/autoresearch-v2/runs"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class LiteratureConfig:
+    enabled: bool = True
+    mode: str = "http"
+    url: str = "http://127.0.0.1:8077"
+    repo: str = "/root/servers/infohub"
+    timeout_sec: float = 20.0
+    search_limit: int = 30
+    collect_days: int = 3650
+    collect_platforms: tuple[str, ...] = ("arxiv", "scholar", "bing")
+    refresh_on_low_results: bool = True
+    min_results: int = 8
+
+
+@dataclass(frozen=True, slots=True)
+class ModelConfig:
+    researchclaw_config: str = "config.rsi.yaml"
+    decision_role: str = "research_director"
+    worker_role: str = "coding_engineer"
+    utility_role: str = "literature_researcher"
+
+
+@dataclass(frozen=True, slots=True)
+class V2Config:
+    enabled: bool = False
+    system_id: str = "autoresearch-v2"
+    state_dir: str = "workspace/autoresearch-v2"
+    topic_brief: str = ""
+    population: PopulationConfig = field(default_factory=PopulationConfig)
+    concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
+    budgets: BudgetConfig = field(default_factory=BudgetConfig)
+    gpu: GPUConfig = field(default_factory=GPUConfig)
+    models: ModelConfig = field(default_factory=ModelConfig)
+    literature: LiteratureConfig = field(default_factory=LiteratureConfig)
+
+    @property
+    def root(self) -> Path:
+        return Path(self.state_dir).expanduser().resolve()
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> V2Config:
+        top = _mapping(raw, "config")
+        data = _mapping(
+            top.get("autoresearch_v2", top.get("v2", top)),
+            "autoresearch_v2",
+        )
+        population = PopulationConfig(
+            **{
+                key: int(value)
+                for key, value in _mapping(
+                    data.get("population"), "population"
+                ).items()
+            }
+        )
+        concurrency_raw = _mapping(data.get("concurrency"), "concurrency")
+        concurrency = ConcurrencyConfig(
+            max_llm_jobs=int(concurrency_raw.get("max_llm_jobs", 4)),
+            max_cpu_jobs=int(concurrency_raw.get("max_cpu_jobs", 8)),
+            max_gpu_jobs=int(concurrency_raw.get("max_gpu_jobs", 8)),
+            poll_interval_sec=float(
+                concurrency_raw.get("poll_interval_sec", 2.0)
+            ),
+        )
+        budgets_raw = _mapping(data.get("budgets"), "budgets")
+        budgets = BudgetConfig(
+            max_build_attempts=int(
+                budgets_raw.get("max_build_attempts", 2)
+            ),
+            max_job_attempts=int(budgets_raw.get("max_job_attempts", 2)),
+            pilot_gpu_hours=float(
+                budgets_raw.get("pilot_gpu_hours", 2.0)
+            ),
+            scale_gpu_hours=float(
+                budgets_raw.get("scale_gpu_hours", 32.0)
+            ),
+            max_llm_tokens_per_idea=int(
+                budgets_raw.get("max_llm_tokens_per_idea", 2_000_000)
+            ),
+            max_wall_clock_hours_per_idea=float(
+                budgets_raw.get("max_wall_clock_hours_per_idea", 72.0)
+            ),
+            max_no_progress_hours=float(
+                budgets_raw.get("max_no_progress_hours", 12.0)
+            ),
+        )
+        gpu_raw = _mapping(data.get("gpu"), "gpu")
+        gpu = GPUConfig(
+            enabled=bool(gpu_raw.get("enabled", False)),
+            pool_config=str(gpu_raw.get("pool_config", "") or ""),
+            reserved_gpus=int(gpu_raw.get("reserved_gpus", 0)),
+            target_utilization=float(
+                gpu_raw.get("target_utilization", 0.90)
+            ),
+            max_share_per_idea=float(
+                gpu_raw.get("max_share_per_idea", 0.50)
+            ),
+            pilot_max_gpus=int(gpu_raw.get("pilot_max_gpus", 2)),
+            scale_max_gpus=int(gpu_raw.get("scale_max_gpus", 8)),
+            shared_workspace_root=str(
+                gpu_raw.get(
+                    "shared_workspace_root",
+                    "/root/shared/.clusters/.workdir/autoresearch-v2/runs",
+                )
+                or ""
+            ),
+        )
+        models_raw = _mapping(data.get("models"), "models")
+        models = ModelConfig(
+            researchclaw_config=str(
+                models_raw.get("researchclaw_config", "config.rsi.yaml")
+            ),
+            decision_role=str(
+                models_raw.get("decision_role", "research_director")
+            ),
+            worker_role=str(
+                models_raw.get("worker_role", "coding_engineer")
+            ),
+            utility_role=str(
+                models_raw.get("utility_role", "literature_researcher")
+            ),
+        )
+        literature_raw = _mapping(data.get("literature"), "literature")
+        platforms_raw = literature_raw.get(
+            "collect_platforms", ("arxiv", "scholar", "bing")
+        )
+        if isinstance(platforms_raw, str):
+            platforms = tuple(
+                value.strip()
+                for value in platforms_raw.split(",")
+                if value.strip()
+            )
+        else:
+            platforms = tuple(
+                str(value).strip()
+                for value in (platforms_raw or ())
+                if str(value).strip()
+            )
+        literature = LiteratureConfig(
+            enabled=bool(literature_raw.get("enabled", True)),
+            mode=str(literature_raw.get("mode", "http") or "http"),
+            url=str(
+                literature_raw.get("url", "http://127.0.0.1:8077")
+                or "http://127.0.0.1:8077"
+            ),
+            repo=str(
+                literature_raw.get("repo", "/root/servers/infohub")
+                or "/root/servers/infohub"
+            ),
+            timeout_sec=float(literature_raw.get("timeout_sec", 20.0)),
+            search_limit=int(literature_raw.get("search_limit", 30)),
+            collect_days=int(literature_raw.get("collect_days", 3650)),
+            collect_platforms=platforms or ("arxiv", "scholar", "bing"),
+            refresh_on_low_results=bool(
+                literature_raw.get("refresh_on_low_results", True)
+            ),
+            min_results=int(literature_raw.get("min_results", 8)),
+        )
+        config = cls(
+            enabled=bool(data.get("enabled", False)),
+            system_id=str(data.get("system_id", "autoresearch-v2")),
+            state_dir=str(
+                data.get("state_dir", "workspace/autoresearch-v2")
+            ),
+            topic_brief=str(data.get("topic_brief", "") or ""),
+            population=population,
+            concurrency=concurrency,
+            budgets=budgets,
+            gpu=gpu,
+            models=models,
+            literature=literature,
+        )
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        if not 0 < self.population.active_idea_target <= (
+            self.population.max_active_ideas
+        ):
+            raise ValueError(
+                "active_idea_target must be within max_active_ideas"
+            )
+        if self.population.reservoir_target < (
+            self.population.reservoir_low_watermark
+        ):
+            raise ValueError(
+                "reservoir_target must be >= reservoir_low_watermark"
+            )
+        if min(
+            self.concurrency.max_llm_jobs,
+            self.concurrency.max_cpu_jobs,
+            self.concurrency.max_gpu_jobs,
+        ) < 1:
+            raise ValueError("concurrency limits must be positive")
+        if not 0 < self.gpu.target_utilization <= 1:
+            raise ValueError("gpu.target_utilization must be in (0,1]")
+        if not 0 < self.gpu.max_share_per_idea <= 1:
+            raise ValueError("gpu.max_share_per_idea must be in (0,1]")
+        if self.gpu.enabled and not self.gpu.pool_config:
+            raise ValueError("gpu.pool_config is required when GPU is enabled")
+        if self.gpu.enabled and not self.gpu.shared_workspace_root:
+            raise ValueError(
+                "gpu.shared_workspace_root is required when GPU is enabled"
+            )
+        if min(
+            self.budgets.pilot_gpu_hours,
+            self.budgets.scale_gpu_hours,
+            self.budgets.max_wall_clock_hours_per_idea,
+            self.budgets.max_no_progress_hours,
+        ) <= 0:
+            raise ValueError("budget hours must be positive")
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> V2Config:
+        value = yaml.safe_load(
+            Path(path).expanduser().read_text(encoding="utf-8")
+        )
+        if not isinstance(value, Mapping):
+            raise TypeError("v2 config must be a mapping")
+        return cls.from_mapping(value)

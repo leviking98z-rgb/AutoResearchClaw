@@ -1,0 +1,60 @@
+autoresearch_v2:
+  enabled: false
+  system_id: rsi-autoresearch-v2
+  state_dir: /root/shared/.clusters/.workdir/autoresearch-v2/rsi
+  topic_brief: >-
+    Discover mechanistic, falsifiable, compute-efficient research questions
+    about recursive self-improvement and self-iterative optimization of LLMs
+    and LLM agents. Prefer ideas with valuable negative results.
+
+  population:
+    reservoir_low_watermark: 12
+    reservoir_target: 24
+    generation_batch_size: 12
+    active_idea_target: 8
+    max_active_ideas: 10
+    max_same_family: 2
+
+  concurrency:
+    max_llm_jobs: 4
+    max_cpu_jobs: 8
+    max_gpu_jobs: 8
+    poll_interval_sec: 2
+
+  budgets:
+    max_build_attempts: 2
+    max_job_attempts: 2
+    pilot_gpu_hours: 2
+    scale_gpu_hours: 32
+    max_llm_tokens_per_idea: 2000000
+    max_wall_clock_hours_per_idea: 72
+    max_no_progress_hours: 12
+
+  gpu:
+    enabled: false
+    pool_config: config.cluster32.yaml
+    reserved_gpus: 0
+    target_utilization: 0.90
+    max_share_per_idea: 0.50
+    pilot_max_gpus: 2
+    scale_max_gpus: 8
+    # This path must be visible with the same absolute name on all GPU nodes.
+    shared_workspace_root: /root/shared/.clusters/.workdir/autoresearch-v2/runs
+
+  models:
+    researchclaw_config: config.rsi.yaml
+    decision_role: research_director
+    worker_role: coding_engineer
+    utility_role: literature_researcher
+
+  literature:
+    enabled: true
+    mode: http
+    url: http://127.0.0.1:8077
+    repo: /root/servers/infohub
+    timeout_sec: 20
+    search_limit: 30
+    collect_days: 3650
+    collect_platforms: [arxiv, scholar, bing]
+    refresh_on_low_results: true
+    min_results: 8

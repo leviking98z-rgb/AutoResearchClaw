@@ -1,0 +1,29 @@
+[Unit]
+Description=AutoResearch v2 continuous controller (%i)
+After=network-online.target srv-bridge.service
+Wants=network-online.target srv-bridge.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/data/workspace/autoresearch-stack/AutoResearchClaw-prod
+Environment=HOME=/root
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/autoresearch-v2/%i.env
+ExecStartPre=/usr/bin/test -f ${AUTORESEARCH_V2_CONFIG}
+ExecStartPre=/data/workspace/autoresearch-stack/AutoResearchClaw-prod/.venv/bin/python -c "import arxiv"
+ExecStart=/data/workspace/autoresearch-stack/AutoResearchClaw-prod/.venv/bin/python -m researchclaw.autoresearch_v2.cli --config ${AUTORESEARCH_V2_CONFIG} start
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=120
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=full
+ReadWritePaths=/root/shared/.clusters /data/workspace/autoresearch-stack/AutoResearchClaw-prod/workspace
+LimitNOFILE=524288
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target
