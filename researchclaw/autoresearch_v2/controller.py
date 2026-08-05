@@ -183,8 +183,10 @@ class V2Controller:
                 # process, so these non-cancellable CLI-backed workers must be
                 # removed from that interpreter-exit join registry.
                 self._pool.detach_workers_for_process_exit()
-                if self.gpu_broker is not None:
-                    self.gpu_broker.close()
+                # Do not synchronously probe or stop a remote pool from a
+                # POSIX-signal path. Any submitted GPU tasks remain durable and
+                # are adopted by startup recovery; the process exiting stops
+                # its daemon heartbeat/keepalive threads.
                 self.store.release_writer_lock()
                 self._initialized = False
             else:
