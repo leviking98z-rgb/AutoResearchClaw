@@ -28,7 +28,9 @@ autoresearch_v2:
 
   budgets:
     max_build_attempts: 2
-    max_job_attempts: 2
+    # Three bounded scientific attempts are enough for one targeted repair
+    # after a typed compiler/schema upgrade without permitting endless churn.
+    max_job_attempts: 3
     pilot_gpu_hours: 2
     scale_gpu_hours: 32
     max_llm_tokens_per_idea: 2000000

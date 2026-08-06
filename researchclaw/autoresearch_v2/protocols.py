@@ -58,6 +58,10 @@ _LEDGER_SCOPES = frozenset(
 _LEDGER_DATASET_ROLES = frozenset(
     {"development", "screening", "none"}
 )
+_CRITERION_OPERATORS = frozenset({"<", "<=", ">", ">=", "=="})
+_THRESHOLD_SCALES = frozenset(
+    {"proportion", "percentage_points", "absolute"}
+)
 
 _PROTOCOL_MARKERS = {
     "calibration_verifier": (
@@ -138,11 +142,16 @@ def compile_screening_protocol(
 
     plan["protocol_template"] = protocol
     plan["study_phase"] = "screening_pilot"
+    screening_access_policy = _compile_screening_access_policy(
+        plan.get("screening_access_policy")
+    )
     plan["datasets"] = _compile_datasets(
         idea,
         plan.get("dataset"),
         plan.get("datasets"),
+        screening_access_policy=screening_access_policy,
     )
+    plan["screening_access_policy"] = screening_access_policy
     plan["models"] = _compile_models(idea, plan.get("models"))
     plan["arms"] = _compile_arms(plan.get("arms"))
     plan["baselines"] = _compile_string_list(
@@ -189,8 +198,49 @@ def compile_screening_protocol(
         "max_new_tokens": max_new_tokens,
         "estimated_model_calls": total_calls,
     }
+    gate_statistic = _compile_gate_statistic(
+        plan.get("gate_statistic"),
+        plan.get("effect_threshold"),
+    )
+    plan["gate_statistic"] = gate_statistic
+    # Compatibility mirror for existing consumers. The executable direction
+    # lives in gate_statistic and the primary promotion criterion.
+    plan["effect_threshold"] = copy.deepcopy(gate_statistic["threshold"])
+    plan["uncertainty"] = _compile_uncertainty(plan.get("uncertainty"))
+    plan["validity_criteria"] = _compile_criteria(
+        plan.get("validity_criteria"),
+        field="validity_criteria",
+        minimum=1,
+        maximum=6,
+    )
+    plan["promotion_criteria"] = _compile_criteria(
+        plan.get("promotion_criteria"),
+        field="promotion_criteria",
+        minimum=1,
+        maximum=6,
+    )
+    _require_primary_gate_criterion(
+        gate_statistic,
+        plan["promotion_criteria"],
+    )
+    plan["decision_contract"] = _compile_decision_contract(
+        validity_criteria=plan["validity_criteria"],
+        promotion_criteria=plan["promotion_criteria"],
+    )
     plan["decision_table"] = _compile_decision_table(
-        plan.get("metric_direction")
+        promotion_criteria=plan["promotion_criteria"],
+    )
+    # Free-form prose is not executable. Keep it synchronized with the typed
+    # criteria instead of asking a reviewer to reconcile two rule systems.
+    plan["promotion_rule"] = (
+        "After every validity criterion passes, promote if and only if every "
+        "preregistered promotion criterion passes; valid evidence that fails "
+        "any promotion criterion is rejected."
+    )
+    plan["early_stop_rule"] = (
+        "Retry only when a preregistered validity criterion fails or required "
+        "runtime evidence is missing or corrupt. Unfavorable, undefined, "
+        "low-variance, or inconclusive scientific results are valid rejects."
     )
     plan["confirmatory_followup"] = _compile_confirmatory_followup(
         plan.get("confirmatory_followup"),
@@ -208,48 +258,53 @@ def compile_screening_protocol(
         "dataset_roles",
         "split_identifiers",
         "call_counts",
+        "evidence_valid",
+        "gate_statistic_defined",
+        "criterion_results",
     ]
     plan["compiler"] = {
         "name": "autoresearch_v2_protocol_compiler",
-        "version": 1,
+        "version": 2,
         "mechanical_fields": [
             "datasets",
+            "screening_access_policy",
             "pilot",
             "call_ledger",
             "sample_accounting",
             "workload_budget",
+            "effect_threshold",
+            "decision_contract",
             "decision_table",
+            "promotion_rule",
+            "early_stop_rule",
             "confirmatory_followup",
         ],
     }
     return plan
 
 
-def _compile_decision_table(metric_direction: Any) -> list[dict[str, Any]]:
-    """Compile exhaustive outcomes with direction-aware gate semantics."""
+def _compile_decision_table(
+    *,
+    promotion_criteria: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compile invalid/promote/valid-reject as an exhaustive partition."""
 
-    if metric_direction == "maximize":
-        promote_region = "at_or_above_effect_threshold"
-        reject_region = "below_effect_threshold"
-    elif metric_direction == "minimize":
-        promote_region = "below_effect_threshold"
-        reject_region = "at_or_above_effect_threshold"
-    else:
-        raise ValueError(
-            "metric_direction must be maximize or minimize before protocol "
-            "compilation"
-        )
     return [
         {
             "condition": {"region": "invalid"},
             "decision": "retry",
         },
         {
-            "condition": {"region": promote_region},
+            "condition": {
+                "region": "meets_all_promotion_criteria",
+                "criteria": [
+                    str(item["id"]) for item in promotion_criteria
+                ],
+            },
             "decision": "promote",
         },
         {
-            "condition": {"region": reject_region},
+            "condition": {"region": "valid_otherwise"},
             "decision": "reject",
         },
     ]
@@ -274,8 +329,6 @@ def validate_protocol_draft(value: Mapping[str, Any]) -> list[str]:
         "hypothesis",
         "primary_metric",
         "unit_of_analysis",
-        "promotion_rule",
-        "early_stop_rule",
         "estimand",
         "sample_size_rationale",
     ):
@@ -285,6 +338,12 @@ def validate_protocol_draft(value: Mapping[str, Any]) -> list[str]:
             errors.append(f"missing {field}")
     if value.get("metric_direction") not in {"maximize", "minimize"}:
         errors.append("metric_direction must be maximize or minimize")
+    try:
+        _compile_screening_access_policy(
+            value.get("screening_access_policy")
+        )
+    except (TypeError, ValueError) as exc:
+        errors.append(str(exc))
     dataset = value.get("dataset")
     datasets = value.get("datasets")
     if not (
@@ -323,27 +382,318 @@ def validate_protocol_draft(value: Mapping[str, Any]) -> list[str]:
             )
         except (TypeError, ValueError) as exc:
             errors.append(str(exc))
-    threshold = value.get("effect_threshold")
-    if not isinstance(threshold, Mapping):
-        errors.append("effect_threshold must be an object")
-    else:
-        raw = threshold.get("value")
+    try:
+        gate_statistic = _compile_gate_statistic(
+            value.get("gate_statistic"),
+            value.get("effect_threshold"),
+        )
+    except (TypeError, ValueError) as exc:
+        errors.append(str(exc))
+        gate_statistic = {}
+    try:
+        _compile_uncertainty(value.get("uncertainty"))
+    except (TypeError, ValueError) as exc:
+        errors.append(str(exc))
+    try:
+        _compile_criteria(
+            value.get("validity_criteria"),
+            field="validity_criteria",
+            minimum=1,
+            maximum=6,
+        )
+    except (TypeError, ValueError) as exc:
+        errors.append(str(exc))
+    try:
+        promotion_criteria = _compile_criteria(
+            value.get("promotion_criteria"),
+            field="promotion_criteria",
+            minimum=1,
+            maximum=6,
+        )
+    except (TypeError, ValueError) as exc:
+        errors.append(str(exc))
+        promotion_criteria = []
+    if gate_statistic and promotion_criteria:
+        try:
+            _require_primary_gate_criterion(
+                gate_statistic,
+                promotion_criteria,
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+    return list(dict.fromkeys(errors))
+
+
+def _compile_screening_access_policy(value: Any) -> dict[str, bool]:
+    if not isinstance(value, Mapping):
+        raise TypeError("screening_access_policy must be an object")
+    required = (
+        "input_access",
+        "within_episode_feedback",
+        "cross_example_adaptation",
+        "hidden_labels_for_tuning",
+        "threshold_tuning",
+    )
+    policy: dict[str, bool] = {}
+    for field in required:
+        raw = value.get(field)
+        if not isinstance(raw, bool):
+            raise TypeError(
+                f"screening_access_policy.{field} must be boolean"
+            )
+        policy[field] = raw
+    if not policy["input_access"]:
+        raise ValueError(
+            "screening_access_policy.input_access must be true"
+        )
+    if policy["hidden_labels_for_tuning"]:
+        raise ValueError(
+            "screening_access_policy.hidden_labels_for_tuning must be false"
+        )
+    if policy["threshold_tuning"]:
+        raise ValueError(
+            "screening_access_policy.threshold_tuning must be false"
+        )
+    return policy
+
+
+def _compile_gate_statistic(
+    value: Any,
+    legacy_threshold: Any,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("gate_statistic must be an object")
+    name = _slug(str(value.get("name", "") or ""))
+    if not name:
+        raise ValueError(
+            "gate_statistic.name must be a non-empty machine identifier"
+        )
+    definition = str(value.get("definition", "") or "").strip()
+    if not definition:
+        raise ValueError("gate_statistic.definition must be non-empty")
+    direction = value.get("direction")
+    if direction not in {"maximize", "minimize"}:
+        raise ValueError(
+            "gate_statistic.direction must be maximize or minimize"
+        )
+    threshold_value: Any = value.get("threshold")
+    if not isinstance(threshold_value, Mapping):
+        # Keep repairs local when an in-flight response still carries the old
+        # effect_threshold object.
+        threshold_value = legacy_threshold
+    if not isinstance(threshold_value, Mapping):
+        raise TypeError("gate_statistic.threshold must be an object")
+    raw = threshold_value.get("value")
+    if (
+        isinstance(raw, bool)
+        or not isinstance(raw, (int, float))
+        or not float("-inf") < float(raw) < float("inf")
+        or float(raw) <= 0
+    ):
+        raise ValueError(
+            "gate_statistic.threshold.value must be finite and positive"
+        )
+    scale = threshold_value.get("scale")
+    if scale not in _THRESHOLD_SCALES:
+        raise ValueError(
+            "gate_statistic.threshold.scale must be proportion, "
+            "percentage_points, or absolute"
+        )
+    if scale == "proportion" and float(raw) > 1:
+        raise ValueError(
+            "gate_statistic.threshold.value proportion must be <= 1"
+        )
+    if scale == "percentage_points" and float(raw) > 100:
+        raise ValueError(
+            "gate_statistic.threshold.value percentage_points must be <= 100"
+        )
+    undefined_policy = _slug(
+        str(value.get("undefined_policy", "reject") or "")
+    )
+    if undefined_policy != "reject":
+        raise ValueError(
+            "gate_statistic.undefined_policy must be reject"
+        )
+    return {
+        "name": name,
+        "definition": definition,
+        "direction": direction,
+        "threshold": {
+            "value": float(raw),
+            "scale": scale,
+        },
+        "undefined_policy": "reject",
+    }
+
+
+def _compile_uncertainty(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("uncertainty must be an object")
+    method = _slug(str(value.get("method", "") or ""))
+    if not method:
+        raise ValueError("uncertainty.method must be non-empty")
+    cluster_unit = str(value.get("cluster_unit", "") or "").strip()
+    if not cluster_unit:
+        raise ValueError("uncertainty.cluster_unit must be non-empty")
+    confidence_level = value.get("confidence_level")
+    if (
+        isinstance(confidence_level, bool)
+        or not isinstance(confidence_level, (int, float))
+        or not 0.5 < float(confidence_level) < 1.0
+    ):
+        raise ValueError(
+            "uncertainty.confidence_level must be between 0.5 and 1"
+        )
+    resamples = value.get("resamples", 0)
+    if (
+        isinstance(resamples, bool)
+        or not isinstance(resamples, int)
+        or resamples < 0
+    ):
+        raise ValueError(
+            "uncertainty.resamples must be a non-negative integer"
+        )
+    if "bootstrap" in method and resamples < 200:
+        raise ValueError(
+            "bootstrap uncertainty requires at least 200 resamples"
+        )
+    return {
+        "method": method,
+        "cluster_unit": cluster_unit,
+        "confidence_level": float(confidence_level),
+        "resamples": resamples,
+    }
+
+
+def _compile_criteria(
+    value: Any,
+    *,
+    field: str,
+    minimum: int,
+    maximum: int,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise TypeError(f"{field} must be a list")
+    if not minimum <= len(value) <= maximum:
+        raise ValueError(
+            f"{field} must contain between {minimum} and {maximum} entries"
+        )
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            raise TypeError(f"{field}[{index}] must be an object")
+        criterion_id = _slug(str(item.get("id", "") or ""))
+        if not criterion_id:
+            raise ValueError(f"{field}[{index}].id must be non-empty")
+        if criterion_id in seen:
+            raise ValueError(f"duplicate {field} id: {criterion_id}")
+        seen.add(criterion_id)
+        metric = _slug(str(item.get("metric", "") or ""))
+        if not metric:
+            raise ValueError(f"{field}[{index}].metric must be non-empty")
+        operator = str(item.get("operator", "") or "").strip()
+        if operator not in _CRITERION_OPERATORS:
+            raise ValueError(
+                f"{field}[{index}].operator must be one of "
+                + ", ".join(sorted(_CRITERION_OPERATORS))
+            )
+        raw = item.get("value")
         if (
             isinstance(raw, bool)
             or not isinstance(raw, (int, float))
-            or float(raw) <= 0
+            or not float("-inf") < float(raw) < float("inf")
         ):
-            errors.append("effect_threshold.value must be positive")
-        if threshold.get("scale") not in {
-            "proportion",
-            "percentage_points",
-            "absolute",
-        }:
-            errors.append(
-                "effect_threshold.scale must be proportion, "
+            raise ValueError(f"{field}[{index}].value must be finite")
+        scale = item.get("scale", "absolute")
+        if scale not in _THRESHOLD_SCALES:
+            raise ValueError(
+                f"{field}[{index}].scale must be proportion, "
                 "percentage_points, or absolute"
             )
-    return list(dict.fromkeys(errors))
+        description = str(item.get("description", "") or "").strip()
+        if not description:
+            raise ValueError(
+                f"{field}[{index}].description must be non-empty"
+            )
+        result.append(
+            {
+                "id": criterion_id,
+                "metric": metric,
+                "operator": operator,
+                "value": float(raw),
+                "scale": scale,
+                "description": description,
+            }
+        )
+    return result
+
+
+def _require_primary_gate_criterion(
+    gate_statistic: Mapping[str, Any],
+    criteria: list[dict[str, Any]],
+) -> None:
+    name = str(gate_statistic["name"])
+    threshold = gate_statistic["threshold"]
+    matches = [
+        item for item in criteria if str(item.get("metric")) == name
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "promotion_criteria must contain exactly one primary criterion "
+            f"for gate_statistic.name={name}"
+        )
+    primary = matches[0]
+    expected_operators = (
+        {">", ">="}
+        if gate_statistic["direction"] == "maximize"
+        else {"<", "<="}
+    )
+    if primary["operator"] not in expected_operators:
+        raise ValueError(
+            "primary promotion criterion operator conflicts with "
+            f"gate_statistic.direction={gate_statistic['direction']}"
+        )
+    if (
+        not _numbers_equal(primary["value"], threshold["value"])
+        or primary["scale"] != threshold["scale"]
+    ):
+        raise ValueError(
+            "primary promotion criterion must use the exact "
+            "gate_statistic.threshold value and scale"
+        )
+
+
+def _compile_decision_contract(
+    *,
+    validity_criteria: list[dict[str, Any]],
+    promotion_criteria: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "invalid": {
+            "decision": "retry",
+            "criteria": [str(item["id"]) for item in validity_criteria],
+            "when": (
+                "any validity criterion fails or required evidence is missing"
+            ),
+        },
+        "meets_all_promotion_criteria": {
+            "decision": "promote",
+            "criteria": [str(item["id"]) for item in promotion_criteria],
+            "when": "all validity and all promotion criteria pass",
+        },
+        "valid_otherwise": {
+            "decision": "reject",
+            "when": "valid evidence fails any promotion criterion",
+        },
+    }
+
+
+def _numbers_equal(left: Any, right: Any) -> bool:
+    try:
+        return abs(float(left) - float(right)) <= 1e-12
+    except (TypeError, ValueError):
+        return False
 
 
 def _canonical_protocol(value: Any) -> str:
@@ -355,6 +705,8 @@ def _compile_datasets(
     idea: IdeaRecord,
     dataset: Any,
     existing: Any,
+    *,
+    screening_access_policy: Mapping[str, bool],
 ) -> list[dict[str, Any]]:
     names: list[str] = []
     if isinstance(dataset, str) and dataset.strip():
@@ -383,12 +735,27 @@ def _compile_datasets(
             "split_role": "development",
             "split_id": f"{slug}-development-v1",
             "used_for_adaptation": True,
+            "access_policy": {
+                "input_access": True,
+                "within_episode_feedback": True,
+                "cross_example_adaptation": True,
+                "hidden_labels_for_tuning": True,
+                "threshold_tuning": True,
+                "available_before_scale": True,
+            },
         },
         {
             "name": f"{base} screening partition",
             "split_role": "screening",
             "split_id": f"{slug}-screening-v1",
-            "used_for_adaptation": False,
+            "used_for_adaptation": bool(
+                screening_access_policy["within_episode_feedback"]
+                or screening_access_policy["cross_example_adaptation"]
+            ),
+            "access_policy": {
+                **dict(screening_access_policy),
+                "available_before_scale": True,
+            },
         },
         {
             "name": f"{base} confirmatory partition",
@@ -396,6 +763,14 @@ def _compile_datasets(
             "split_id": f"{slug}-confirmatory-v1",
             "used_for_adaptation": False,
             "untouched": True,
+            "access_policy": {
+                "input_access": True,
+                "within_episode_feedback": False,
+                "cross_example_adaptation": False,
+                "hidden_labels_for_tuning": False,
+                "threshold_tuning": False,
+                "available_before_scale": False,
+            },
         },
     ]
 

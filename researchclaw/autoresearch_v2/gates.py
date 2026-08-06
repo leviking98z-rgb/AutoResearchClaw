@@ -142,9 +142,15 @@ effect. Instead require:
 - a precise unit of analysis and paired/comparable outcomes;
 - 2-3 primary arms with an independent no-self-improvement control;
 - exact, internally consistent sample/call arithmetic;
-- a threshold no finer than finite-sample metric resolution;
-- disjoint promotion, retry/invalidity, and rejection/futility regions;
-- no adaptation, calibration, selection, or memory writing on heldout data;
+- a raw endpoint direction kept distinct from the signed gate statistic;
+- a threshold no finer than finite-sample metric resolution and a typed
+  conjunction of every promotion criterion;
+- invalid -> retry, all promotion criteria -> promote, every other valid
+  outcome (including undefined/CI-crossing/flat/futility) -> reject;
+- explicit screening access policy separating within-episode feedback from
+  cross-example adaptation and label/threshold tuning;
+- confirmatory inputs first opened at Scale, while their labels/assertions are
+  never used for tuning, calibration, selection, memory, or thresholds;
 - an explicit confirmatory follow-up with more examples/seeds at Scale;
 - claims explicitly limited to screening feasibility or a coarse signal.
 
@@ -197,7 +203,13 @@ RUNTIME EVIDENCE:
 {json.dumps(dict(runtime_evidence), ensure_ascii=False, indent=2)[:16000]}
 
 Use only measured evidence. Reject leakage, missing controls, synthetic or
-unverifiable outcomes. Preserve a valid informative null as complete_negative.
+unverifiable outcomes. First audit runtime_evidence.evidence_valid,
+gate_statistic_defined, criterion_results, and gate_decision against the
+compiled decision_contract. Do not reinterpret raw metric_direction as the
+promotion direction. Protocol-invalid evidence may retry; every valid outcome
+that fails any promotion criterion, including an undefined gate statistic,
+must reject or complete_negative rather than retry. Preserve a valid
+informative null as complete_negative.
 
 Return:
 {{

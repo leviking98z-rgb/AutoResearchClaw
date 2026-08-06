@@ -195,6 +195,46 @@ def _typed_draft():
     } | {
         "protocol_template": "calibration_verifier",
         "dataset": "GSM8K",
+        "screening_access_policy": {
+            "input_access": True,
+            "within_episode_feedback": False,
+            "cross_example_adaptation": False,
+            "hidden_labels_for_tuning": False,
+            "threshold_tuning": False,
+        },
+        "gate_statistic": {
+            "name": "paired_accuracy_difference",
+            "definition": "mean paired treatment-minus-control accuracy",
+            "direction": "maximize",
+            "threshold": {"value": 0.15, "scale": "proportion"},
+            "undefined_policy": "reject",
+        },
+        "uncertainty": {
+            "method": "paired_bootstrap",
+            "cluster_unit": "example",
+            "confidence_level": 0.90,
+            "resamples": 2000,
+        },
+        "validity_criteria": [
+            {
+                "id": "completed_examples",
+                "metric": "completed_examples",
+                "operator": ">=",
+                "value": 30,
+                "scale": "absolute",
+                "description": "at least 30 paired examples complete",
+            }
+        ],
+        "promotion_criteria": [
+            {
+                "id": "primary_effect",
+                "metric": "paired_accuracy_difference",
+                "operator": ">=",
+                "value": 0.15,
+                "scale": "proportion",
+                "description": "coarse paired effect",
+            }
+        ],
         "call_ledger": {
             "components": [
                 {
@@ -243,7 +283,7 @@ def test_design_retry_edits_previous_plan_and_review(tmp_path: Path) -> None:
         number=2,
         status=AttemptStatus.RUNNING,
     )
-    role = _Role(_plan())
+    role = _Role(_typed_draft())
 
     outcome = DesignJobExecutor(role, decision_gate=_Gate()).execute(
         idea=idea,
@@ -292,7 +332,7 @@ def test_design_executor_compiles_typed_draft_before_decision_gate(
 
     assert outcome.success
     assert gate.plan is not None
-    assert gate.plan["compiler"]["version"] == 1
+    assert gate.plan["compiler"]["version"] == 2
     assert gate.plan["sample_accounting"]["total_model_calls"] == 64
     assert validate_plan(gate.plan) == []
     assert (
@@ -309,24 +349,27 @@ def test_first_design_attempt_has_no_revision_directive() -> None:
     assert '"protocol_template": "calibration_verifier"' in prompt
     assert '"confirmatory_followup": {' in prompt
     assert '"call_ledger": {' in prompt
+    assert '"gate_statistic": {' in prompt
+    assert '"screening_access_policy": {' in prompt
     assert "Controller creates disjoint" in prompt
     assert "Mechanical fields that the Controller owns" in prompt
 
 
 def test_design_structured_retry_repairs_prior_json_locally() -> None:
-    invalid = _plan()
-    invalid["effect_threshold"] = {
+    invalid = _typed_draft()
+    invalid["gate_statistic"]["threshold"] = {
         "value": 0.15,
         "scale": "proportion_points",
     }
-    client = _RetryClient([invalid, _plan()])
+    client = _RetryClient([invalid, _typed_draft()])
     role = StructuredRole(
         client=client,
         system="return json",
         validator=lambda value: (
             []
-            if value["effect_threshold"]["scale"] == "proportion"
-            else ["invalid effect_threshold.scale"]
+            if value["gate_statistic"]["threshold"]["scale"]
+            == "proportion"
+            else ["invalid gate_statistic.threshold.scale"]
         ),
     )
 
@@ -343,6 +386,7 @@ def test_design_structured_retry_repairs_prior_json_locally() -> None:
     assert "do not redesign the study" in client.requests[1]
     assert "per_arm_example_seed" in client.requests[1]
     assert "Controller derives those fields" in client.requests[1]
+    assert "valid but unfavorable" in client.requests[1]
 
 
 def test_build_smoke_can_defer_to_controller_managed_gpu_environment(

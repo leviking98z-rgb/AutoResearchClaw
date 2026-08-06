@@ -431,6 +431,285 @@ def test_decision_table_must_respect_metric_direction() -> None:
     assert validate_plan(plan) == []
 
 
+def test_typed_decision_contract_uses_gate_not_raw_metric_direction() -> None:
+    from researchclaw.autoresearch_v2.ideas import candidate_to_idea
+    from researchclaw.autoresearch_v2.protocols import (
+        compile_screening_protocol,
+    )
+
+    idea = candidate_to_idea(
+        {
+            "id": "gate-direction",
+            "title": "Regret reduction gate",
+            "family": "calibration",
+            "research_question": "Does the gate reduce regret?",
+            "falsifiable_hypothesis": "Relative regret falls by 20%.",
+            "closest_prior_work": ["Prior"],
+            "novelty_gap": "Gap",
+            "datasets": ["MBPP"],
+            "models": ["Qwen"],
+            "compute": {"gpu_count": 1, "wall_clock_hours": 1},
+            "primary_metric": "regret",
+            "baselines": ["no-self-improvement"],
+            "ablations": ["remove gate"],
+            "failure_safety_tests": ["heldout isolation"],
+            "implementation_feasibility": "public",
+            "licensing_feasibility": "public",
+            "information_gain_if_true": "useful",
+            "information_gain_if_false": "useful",
+            "cheap_pilot": "32 tasks",
+            "scores": {
+                "novelty": 8,
+                "scientific_importance": 8,
+                "falsifiability": 8,
+                "compute_tractability": 8,
+                "reproducibility": 8,
+                "meaningful_result_likelihood": 8,
+                "risk": 2,
+            },
+        }
+    )
+    draft = {
+        "protocol_template": "calibration_verifier",
+        "pilot_objective": "screen the gate",
+        "pilot_claim_scope": "coarse signal only",
+        "research_question": "Does the gate reduce regret?",
+        "hypothesis": "Relative regret reduction is at least 20%.",
+        "primary_metric": "mean regret",
+        "metric_direction": "minimize",
+        "unit_of_analysis": "paired task",
+        "dataset": "MBPP",
+        "screening_access_policy": {
+            "input_access": True,
+            "within_episode_feedback": False,
+            "cross_example_adaptation": False,
+            "hidden_labels_for_tuning": False,
+            "threshold_tuning": False,
+        },
+        "models": [{"name": "Qwen", "role": "subject"}],
+        "baselines": ["no-self-improvement"],
+        "ablations": ["remove gate"],
+        "arms": [
+            {"name": "calibrated gate", "role": "treatment"},
+            {"name": "no-self-improvement", "role": "control"},
+        ],
+        "pilot": {
+            "max_gpus": 1,
+            "development_examples": 16,
+            "max_examples": 32,
+            "max_seeds": 1,
+            "timeout_sec": 7200,
+        },
+        "call_ledger": {
+            "components": [
+                {
+                    "name": "final_evaluation",
+                    "scope": "per_arm_example_seed",
+                    "dataset_role": "screening",
+                    "calls_per_unit": 1,
+                }
+            ]
+        },
+        "gate_statistic": {
+            "name": "relative_regret_reduction",
+            "definition": "(control regret - treatment regret) / control regret",
+            "direction": "maximize",
+            "threshold": {"value": 0.20, "scale": "proportion"},
+            "undefined_policy": "reject",
+        },
+        "uncertainty": {
+            "method": "paired_cluster_bootstrap",
+            "cluster_unit": "task",
+            "confidence_level": 0.90,
+            "resamples": 2000,
+        },
+        "validity_criteria": [
+            {
+                "id": "completed_tasks",
+                "metric": "completed_tasks",
+                "operator": ">=",
+                "value": 30,
+                "scale": "absolute",
+                "description": "operational completeness",
+            }
+        ],
+        "promotion_criteria": [
+            {
+                "id": "relative_reduction",
+                "metric": "relative_regret_reduction",
+                "operator": ">=",
+                "value": 0.20,
+                "scale": "proportion",
+                "description": "primary effect",
+            }
+        ],
+        "estimand": "paired relative regret reduction",
+        "sample_size_rationale": "screening resolution",
+        "workload_budget": {"max_new_tokens": 64},
+        "confirmatory_followup": {"claim": "Scale confirms the effect."},
+    }
+
+    plan = compile_screening_protocol(idea, draft)
+
+    assert plan["metric_direction"] == "minimize"
+    assert plan["gate_statistic"]["direction"] == "maximize"
+    assert validate_plan(plan) == []
+    plan["promotion_criteria"][0]["operator"] = "<="
+    errors = validate_plan(plan)
+    assert any("operator conflicts" in error for error in errors)
+
+
+def test_typed_runtime_valid_undefined_gate_must_reject_not_retry() -> None:
+    from researchclaw.autoresearch_v2.ideas import candidate_to_idea
+    from researchclaw.autoresearch_v2.protocols import (
+        compile_screening_protocol,
+    )
+
+    # Reuse the fully typed fixture from the compiler tests without coupling
+    # test modules through an import.
+    candidate = {
+        "id": "runtime-contract",
+        "title": "Runtime contract",
+        "family": "verifier",
+        "research_question": "Does it help?",
+        "falsifiable_hypothesis": "It helps.",
+        "closest_prior_work": ["Prior"],
+        "novelty_gap": "Gap",
+        "datasets": ["HumanEval"],
+        "models": ["Qwen"],
+        "compute": {"gpu_count": 1, "wall_clock_hours": 1},
+        "primary_metric": "paired difference",
+        "baselines": ["no-self-improvement"],
+        "ablations": ["remove mechanism"],
+        "failure_safety_tests": ["heldout isolation"],
+        "implementation_feasibility": "public",
+        "licensing_feasibility": "public",
+        "information_gain_if_true": "useful",
+        "information_gain_if_false": "useful",
+        "cheap_pilot": "32 tasks",
+        "scores": {
+            "novelty": 8,
+            "scientific_importance": 8,
+            "falsifiability": 8,
+            "compute_tractability": 8,
+            "reproducibility": 8,
+            "meaningful_result_likelihood": 8,
+            "risk": 2,
+        },
+    }
+    idea = candidate_to_idea(candidate)
+    draft = {
+        "protocol_template": "calibration_verifier",
+        "pilot_objective": "screen",
+        "pilot_claim_scope": "coarse",
+        "research_question": "Does it help?",
+        "hypothesis": "It helps.",
+        "primary_metric": "paired difference",
+        "metric_direction": "maximize",
+        "unit_of_analysis": "paired task",
+        "dataset": "HumanEval",
+        "screening_access_policy": {
+            "input_access": True,
+            "within_episode_feedback": False,
+            "cross_example_adaptation": False,
+            "hidden_labels_for_tuning": False,
+            "threshold_tuning": False,
+        },
+        "models": [{"name": "Qwen", "role": "subject"}],
+        "baselines": ["no-self-improvement"],
+        "ablations": ["remove mechanism"],
+        "arms": [
+            {"name": "treatment", "role": "treatment"},
+            {"name": "no-self-improvement", "role": "control"},
+        ],
+        "pilot": {
+            "max_gpus": 1,
+            "development_examples": 16,
+            "max_examples": 32,
+            "max_seeds": 1,
+            "timeout_sec": 7200,
+        },
+        "call_ledger": {
+            "components": [
+                {
+                    "name": "final_evaluation",
+                    "scope": "per_arm_example_seed",
+                    "dataset_role": "screening",
+                    "calls_per_unit": 1,
+                }
+            ]
+        },
+        "gate_statistic": {
+            "name": "paired_difference",
+            "definition": "treatment minus control",
+            "direction": "maximize",
+            "threshold": {"value": 0.15, "scale": "proportion"},
+            "undefined_policy": "reject",
+        },
+        "uncertainty": {
+            "method": "paired_bootstrap",
+            "cluster_unit": "task",
+            "confidence_level": 0.90,
+            "resamples": 2000,
+        },
+        "validity_criteria": [
+            {
+                "id": "completed_tasks",
+                "metric": "completed_tasks",
+                "operator": ">=",
+                "value": 30,
+                "scale": "absolute",
+                "description": "operational completeness",
+            }
+        ],
+        "promotion_criteria": [
+            {
+                "id": "primary_effect",
+                "metric": "paired_difference",
+                "operator": ">=",
+                "value": 0.15,
+                "scale": "proportion",
+                "description": "primary effect",
+            }
+        ],
+        "estimand": "paired mean difference",
+        "sample_size_rationale": "screening resolution",
+        "workload_budget": {"max_new_tokens": 64},
+        "confirmatory_followup": {"claim": "Scale confirms the effect."},
+    }
+    plan = compile_screening_protocol(idea, draft)
+    runtime = {
+        "gpu_count": 1,
+        "examples_processed": 32,
+        "examples_by_role": {"development": 0, "screening": 32},
+        "seeds": [0],
+        "call_counts": {"final_evaluation": 64},
+        "evidence_valid": True,
+        "gate_statistic_defined": False,
+        "criterion_results": {
+            "completed_tasks": {"value": 32, "passed": True},
+            "primary_effect": {"value": 0.0, "passed": False},
+        },
+        "gate_decision": "reject",
+        "metrics": {"paired_difference": 0.0},
+    }
+
+    assert validate_runtime_against_contract(
+        plan=plan,
+        runtime_evidence=runtime,
+        allocated_gpus=1,
+        mode="pilot",
+    ) == []
+    runtime["gate_decision"] = "retry"
+    errors = validate_runtime_against_contract(
+        plan=plan,
+        runtime_evidence=runtime,
+        allocated_gpus=1,
+        mode="pilot",
+    )
+    assert any("expected 'reject'" in error for error in errors)
+
+
 def test_heldout_dataset_must_not_participate_in_adaptation() -> None:
     plan = _screening_plan()
     plan["adaptation"] = {

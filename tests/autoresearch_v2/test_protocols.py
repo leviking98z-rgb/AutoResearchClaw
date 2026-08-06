@@ -59,6 +59,13 @@ def _draft():
         "metric_direction": "maximize",
         "unit_of_analysis": "paired task",
         "dataset": "HumanEval",
+        "screening_access_policy": {
+            "input_access": True,
+            "within_episode_feedback": False,
+            "cross_example_adaptation": False,
+            "hidden_labels_for_tuning": False,
+            "threshold_tuning": False,
+        },
         "models": [
             {"name": "Qwen2.5-Coder-1.5B-Instruct", "role": "subject"}
         ],
@@ -91,9 +98,49 @@ def _draft():
                 },
             ]
         },
-        "effect_threshold": {"value": 0.15, "scale": "proportion"},
-        "promotion_rule": "promote on a coarse paired signal",
-        "early_stop_rule": "retry invalid evidence; reject valid futility",
+        "gate_statistic": {
+            "name": "paired_pass_rate_difference",
+            "definition": (
+                "mean paired treatment-minus-control pass-rate difference"
+            ),
+            "direction": "maximize",
+            "threshold": {"value": 0.15, "scale": "proportion"},
+            "undefined_policy": "reject",
+        },
+        "uncertainty": {
+            "method": "paired_bootstrap",
+            "cluster_unit": "task",
+            "confidence_level": 0.90,
+            "resamples": 2000,
+        },
+        "validity_criteria": [
+            {
+                "id": "completed_tasks",
+                "metric": "completed_tasks",
+                "operator": ">=",
+                "value": 30,
+                "scale": "absolute",
+                "description": "at least 30 paired tasks completed",
+            }
+        ],
+        "promotion_criteria": [
+            {
+                "id": "primary_effect",
+                "metric": "paired_pass_rate_difference",
+                "operator": ">=",
+                "value": 0.15,
+                "scale": "proportion",
+                "description": "coarse paired improvement threshold",
+            },
+            {
+                "id": "positive_ci",
+                "metric": "paired_effect_ci_lower",
+                "operator": ">",
+                "value": 0.0,
+                "scale": "absolute",
+                "description": "uncertainty excludes no improvement",
+            },
+        ],
         "estimand": "paired mean treatment-control difference",
         "sample_size_rationale": "screening resolution only",
         "workload_budget": {"max_new_tokens": 256},
@@ -119,9 +166,18 @@ def test_compiler_owns_arithmetic_splits_and_decision_regions() -> None:
         row["condition"]["region"] for row in plan["decision_table"]
     ] == [
         "invalid",
-        "at_or_above_effect_threshold",
-        "below_effect_threshold",
+        "meets_all_promotion_criteria",
+        "valid_otherwise",
     ]
+    assert plan["compiler"]["version"] == 2
+    assert plan["decision_contract"]["valid_otherwise"]["decision"] == "reject"
+    assert (
+        plan["datasets"][1]["access_policy"]
+        == {
+            **_draft()["screening_access_policy"],
+            "available_before_scale": True,
+        }
+    )
     assert len({item["split_id"] for item in plan["datasets"]}) == 3
     assert (
         plan["confirmatory_followup"]["split_id"]
@@ -130,33 +186,28 @@ def test_compiler_owns_arithmetic_splits_and_decision_regions() -> None:
     assert validate_plan(plan) == []
 
 
-@pytest.mark.parametrize(
-    ("metric_direction", "expected"),
-    [
-        (
-            "maximize",
-            {
-                "invalid": "retry",
-                "below_effect_threshold": "reject",
-                "at_or_above_effect_threshold": "promote",
-            },
-        ),
-        (
-            "minimize",
-            {
-                "invalid": "retry",
-                "below_effect_threshold": "promote",
-                "at_or_above_effect_threshold": "reject",
-            },
-        ),
-    ],
-)
-def test_compiler_decision_table_respects_metric_direction(
-    metric_direction: str,
-    expected: dict[str, str],
-) -> None:
+def test_compiler_gate_direction_is_independent_of_raw_metric_direction() -> None:
     draft = _draft()
-    draft["metric_direction"] = metric_direction
+    draft["metric_direction"] = "minimize"
+    draft["primary_metric"] = "selection regret"
+    draft["gate_statistic"] = {
+        "name": "relative_regret_reduction",
+        "definition": (
+            "(control mean regret - treatment mean regret) / "
+            "control mean regret"
+        ),
+        "direction": "maximize",
+        "threshold": {"value": 0.20, "scale": "proportion"},
+        "undefined_policy": "reject",
+    }
+    draft["promotion_criteria"][0] = {
+        "id": "primary_effect",
+        "metric": "relative_regret_reduction",
+        "operator": ">=",
+        "value": 0.20,
+        "scale": "proportion",
+        "description": "relative regret reduction reaches 20%",
+    }
 
     plan = compile_screening_protocol(_idea(), draft)
 
@@ -164,7 +215,38 @@ def test_compiler_decision_table_respects_metric_direction(
         row["condition"]["region"]: row["decision"]
         for row in plan["decision_table"]
     }
-    assert actual == expected
+    assert actual == {
+        "invalid": "retry",
+        "meets_all_promotion_criteria": "promote",
+        "valid_otherwise": "reject",
+    }
+    assert plan["metric_direction"] == "minimize"
+    assert plan["gate_statistic"]["direction"] == "maximize"
+    assert validate_plan(plan) == []
+
+
+def test_compiler_rejects_primary_criterion_that_inverts_gate_direction() -> None:
+    draft = _draft()
+    draft["promotion_criteria"][0]["operator"] = "<="
+
+    with pytest.raises(ValueError, match="operator conflicts"):
+        compile_screening_protocol(_idea(), draft)
+
+
+def test_compiler_encodes_within_episode_feedback_without_label_tuning() -> None:
+    draft = _draft()
+    draft["screening_access_policy"]["within_episode_feedback"] = True
+
+    plan = compile_screening_protocol(_idea(), draft)
+    screening = plan["datasets"][1]
+    confirmatory = plan["datasets"][2]
+
+    assert screening["used_for_adaptation"] is True
+    assert screening["access_policy"]["within_episode_feedback"] is True
+    assert screening["access_policy"]["cross_example_adaptation"] is False
+    assert screening["access_policy"]["hidden_labels_for_tuning"] is False
+    assert confirmatory["access_policy"]["input_access"] is True
+    assert confirmatory["access_policy"]["available_before_scale"] is False
     assert validate_plan(plan) == []
 
 
@@ -281,6 +363,17 @@ def test_runtime_call_ledger_is_enforced() -> None:
             "candidate_generation": 32,
             "verifier_scoring": 129,
         },
+        "evidence_valid": True,
+        "gate_statistic_defined": True,
+        "criterion_results": {
+            "completed_tasks": {"value": 32, "passed": True},
+            "primary_effect": {"value": 0.20, "passed": True},
+            "positive_ci": {"value": 0.01, "passed": True},
+        },
+        "gate_decision": "promote",
+        "metrics": {
+            "paired_pass_rate_difference": 0.20,
+        },
     }
     errors = validate_runtime_against_contract(
         plan=plan,
@@ -332,6 +425,17 @@ def test_runtime_call_counts_aggregate_repeated_component_names() -> None:
         },
         "seeds": [0],
         "call_counts": {"adaptation": 18},
+        "evidence_valid": True,
+        "gate_statistic_defined": True,
+        "criterion_results": {
+            "completed_tasks": {"value": 32, "passed": True},
+            "primary_effect": {"value": 0.20, "passed": True},
+            "positive_ci": {"value": 0.01, "passed": True},
+        },
+        "gate_decision": "promote",
+        "metrics": {
+            "paired_pass_rate_difference": 0.20,
+        },
     }
 
     assert validate_runtime_against_contract(

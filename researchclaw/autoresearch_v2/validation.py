@@ -203,6 +203,13 @@ _OUTCOME_REGIONS = frozenset(
         "at_or_above_effect_threshold",
     }
 )
+_CONTRACT_OUTCOME_REGIONS = frozenset(
+    {
+        "invalid",
+        "meets_all_promotion_criteria",
+        "valid_otherwise",
+    }
+)
 _REGION_ALIASES = {
     "invalid": "invalid",
     "invalid_evidence": "invalid",
@@ -221,6 +228,12 @@ _REGION_ALIASES = {
     "meets_threshold": "at_or_above_effect_threshold",
     "threshold_met": "at_or_above_effect_threshold",
     "above_threshold": "at_or_above_effect_threshold",
+    "meets_all_promotion_criteria": "meets_all_promotion_criteria",
+    "all_promotion_criteria_met": "meets_all_promotion_criteria",
+    "all_criteria_met": "meets_all_promotion_criteria",
+    "valid_otherwise": "valid_otherwise",
+    "valid_but_not_promoted": "valid_otherwise",
+    "valid_reject": "valid_otherwise",
 }
 
 
@@ -311,6 +324,7 @@ def validate_plan(value: dict[str, Any]) -> list[str]:
         errors,
         structured=phase_aware,
         metric_direction=value.get("metric_direction"),
+        decision_contract=value.get("decision_contract"),
     )
     return _deduplicate(errors)
 
@@ -328,6 +342,26 @@ def _validate_protocol_compiler_contract(
                 "protocol_template must be one of: "
                 + ", ".join(sorted(SUPPORTED_PROTOCOLS))
             )
+    compiler = value.get("compiler")
+    compiler_version = 0
+    if isinstance(compiler, Mapping):
+        try:
+            compiler_version = int(compiler.get("version", 0) or 0)
+        except (TypeError, ValueError):
+            errors.append("compiler.version must be an integer")
+    typed_decisions = compiler_version >= 2 or any(
+        field in value
+        for field in (
+            "gate_statistic",
+            "decision_contract",
+            "screening_access_policy",
+            "validity_criteria",
+            "promotion_criteria",
+        )
+    )
+    if typed_decisions:
+        _validate_typed_decision_contract(value, errors)
+        _validate_dataset_access_policies(value, errors)
     ledger = value.get("call_ledger")
     if ledger is None:
         return
@@ -420,6 +454,252 @@ def _validate_protocol_compiler_contract(
             f"{accounting.get('total_model_calls')} does not equal "
             f"call_ledger total={compiled_total}"
         )
+
+
+def _validate_typed_decision_contract(
+    value: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    gate = value.get("gate_statistic")
+    gate_name = ""
+    gate_direction = ""
+    gate_threshold: Mapping[str, Any] = {}
+    if not isinstance(gate, Mapping):
+        errors.append("gate_statistic must be an object")
+    else:
+        gate_name = _slug(str(gate.get("name", "") or ""))
+        if not gate_name:
+            errors.append("gate_statistic.name must be non-empty")
+        if not str(gate.get("definition", "") or "").strip():
+            errors.append("gate_statistic.definition must be non-empty")
+        gate_direction = str(gate.get("direction", "") or "")
+        if gate_direction not in {"maximize", "minimize"}:
+            errors.append(
+                "gate_statistic.direction must be maximize or minimize"
+            )
+        if gate.get("undefined_policy") != "reject":
+            errors.append("gate_statistic.undefined_policy must be reject")
+        threshold = gate.get("threshold")
+        if not isinstance(threshold, Mapping):
+            errors.append("gate_statistic.threshold must be an object")
+        else:
+            gate_threshold = threshold
+            _validate_threshold_shape(
+                threshold,
+                "gate_statistic.threshold",
+                errors,
+            )
+
+    uncertainty = value.get("uncertainty")
+    if not isinstance(uncertainty, Mapping):
+        errors.append("uncertainty must be an object")
+    else:
+        method = _slug(str(uncertainty.get("method", "") or ""))
+        if not method:
+            errors.append("uncertainty.method must be non-empty")
+        if not str(uncertainty.get("cluster_unit", "") or "").strip():
+            errors.append("uncertainty.cluster_unit must be non-empty")
+        confidence = uncertainty.get("confidence_level")
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not 0.5 < float(confidence) < 1
+        ):
+            errors.append(
+                "uncertainty.confidence_level must be between 0.5 and 1"
+            )
+        resamples = uncertainty.get("resamples")
+        if (
+            isinstance(resamples, bool)
+            or not isinstance(resamples, int)
+            or resamples < 0
+        ):
+            errors.append(
+                "uncertainty.resamples must be a non-negative integer"
+            )
+        elif "bootstrap" in method and resamples < 200:
+            errors.append(
+                "bootstrap uncertainty requires at least 200 resamples"
+            )
+
+    validity = _validate_typed_criteria(
+        value.get("validity_criteria"),
+        "validity_criteria",
+        errors,
+    )
+    promotion = _validate_typed_criteria(
+        value.get("promotion_criteria"),
+        "promotion_criteria",
+        errors,
+    )
+    if gate_name and gate_threshold and promotion:
+        matching = [
+            criterion
+            for criterion in promotion
+            if criterion.get("metric") == gate_name
+        ]
+        if len(matching) != 1:
+            errors.append(
+                "promotion_criteria must contain exactly one primary "
+                f"criterion for gate_statistic.name={gate_name}"
+            )
+        else:
+            primary = matching[0]
+            allowed = (
+                {">", ">="}
+                if gate_direction == "maximize"
+                else {"<", "<="}
+                if gate_direction == "minimize"
+                else set()
+            )
+            if primary.get("operator") not in allowed:
+                errors.append(
+                    "primary promotion criterion operator conflicts with "
+                    f"gate_statistic.direction={gate_direction}"
+                )
+            if (
+                not _numeric_equal(
+                    primary.get("value"),
+                    gate_threshold.get("value"),
+                )
+                or primary.get("scale") != gate_threshold.get("scale")
+            ):
+                errors.append(
+                    "primary promotion criterion must use the exact "
+                    "gate_statistic.threshold value and scale"
+                )
+
+    contract = value.get("decision_contract")
+    expected = {
+        "invalid": "retry",
+        "meets_all_promotion_criteria": "promote",
+        "valid_otherwise": "reject",
+    }
+    if not isinstance(contract, Mapping):
+        errors.append("decision_contract must be an object")
+    else:
+        for region, decision in expected.items():
+            row = contract.get(region)
+            if not isinstance(row, Mapping):
+                errors.append(f"decision_contract.{region} must be an object")
+                continue
+            if row.get("decision") != decision:
+                errors.append(
+                    f"decision_contract.{region}.decision must be {decision}"
+                )
+        invalid = contract.get("invalid")
+        if isinstance(invalid, Mapping):
+            declared = invalid.get("criteria")
+            expected_ids = [str(item.get("id")) for item in validity]
+            if declared != expected_ids:
+                errors.append(
+                    "decision_contract.invalid.criteria must exactly match "
+                    "validity_criteria ids"
+                )
+        promoted = contract.get("meets_all_promotion_criteria")
+        if isinstance(promoted, Mapping):
+            declared = promoted.get("criteria")
+            expected_ids = [str(item.get("id")) for item in promotion]
+            if declared != expected_ids:
+                errors.append(
+                    "decision_contract.meets_all_promotion_criteria.criteria "
+                    "must exactly match promotion_criteria ids"
+                )
+
+
+def _validate_typed_criteria(
+    value: Any,
+    field: str,
+    errors: list[str],
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        errors.append(f"{field} must be a non-empty list")
+        return []
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, criterion in enumerate(value):
+        if not isinstance(criterion, Mapping):
+            errors.append(f"{field}[{index}] must be an object")
+            continue
+        criterion_id = _slug(str(criterion.get("id", "") or ""))
+        metric = _slug(str(criterion.get("metric", "") or ""))
+        operator = str(criterion.get("operator", "") or "").strip()
+        scale = criterion.get("scale")
+        raw = criterion.get("value")
+        if not criterion_id:
+            errors.append(f"{field}[{index}].id must be non-empty")
+        elif criterion_id in seen:
+            errors.append(f"duplicate {field} id: {criterion_id}")
+        else:
+            seen.add(criterion_id)
+        if not metric:
+            errors.append(f"{field}[{index}].metric must be non-empty")
+        if operator not in {"<", "<=", ">", ">=", "=="}:
+            errors.append(
+                f"{field}[{index}].operator must be a supported comparator"
+            )
+        if (
+            isinstance(raw, bool)
+            or not isinstance(raw, (int, float))
+            or not math.isfinite(float(raw))
+        ):
+            errors.append(f"{field}[{index}].value must be finite")
+        if scale not in {"proportion", "percentage_points", "absolute"}:
+            errors.append(
+                f"{field}[{index}].scale must be proportion, "
+                "percentage_points, or absolute"
+            )
+        if not str(criterion.get("description", "") or "").strip():
+            errors.append(f"{field}[{index}].description must be non-empty")
+        result.append(
+            {
+                "id": criterion_id,
+                "metric": metric,
+                "operator": operator,
+                "value": raw,
+                "scale": scale,
+            }
+        )
+    return result
+
+
+def _validate_threshold_shape(
+    threshold: Mapping[str, Any],
+    path: str,
+    errors: list[str],
+) -> None:
+    raw = threshold.get("value")
+    if (
+        isinstance(raw, bool)
+        or not isinstance(raw, (int, float))
+        or not math.isfinite(float(raw))
+        or float(raw) <= 0
+    ):
+        errors.append(f"{path}.value must be finite and positive")
+    scale = threshold.get("scale")
+    if scale not in {"proportion", "percentage_points", "absolute"}:
+        errors.append(
+            f"{path}.scale must be proportion, percentage_points, or absolute"
+        )
+    elif isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        if scale == "proportion" and float(raw) > 1:
+            errors.append(f"{path}.value proportion must be <= 1")
+        if scale == "percentage_points" and float(raw) > 100:
+            errors.append(
+                f"{path}.value percentage_points must be <= 100"
+            )
+
+
+def _numeric_equal(left: Any, right: Any) -> bool:
+    try:
+        return math.isclose(
+            float(left),
+            float(right),
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _positive_number(
@@ -1016,6 +1296,106 @@ def _validate_dataset_isolation(
             )
 
 
+def _validate_dataset_access_policies(
+    value: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    top_level = value.get("screening_access_policy")
+    expected_fields = (
+        "input_access",
+        "within_episode_feedback",
+        "cross_example_adaptation",
+        "hidden_labels_for_tuning",
+        "threshold_tuning",
+    )
+    if not isinstance(top_level, Mapping):
+        errors.append("screening_access_policy must be an object")
+        top_level = {}
+    for field in expected_fields:
+        if not isinstance(top_level.get(field), bool):
+            errors.append(
+                f"screening_access_policy.{field} must be boolean"
+            )
+    if top_level.get("input_access") is not True:
+        errors.append("screening_access_policy.input_access must be true")
+    for field in ("hidden_labels_for_tuning", "threshold_tuning"):
+        if top_level.get(field) is not False:
+            errors.append(
+                f"screening_access_policy.{field} must be false"
+            )
+
+    datasets = value.get("datasets")
+    if not isinstance(datasets, list):
+        return
+    roles_seen: set[str] = set()
+    for index, dataset in enumerate(datasets):
+        if not isinstance(dataset, Mapping):
+            continue
+        role = _dataset_role(dataset.get("split_role"))
+        if role is None:
+            continue
+        roles_seen.add(role)
+        policy = dataset.get("access_policy")
+        if not isinstance(policy, Mapping):
+            errors.append(f"datasets[{index}].access_policy must be an object")
+            continue
+        for field in (*expected_fields, "available_before_scale"):
+            if not isinstance(policy.get(field), bool):
+                errors.append(
+                    f"datasets[{index}].access_policy.{field} must be boolean"
+                )
+        if role == "screening":
+            expected = {
+                **dict(top_level),
+                "available_before_scale": True,
+            }
+            for field, expected_value in expected.items():
+                if policy.get(field) is not expected_value:
+                    errors.append(
+                        f"datasets[{index}].access_policy.{field} must match "
+                        "screening_access_policy"
+                    )
+            adaptive = bool(
+                top_level.get("within_episode_feedback")
+                or top_level.get("cross_example_adaptation")
+            )
+            if dataset.get("used_for_adaptation") is not adaptive:
+                errors.append(
+                    f"datasets[{index}].used_for_adaptation must be {adaptive} "
+                    "for the declared screening access policy"
+                )
+        if role == "confirmatory":
+            expected_confirmatory = {
+                "input_access": True,
+                "within_episode_feedback": False,
+                "cross_example_adaptation": False,
+                "hidden_labels_for_tuning": False,
+                "threshold_tuning": False,
+                "available_before_scale": False,
+            }
+            for field, expected_value in expected_confirmatory.items():
+                if policy.get(field) is not expected_value:
+                    errors.append(
+                        f"datasets[{index}].access_policy.{field} must be "
+                        f"{expected_value} for confirmatory data"
+                    )
+            if dataset.get("untouched") is not True:
+                errors.append(
+                    f"datasets[{index}].untouched must be true for "
+                    "confirmatory data"
+                )
+            if dataset.get("used_for_adaptation") is not False:
+                errors.append(
+                    f"datasets[{index}].used_for_adaptation must be false "
+                    "for confirmatory data"
+                )
+    for required_role in ("development", "screening", "confirmatory"):
+        if required_role not in roles_seen:
+            errors.append(
+                f"compiled protocol is missing {required_role} dataset role"
+            )
+
+
 def _plan_split_ids(
     plan: Mapping[str, Any],
     *,
@@ -1351,6 +1731,7 @@ def _validate_decision_table(
     *,
     structured: bool,
     metric_direction: Any = None,
+    decision_contract: Any = None,
 ) -> None:
     if not isinstance(table, list) or not table:
         errors.append("decision_table must cover every outcome region")
@@ -1369,7 +1750,7 @@ def _validate_decision_table(
             direct = {
                 key: child
                 for key, child in row.items()
-                if key not in {"decision", "reason"}
+                if key not in {"decision", "reason", "criteria"}
             }
             condition = direct or None
         if condition is None or (
@@ -1404,12 +1785,69 @@ def _validate_decision_table(
             decisions.append((index, parsed_condition, decision))
 
     if structured:
-        _validate_structured_outcomes(conditions, errors)
-        _validate_directional_decisions(
-            decisions,
-            metric_direction=metric_direction,
-            errors=errors,
+        if isinstance(decision_contract, Mapping):
+            _validate_contract_outcomes(conditions, errors)
+            _validate_contract_decisions(decisions, errors)
+        else:
+            _validate_structured_outcomes(conditions, errors)
+            _validate_directional_decisions(
+                decisions,
+                metric_direction=metric_direction,
+                errors=errors,
+            )
+
+
+def _validate_contract_outcomes(
+    conditions: list[tuple[int, Mapping[str, Any]]],
+    errors: list[str],
+) -> None:
+    regions: dict[str, int] = {}
+    for index, condition in conditions:
+        region, region_error = _outcome_region(condition)
+        if region_error:
+            errors.append(
+                f"invalid decision_table[{index}].condition: {region_error}"
+            )
+            continue
+        if region not in _CONTRACT_OUTCOME_REGIONS:
+            errors.append(
+                f"invalid decision_table[{index}].condition: expected one of "
+                + ", ".join(sorted(_CONTRACT_OUTCOME_REGIONS))
+            )
+            continue
+        if region in regions:
+            errors.append(
+                f"duplicate decision_table outcome region {region!r} at "
+                f"indexes {regions[region]} and {index}"
+            )
+        else:
+            regions[region] = index
+    missing = sorted(_CONTRACT_OUTCOME_REGIONS - set(regions))
+    if missing:
+        errors.append(
+            "decision_table missing outcome regions: " + ", ".join(missing)
         )
+
+
+def _validate_contract_decisions(
+    decisions: list[tuple[int, Mapping[str, Any], str]],
+    errors: list[str],
+) -> None:
+    expected = {
+        "invalid": "retry",
+        "meets_all_promotion_criteria": "promote",
+        "valid_otherwise": "reject",
+    }
+    for index, condition, decision in decisions:
+        region, region_error = _outcome_region(condition)
+        if region_error or region not in expected:
+            continue
+        if decision != expected[region]:
+            errors.append(
+                f"decision_table[{index}].decision={decision!r} conflicts "
+                f"with decision_contract region {region!r}: must use "
+                f"{expected[region]!r}"
+            )
 
 
 def _validate_directional_decisions(
@@ -2087,6 +2525,36 @@ def validate_runtime_evidence_file(path: Path) -> dict[str, Any]:
                         "to non-negative integers"
                     )
                     break
+    if "evidence_valid" in value and not isinstance(
+        value["evidence_valid"],
+        bool,
+    ):
+        errors.append("evidence_valid must be boolean")
+    if "gate_statistic_defined" in value and not isinstance(
+        value["gate_statistic_defined"],
+        bool,
+    ):
+        errors.append("gate_statistic_defined must be boolean")
+    if "criterion_results" in value:
+        criterion_results = value["criterion_results"]
+        if not isinstance(criterion_results, Mapping) or not criterion_results:
+            errors.append("criterion_results must be a non-empty object")
+        else:
+            for criterion_id, result in criterion_results.items():
+                if (
+                    not isinstance(criterion_id, str)
+                    or not criterion_id.strip()
+                    or not isinstance(result, Mapping)
+                    or not isinstance(result.get("passed"), bool)
+                    or isinstance(result.get("value"), bool)
+                    or not isinstance(result.get("value"), (int, float))
+                    or not math.isfinite(float(result.get("value")))
+                ):
+                    errors.append(
+                        "criterion_results must map criterion ids to "
+                        "{value: finite number, passed: boolean}"
+                    )
+                    break
     if not isinstance(value.get("metrics"), dict) or not value.get("metrics"):
         errors.append("runtime evidence metrics must be a non-empty object")
     else:
@@ -2229,6 +2697,12 @@ def validate_runtime_against_contract(
                             f"examples_by_role[{role}]={actual} exceeds "
                             f"pilot {maximum_field}={maximum}"
                         )
+    if mode in {"pilot", "scale"}:
+        _validate_runtime_decision_contract(
+            plan=plan,
+            runtime_evidence=runtime_evidence,
+            errors=errors,
+        )
     if mode == "scale" and pilot_runtime:
         try:
             scale_examples = int(
@@ -2271,6 +2745,154 @@ def validate_runtime_against_contract(
                 errors=errors,
             )
     return errors
+
+
+def _validate_runtime_decision_contract(
+    *,
+    plan: Mapping[str, Any],
+    runtime_evidence: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    contract = plan.get("decision_contract")
+    if not isinstance(contract, Mapping):
+        return
+    evidence_valid = runtime_evidence.get("evidence_valid")
+    if not isinstance(evidence_valid, bool):
+        errors.append(
+            "runtime_evidence.evidence_valid is required by decision_contract"
+        )
+        return
+    gate_defined = runtime_evidence.get("gate_statistic_defined")
+    if not isinstance(gate_defined, bool):
+        errors.append(
+            "runtime_evidence.gate_statistic_defined is required by "
+            "decision_contract"
+        )
+    results = runtime_evidence.get("criterion_results")
+    if not isinstance(results, Mapping):
+        errors.append(
+            "runtime_evidence.criterion_results is required by "
+            "decision_contract"
+        )
+        return
+    expected: dict[str, Mapping[str, Any]] = {}
+    for field in ("validity_criteria", "promotion_criteria"):
+        criteria = plan.get(field)
+        if not isinstance(criteria, list):
+            continue
+        for criterion in criteria:
+            if isinstance(criterion, Mapping):
+                criterion_id = str(criterion.get("id", "") or "")
+                if criterion_id:
+                    expected[criterion_id] = criterion
+    missing = sorted(set(expected) - {str(key) for key in results})
+    if missing:
+        errors.append(
+            "runtime_evidence.criterion_results missing criteria: "
+            + ", ".join(missing)
+        )
+    parsed: dict[str, bool] = {}
+    for criterion_id, criterion in expected.items():
+        result = results.get(criterion_id)
+        if not isinstance(result, Mapping):
+            continue
+        passed = result.get("passed")
+        measured = result.get("value")
+        if not isinstance(passed, bool):
+            errors.append(
+                f"criterion_results[{criterion_id}].passed must be boolean"
+            )
+            continue
+        if (
+            isinstance(measured, bool)
+            or not isinstance(measured, (int, float))
+            or not math.isfinite(float(measured))
+        ):
+            errors.append(
+                f"criterion_results[{criterion_id}].value must be finite"
+            )
+            continue
+        recomputed = _criterion_passes(criterion, float(measured))
+        if recomputed is not passed:
+            errors.append(
+                f"criterion_results[{criterion_id}].passed disagrees with "
+                "the preregistered operator/value"
+            )
+        parsed[criterion_id] = passed
+    validity_ids = [
+        str(item.get("id"))
+        for item in plan.get("validity_criteria", [])
+        if isinstance(item, Mapping)
+    ]
+    promotion_ids = [
+        str(item.get("id"))
+        for item in plan.get("promotion_criteria", [])
+        if isinstance(item, Mapping)
+    ]
+    validity_pass = all(parsed.get(item) is True for item in validity_ids)
+    promotion_pass = all(
+        parsed.get(item) is True for item in promotion_ids
+    )
+    if evidence_valid is not validity_pass:
+        errors.append(
+            "runtime_evidence.evidence_valid disagrees with validity_criteria"
+        )
+    decision = str(runtime_evidence.get("gate_decision", "") or "").casefold()
+    if not evidence_valid:
+        expected_decision = "retry"
+    elif gate_defined is False:
+        expected_decision = "reject"
+    elif promotion_pass:
+        expected_decision = "promote"
+    else:
+        expected_decision = "reject"
+    normalized = {
+        "continue": "promote",
+        "stop": "reject",
+    }.get(decision, decision)
+    if normalized != expected_decision:
+        errors.append(
+            f"runtime gate_decision={decision!r} conflicts with compiled "
+            f"decision_contract; expected {expected_decision!r}"
+        )
+    gate = plan.get("gate_statistic")
+    if isinstance(gate, Mapping):
+        gate_name = str(gate.get("name", "") or "")
+        metrics = runtime_evidence.get("metrics")
+        if (
+            gate_defined is True
+            and gate_name
+            and (
+                not isinstance(metrics, Mapping)
+                or gate_name not in metrics
+            )
+        ):
+            errors.append(
+                "runtime metrics missing defined gate statistic "
+                f"{gate_name!r}"
+            )
+
+
+def _criterion_passes(
+    criterion: Mapping[str, Any],
+    measured: float,
+) -> bool:
+    threshold = float(criterion.get("value"))
+    operator = criterion.get("operator")
+    if operator == "<":
+        return measured < threshold
+    if operator == "<=":
+        return measured <= threshold
+    if operator == ">":
+        return measured > threshold
+    if operator == ">=":
+        return measured >= threshold
+    return math.isclose(
+        measured,
+        threshold,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    )
 
 
 def _validate_runtime_call_ledger(

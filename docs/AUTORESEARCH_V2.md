@@ -152,6 +152,46 @@ only returns bounded JSON verdicts for:
 
 The Decision tier is never given a code-editing interface.
 
+Design uses a typed protocol compiler rather than reconciling several
+free-form rules after generation. The raw scientific endpoint and the
+promotion statistic are separate:
+
+```json
+{
+  "primary_metric": "selection regret",
+  "metric_direction": "minimize",
+  "gate_statistic": {
+    "name": "relative_regret_reduction",
+    "direction": "maximize",
+    "threshold": {"value": 0.2, "scale": "proportion"},
+    "undefined_policy": "reject"
+  }
+}
+```
+
+The model supplies a small typed conjunction of operational
+`validity_criteria` and scientific `promotion_criteria`. The Controller
+compiles exactly three exhaustive outcomes:
+
+```text
+invalid evidence                         -> retry
+valid + every promotion criterion passes -> promote
+valid otherwise                          -> reject
+```
+
+Thus an undefined denominator, flat outcome, low event rate, or confidence
+interval crossing a boundary cannot be retried until favorable; it is a valid
+futility/rejection result unless an independently preregistered operational
+validity criterion failed.
+
+Dataset access is also typed. `input_access`, `within_episode_feedback`,
+`cross_example_adaptation`, `hidden_labels_for_tuning`, and
+`threshold_tuning` are independent controls. This permits an online-memory
+experiment to consume its own prior within-episode outcome without incorrectly
+claiming that the entire screening split is non-adaptive. Confirmatory inputs
+may be presented exactly once at Scale, but their labels/assertions remain
+unavailable for tuning, selection, calibration, memory, or threshold changes.
+
 ## Dashboard
 
 ```bash

@@ -275,6 +275,13 @@ Return exactly:
   "metric_direction": "maximize|minimize",
   "unit_of_analysis": "one paired example, task, modification, or stream",
   "dataset": "one public benchmark; Controller creates disjoint dev/screening/confirmatory split IDs",
+  "screening_access_policy": {{
+    "input_access": true,
+    "within_episode_feedback": false,
+    "cross_example_adaptation": false,
+    "hidden_labels_for_tuning": false,
+    "threshold_tuning": false
+  }},
   "models": [{{"name": "...", "role": "subject|verifier"}}],
   "baselines": ["include no-self-improvement"],
   "ablations": ["..."],
@@ -303,11 +310,47 @@ Return exactly:
       }}
     ]
   }},
-  "effect_threshold": {{
-    "value": 0.15, "scale": "proportion"
+  "gate_statistic": {{
+    "name": "machine_identifier_for_the_promotion_statistic",
+    "definition": "exact formula, sign, denominator and aggregation",
+    "direction": "maximize|minimize",
+    "threshold": {{"value": 0.15, "scale": "proportion"}},
+    "undefined_policy": "reject"
   }},
-  "promotion_rule": "coarse screening threshold with paired uncertainty",
-  "early_stop_rule": "disjoint futility or protocol-invalidity threshold",
+  "uncertainty": {{
+    "method": "paired_cluster_bootstrap|paired_bootstrap|exact_binomial|none",
+    "cluster_unit": "the independent resampling unit",
+    "confidence_level": 0.90,
+    "resamples": 2000
+  }},
+  "validity_criteria": [
+    {{
+      "id": "minimum_completed_examples",
+      "metric": "completed_examples",
+      "operator": ">=",
+      "value": 28,
+      "scale": "absolute",
+      "description": "operational validity only, never a favorable outcome"
+    }}
+  ],
+  "promotion_criteria": [
+    {{
+      "id": "primary_effect",
+      "metric": "same identifier as gate_statistic.name",
+      "operator": ">=",
+      "value": 0.15,
+      "scale": "proportion",
+      "description": "primary coarse screening effect"
+    }},
+    {{
+      "id": "uncertainty_support",
+      "metric": "primary_effect_ci_lower",
+      "operator": ">",
+      "value": 0.0,
+      "scale": "absolute",
+      "description": "paired uncertainty excludes no effect"
+    }}
+  ],
   "estimand": "exact unit, treatment contrast and aggregation",
   "sample_size_rationale": "screening precision/resolution, not confirmatory power",
   "workload_budget": {{"max_new_tokens": 512}},
@@ -318,18 +361,41 @@ Return exactly:
 
 Scientific responsibilities that remain yours:
 - choose the protocol template, intervention, 2-3 arms, estimand, metric,
-  threshold, pilot claim, and exact per-unit model-call components;
+  gate statistic, threshold, uncertainty, typed validity/promotion criteria,
+  pilot claim, screening access policy, and exact model-call components;
 - include an independent no-self-improvement/reference control;
 - distinguish adaptation calls from final evaluation calls;
-- never use heldout outcomes for selection, calibration, prompts, memory,
-  inheritance, stopping thresholds, or any other adaptation.
+- distinguish the raw endpoint direction from gate_statistic.direction. For
+  example, raw regret may be minimized while relative regret reduction is
+  maximized; promotion follows the gate statistic, never the raw endpoint;
+- declare within-episode feedback separately from cross-example adaptation.
+  Screening inputs may be visible and an online protocol may consume its own
+  prior outcome inside the same episode, while hidden labels, thresholds, and
+  cross-example state remain frozen unless explicitly declared;
+- never use confirmatory labels/assertions for tuning, selection, calibration,
+  prompts, memory, inheritance, or stopping thresholds before Scale. Scale may
+  present confirmatory inputs for generation and score them exactly once.
 
 Mechanical fields that the Controller owns and will overwrite:
 - dataset roles and stable split identifiers;
 - sample_accounting and workload arithmetic;
-- exhaustive retry/promote/reject decision regions;
+- exhaustive invalid / meets-all-promotion / valid-otherwise regions;
+- decision_contract plus synchronized promotion/early-stop prose;
 - Scale examples/seeds and untouched confirmatory split;
 - required runtime evidence.
+
+Decision semantics are strict:
+- invalid operational evidence -> retry;
+- valid evidence satisfying every promotion criterion -> promote;
+- every other valid result, including a CI crossing the boundary, zero or
+  undefined denominator, low event count, flat outcome, or unfavorable
+  secondary gate -> reject. Never label scientific inconclusiveness invalid.
+
+Each validity/promotion criterion must contain exactly:
+id, metric, operator, value, scale, description. Use only <, <=, >, >=, ==.
+The primary promotion criterion must reference gate_statistic.name exactly,
+use its exact threshold value/scale, and use an operator consistent with the
+gate statistic direction. Keep total criteria small and conjunctive.
 
 Allowed call_ledger component names are:
 adaptation, candidate_generation, verifier_scoring, calibration,
@@ -366,6 +432,22 @@ This is a typed scientific draft, not the compiled plan. Do not add or edit
 sample_accounting, workload totals, split IDs, decision_table, or required
 runtime evidence; the Controller derives those fields.
 
+For decision fields:
+- primary_metric + metric_direction describe the raw endpoint;
+- gate_statistic independently defines the signed promotion statistic;
+- gate_statistic.undefined_policy must be reject;
+- validity_criteria contain only operational/protocol validity checks;
+- promotion_criteria contain every scientific go/no-go gate as a conjunction;
+- exactly one promotion criterion must reference gate_statistic.name, use its
+  exact threshold value/scale, and point in gate_statistic.direction;
+- valid but unfavorable, undefined, low-event, flat, or CI-crossing outcomes
+  must reject rather than retry.
+
+For screening_access_policy, provide all five booleans. input_access must be
+true; hidden_labels_for_tuning and threshold_tuning must be false. Use
+within_episode_feedback for feedback inside one episode and
+cross_example_adaptation only for state carried between independent examples.
+
 For call_ledger:
 - allowed names are adaptation, candidate_generation, verifier_scoring,
   calibration, memory_writing, shadow_continuation, baseline_reference,
@@ -378,8 +460,10 @@ For call_ledger:
 - scopes containing "example" require dataset_role development or screening;
 - every calls_per_unit must be a positive integer.
 
-For effect_threshold.scale use exactly proportion, percentage_points, or
-absolute. Do not weaken the scientific threshold merely to pass validation.
+For gate_statistic.threshold.scale and every criterion scale use exactly
+proportion, percentage_points, or absolute. Bootstrap methods require at least
+200 resamples. Do not weaken the scientific threshold merely to pass
+validation.
 
 PRIOR JSON TO REPAIR:
 {json.dumps(dict(previous_value), ensure_ascii=False, indent=2)[:24000]}
@@ -526,7 +610,20 @@ Requirements:
 - Every returned file is complete, never a patch or prefix.
 - The runtime must write metrics.json with result_valid and metrics.
 - The runtime must write runtime_evidence.json with exact model, datasets,
-  examples, seeds, GPU count and any accept/reject/rollback decision.
+  examples, seeds, GPU count, call counts, dataset/split declarations,
+  evidence_valid, criterion_results, and the compiled gate decision.
+- Implement the compiled decision_contract mechanically. Every
+  validity_criteria and promotion_criteria id must appear in
+  runtime_evidence.json criterion_results with its measured value and pass
+  boolean. Retry only on invalid evidence; any valid result that does not
+  satisfy every promotion criterion must reject.
+- The metric named by gate_statistic.name must be emitted in both metrics
+  artifacts. Do not derive promotion direction from primary_metric or
+  metric_direction.
+- Enforce each dataset access_policy: within-episode feedback and cross-example
+  adaptation are distinct; confirmatory inputs are first opened at Scale and
+  confirmatory labels/assertions never tune prompts, thresholds, memory, or
+  selection.
 - Respect plan budgets. Never synthesize scientific outcomes.
 - Every commands value must be either a direct argv list or a shell-free
   Python command such as "python main.py --mode pilot --output ...".
