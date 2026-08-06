@@ -7,9 +7,17 @@ from pathlib import Path
 from researchclaw.autoresearch_v2.config import V2Config
 from researchclaw.autoresearch_v2.controller import V2Controller
 from researchclaw.autoresearch_v2.gpu import AdaptiveGPUScheduler, GPUBroker
-from researchclaw.autoresearch_v2.ideas import StaticIdeaGenerator
+from researchclaw.autoresearch_v2.ideas import (
+    StaticIdeaGenerator,
+    candidate_to_idea,
+)
 from researchclaw.autoresearch_v2.jobs import SimulatedJobExecutor
-from researchclaw.autoresearch_v2.models import IdeaStatus, JobKind
+from researchclaw.autoresearch_v2.models import (
+    IdeaStatus,
+    JobKind,
+    JobRecord,
+    JobStatus,
+)
 from researchclaw.autoresearch_v2.store import V2Store
 
 
@@ -95,6 +103,82 @@ class _Pool:
 
     def cancel_task(self, task_id: str):
         return {"returncode": 130, "elapsed_sec": 1.0}
+
+
+class _NoopGenerator:
+    def generate(self, *, count, existing):
+        del count, existing
+        return []
+
+
+def test_gpu_job_remains_ready_when_configured_pool_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path / "state"),
+                "population": {
+                    "reservoir_low_watermark": 1,
+                    "reservoir_target": 1,
+                    "generation_batch_size": 1,
+                    "active_idea_target": 1,
+                    "max_active_ideas": 1,
+                    "max_same_family": 1,
+                },
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": str(tmp_path / "pool.yaml"),
+                    "shared_workspace_root": str(tmp_path),
+                },
+            }
+        }
+    )
+    store = V2Store(config.root)
+    controller = V2Controller(
+        config=config,
+        store=store,
+        generator=_NoopGenerator(),
+        gpu_broker=None,
+        configured_gpu_capacity=8,
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    idea = candidate_to_idea(_candidate(0))
+    idea.status = IdeaStatus.PILOTING
+    idea.current_job_id = f"{idea.idea_id}-pilot"
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id=idea.current_job_id,
+        idea_id=idea.idea_id,
+        kind=JobKind.PILOT,
+        status=JobStatus.READY,
+        requires_gpu=True,
+        min_gpus=1,
+        preferred_gpus=2,
+        max_gpus=2,
+    )
+    store.save_job(job)
+
+    controller._dispatch()
+
+    durable = store.get_job(job.job_id)
+    assert durable is not None
+    assert durable.status is JobStatus.READY
+    assert store.list_attempts(job_id=job.job_id) == []
+    snapshot = controller.snapshot()
+    assert snapshot["gpu"] == {
+        "total_gpus": 8,
+        "allocated_gpus": 0,
+        "available_gpus": 0,
+        "utilization": 0.0,
+        "target_utilization": config.gpu.target_utilization,
+        "pending_jobs": 1,
+        "leases": [],
+        "state": "unavailable",
+    }
+    controller.close()
 
 
 def test_controller_runs_build_smoke_on_gpu_pool_before_pilot(

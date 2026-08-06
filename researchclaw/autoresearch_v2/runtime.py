@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from researchclaw.experiment.clusterbridge_pool import ClusterPoolError
+
 from .config import V2Config
 from .controller import V2Controller
 from .gates import LLMDecisionGate
-from .gpu import build_clusterbridge_broker
+from .gpu import build_clusterbridge_broker, clusterbridge_capacity
 from .ideas import IdeaGenerator, LLMBoardIdeaGenerator
 from .jobs import (
     BuildJobExecutor,
@@ -98,20 +100,31 @@ def build_production_controller(
         ),
         decision_gate=decision_gate,
     )
-    broker = (
-        build_clusterbridge_broker(
-            config.gpu.pool_config,
-            reserved_gpus=config.gpu.reserved_gpus,
-            max_share_per_idea=config.gpu.max_share_per_idea,
-            target_utilization=config.gpu.target_utilization,
-            probe_failure_threshold=(
-                config.gpu.probe_failure_threshold
-            ),
-        )
+    configured_gpu_capacity = (
+        clusterbridge_capacity(config.gpu.pool_config)
         if config.gpu.enabled
-        else None
+        else 0
     )
-    return V2Controller(
+    broker = None
+    gpu_broker_error = ""
+    if config.gpu.enabled:
+        try:
+            broker = build_clusterbridge_broker(
+                config.gpu.pool_config,
+                reserved_gpus=config.gpu.reserved_gpus,
+                max_share_per_idea=config.gpu.max_share_per_idea,
+                target_utilization=config.gpu.target_utilization,
+                probe_failure_threshold=(
+                    config.gpu.probe_failure_threshold
+                ),
+            )
+        except ClusterPoolError as exc:
+            # Idea generation, Design, and Build do not require a live physical
+            # allocation. Keep the Controller useful while the GPU pool is
+            # released; GPU jobs remain READY until a restart can adopt a
+            # freshly claimed/prepared pool.
+            gpu_broker_error = f"{type(exc).__name__}: {exc}"
+    controller = V2Controller(
         config=config,
         store=store,
         generator=idea_generator,
@@ -127,4 +140,13 @@ def build_production_controller(
             JobKind.REPORT: report,
         },
         gpu_broker=broker,
+        configured_gpu_capacity=configured_gpu_capacity,
     )
+    if gpu_broker_error:
+        controller.store.initialize()
+        controller.store.event(
+            "gpu_broker_unavailable",
+            error=gpu_broker_error,
+            configured_gpu_capacity=configured_gpu_capacity,
+        )
+    return controller

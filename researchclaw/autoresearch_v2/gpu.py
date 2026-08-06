@@ -550,7 +550,11 @@ def build_clusterbridge_broker(
 ) -> GPUBroker:
     """Adopt a prepared ClusterBridge/Ray pool without owning its lifecycle."""
 
-    from researchclaw.experiment.clusterbridge_pool import ClusterBridgePool
+    from researchclaw.experiment.clusterbridge_pool import (
+        ClusterBridgePool,
+        PoolNotClaimedError,
+        PoolNotReadyError,
+    )
     from researchclaw.factory.pool_config import PoolConfigSummary
 
     summary = PoolConfigSummary.from_file(pool_config)
@@ -558,8 +562,13 @@ def build_clusterbridge_broker(
         summary.config_path,
         restore_state=restore_state,
     )
-    if not pool.claimed or not pool.prepared:
-        raise RuntimeError(
+    if not pool.claimed:
+        raise PoolNotClaimedError(
+            "v2 requires an already claimed and prepared shared GPU pool; "
+            "it will not claim, prepare, or release physical nodes"
+        )
+    if not pool.prepared:
+        raise PoolNotReadyError(
             "v2 requires an already claimed and prepared shared GPU pool; "
             "it will not claim, prepare, or release physical nodes"
         )
@@ -601,3 +610,11 @@ def build_clusterbridge_broker(
         probe_failure_threshold=probe_failure_threshold,
         lease_registry=lease_registry,
     )
+
+
+def clusterbridge_capacity(pool_config: str) -> int:
+    """Read configured GPU capacity without adopting or probing a live pool."""
+
+    from researchclaw.factory.pool_config import PoolConfigSummary
+
+    return PoolConfigSummary.from_file(pool_config).expected_total_gpus

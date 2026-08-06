@@ -88,6 +88,7 @@ class V2Controller:
         generator: IdeaGenerator,
         executors: Mapping[JobKind, JobExecutor] | None = None,
         gpu_broker: GPUBroker | None = None,
+        configured_gpu_capacity: int = 0,
         sleep: Any = time.sleep,
     ) -> None:
         self.config = config
@@ -103,6 +104,10 @@ class V2Controller:
             else _MissingExecutor()
         )
         self.gpu_broker = gpu_broker
+        self.configured_gpu_capacity = max(
+            0,
+            int(configured_gpu_capacity),
+        )
         self.admission = IdeaAdmission(
             duplicate_threshold=config.admission.duplicate_threshold,
             max_same_family=config.population.max_same_family,
@@ -1826,13 +1831,18 @@ class V2Controller:
             self.gpu_broker.snapshot(pending_jobs=pending_gpu)
             if self.gpu_broker is not None
             else {
-                "total_gpus": 0,
+                "total_gpus": self.configured_gpu_capacity,
                 "allocated_gpus": 0,
                 "available_gpus": 0,
                 "utilization": 0.0,
                 "target_utilization": self.config.gpu.target_utilization,
                 "pending_jobs": pending_gpu,
                 "leases": [],
+                "state": (
+                    "unavailable"
+                    if self.config.gpu.enabled
+                    else "disabled"
+                ),
             }
         )
         return {
