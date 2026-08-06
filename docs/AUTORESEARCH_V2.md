@@ -152,6 +152,14 @@ only returns bounded JSON verdicts for:
 
 The Decision tier is never given a code-editing interface.
 
+Design uses one immutable Job attempt with a bounded Worker/Decision repair
+loop. A Decision `retry` is fed directly back to the Worker with the current
+compiled plan and exact required changes; the Worker may revise the typed
+scientific fields up to `budgets.max_design_revisions` times. A hard scientific
+`reject` exits immediately. This avoids spending several full Job attempts
+rediscovering the same protocol defects while preserving every revision in the
+attempt audit record.
+
 Design uses a typed protocol compiler rather than reconciling several
 free-form rules after generation. The raw scientific endpoint and the
 promotion statistic are separate:

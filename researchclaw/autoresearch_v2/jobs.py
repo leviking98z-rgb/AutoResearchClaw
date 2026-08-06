@@ -76,9 +76,11 @@ class DesignJobExecutor:
         role: StructuredRole,
         *,
         decision_gate: DecisionGate | None = None,
+        max_revisions: int = 1,
     ) -> None:
         self.role = role
         self.decision_gate = decision_gate
+        self.max_revisions = max(0, int(max_revisions))
 
     def execute(
         self,
@@ -116,73 +118,122 @@ class DesignJobExecutor:
             attempt=attempt,
             store=store,
         )
-        result = self.role.call(
-            self._prompt(
-                idea,
-                prior_failure=job.result,
-                previous_plan=previous_plan,
-                previous_review=previous_review,
-            ),
-            max_tokens=10000,
-            temperature=0.25,
-            retry_context=self._validation_repair_context,
+        prompt = self._prompt(
+            idea,
+            prior_failure=job.result,
+            previous_plan=previous_plan,
+            previous_review=previous_review,
         )
-        try:
-            plan = compile_screening_protocol(idea, result.value)
-        except (TypeError, ValueError) as exc:
-            attempt.validation = {
-                "ok": False,
-                "protocol_compiler": {
-                    "error": str(exc),
-                },
-            }
-            attempt.status = AttemptStatus.REJECTED
-            attempt.error = f"protocol_compile_failed: {exc}"
-            store.save_attempt(attempt)
-            return JobOutcome(
-                False,
-                "retry",
-                attempt.error,
-                {"validation": attempt.validation},
-                tokens=result.total_tokens,
-                elapsed_sec=time.monotonic() - started,
+        total_tokens = 0
+        design_revisions: list[dict[str, Any]] = []
+        for revision in range(self.max_revisions + 1):
+            result = self.role.call(
+                prompt,
+                max_tokens=10000,
+                temperature=0.25 if revision == 0 else 0.10,
+                retry_context=self._validation_repair_context,
             )
-        _write_json(candidate / "plan.json", plan)
-        gate_tokens = 0
-        if self.decision_gate is not None:
+            total_tokens += result.total_tokens
+            try:
+                plan = compile_screening_protocol(idea, result.value)
+            except (TypeError, ValueError) as exc:
+                attempt.validation = {
+                    "ok": False,
+                    "protocol_compiler": {
+                        "error": str(exc),
+                    },
+                    "design_revisions": design_revisions,
+                }
+                attempt.status = AttemptStatus.REJECTED
+                attempt.error = f"protocol_compile_failed: {exc}"
+                store.save_attempt(attempt)
+                return JobOutcome(
+                    False,
+                    "retry",
+                    attempt.error,
+                    {"validation": attempt.validation},
+                    tokens=total_tokens,
+                    elapsed_sec=time.monotonic() - started,
+                )
+            _write_json(candidate / "plan.json", plan)
+            if self.decision_gate is None:
+                break
             verdict = self.decision_gate.review_design(idea, plan)
-            gate_tokens = verdict.tokens
-            _write_json(
-                candidate / "design_review.json",
-                verdict.raw or {
+            total_tokens += verdict.tokens
+            review = verdict.raw or {
+                "decision": verdict.decision,
+                "reason": verdict.reason,
+                "confidence": verdict.confidence,
+                "risks": list(verdict.risks),
+                "required_changes": list(verdict.required_changes),
+            }
+            _write_json(candidate / "design_review.json", review)
+            design_revisions.append(
+                {
+                    "revision": revision,
                     "decision": verdict.decision,
                     "reason": verdict.reason,
-                    "confidence": verdict.confidence,
-                    "risks": list(verdict.risks),
                     "required_changes": list(verdict.required_changes),
-                },
+                }
             )
-            if verdict.decision != "promote":
+            if verdict.decision == "promote":
+                break
+            if verdict.decision == "reject":
                 attempt.output_manifest = {
                     "files": ["plan.json", "design_review.json"]
                 }
                 attempt.validation = {
                     "ok": False,
-                    "decision_gate": verdict.raw or {},
+                    "decision_gate": review,
+                    "design_revisions": design_revisions,
                 }
                 attempt.status = AttemptStatus.REJECTED
                 attempt.error = verdict.reason
                 store.save_attempt(attempt)
                 return JobOutcome(
-                    verdict.decision == "reject",
-                    verdict.decision,
+                    True,
+                    "reject",
                     verdict.reason,
-                    {"decision_gate": verdict.raw or {}},
-                    tokens=result.total_tokens + gate_tokens,
+                    {
+                        "decision_gate": review,
+                        "design_revisions": design_revisions,
+                    },
+                    tokens=total_tokens,
                     elapsed_sec=time.monotonic() - started,
                 )
+            if revision >= self.max_revisions:
+                attempt.output_manifest = {
+                    "files": ["plan.json", "design_review.json"]
+                }
+                attempt.validation = {
+                    "ok": False,
+                    "decision_gate": review,
+                    "design_revisions": design_revisions,
+                }
+                attempt.status = AttemptStatus.REJECTED
+                attempt.error = verdict.reason
+                store.save_attempt(attempt)
+                return JobOutcome(
+                    False,
+                    "retry",
+                    verdict.reason,
+                    {
+                        "decision_gate": review,
+                        "design_revisions": design_revisions,
+                    },
+                    tokens=total_tokens,
+                    elapsed_sec=time.monotonic() - started,
+                )
+            prompt = self._decision_repair_prompt(
+                idea=idea,
+                plan=plan,
+                review=review,
+            )
         attempt.output_manifest = {"files": ["plan.json"]}
-        attempt.validation = {"ok": True}
+        attempt.validation = {
+            "ok": True,
+            "design_revisions": design_revisions,
+        }
         attempt.status = AttemptStatus.VALIDATING
         store.save_attempt(attempt)
         store.commit_candidate(attempt)
@@ -191,7 +242,7 @@ class DesignJobExecutor:
             "promote",
             "design_accepted",
             {"plan_path": str(store.current_dir(idea.idea_id) / "plan.json")},
-            tokens=result.total_tokens + gate_tokens,
+            tokens=total_tokens,
             elapsed_sec=time.monotonic() - started,
         )
 
@@ -470,6 +521,48 @@ PRIOR JSON TO REPAIR:
 
 DETERMINISTIC ERRORS TO FIX:
 {json.dumps(errors, ensure_ascii=False, indent=2)[:8000]}
+"""
+
+    @staticmethod
+    def _decision_repair_prompt(
+        *,
+        idea: IdeaRecord,
+        plan: Mapping[str, Any],
+        review: Mapping[str, Any],
+    ) -> str:
+        return f"""\
+Revise the typed scientific draft below in response to the Decision review.
+Return one complete JSON object containing only model-owned draft fields.
+Do not return compiled/mechanical fields.
+
+IDEA (immutable):
+{json.dumps(idea.candidate, ensure_ascii=False, indent=2)[:16000]}
+
+CURRENT COMPILED PLAN:
+{json.dumps(dict(plan), ensure_ascii=False, indent=2)[:24000]}
+
+DECISION REVIEW:
+{json.dumps(dict(review), ensure_ascii=False, indent=2)[:12000]}
+
+Preserve the research question and mechanism. Apply every required change
+point-by-point. Narrow the screening claim or simplify the pilot when needed;
+do not expand it into a confirmatory study. Prefer a simple paired 2-arm design
+plus an independent no-self-improvement control. Specify the operational
+algorithm, denominator, pairing, tie/zero handling, and comparable control
+outcome exactly enough that code can implement them without discretion.
+
+Return exactly the same typed schema requested by the original Design prompt:
+protocol_template, pilot_objective, pilot_claim_scope, research_question,
+hypothesis, primary_metric, metric_direction, unit_of_analysis, dataset,
+screening_access_policy, models, baselines, ablations, arms, pilot,
+call_ledger, gate_statistic, uncertainty, validity_criteria,
+promotion_criteria, estimand, sample_size_rationale, workload_budget, and
+confirmatory_followup.
+
+The Controller will recompile datasets, split IDs, arithmetic, decision
+regions, Scale expansion, and required runtime evidence. Do not include or
+edit those mechanical fields. Retry is only for invalid operational evidence;
+valid undefined, low-event, flat, CI-crossing, or unfavorable results reject.
 """
 
 

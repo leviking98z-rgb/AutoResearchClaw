@@ -69,6 +69,7 @@ def build_production_controller(
             validator=validate_protocol_draft,
         ),
         decision_gate=decision_gate,
+        max_revisions=config.budgets.max_design_revisions,
     )
     build = BuildJobExecutor(
         StructuredRole(

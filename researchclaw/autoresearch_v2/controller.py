@@ -579,6 +579,8 @@ class V2Controller:
                 attempt_limit=(
                     self.config.budgets.max_build_attempts
                     if dispatch_kind is JobKind.BUILD
+                    else 1
+                    if dispatch_kind is JobKind.DESIGN
                     else self.config.budgets.max_job_attempts
                 ),
                 requires_gpu=bool(requested_gpus),

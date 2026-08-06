@@ -82,6 +82,23 @@ class _Gate:
         return GateVerdict("promote", "ok", 1.0)
 
 
+class _RepairingGate:
+    def __init__(self):
+        self.plans = []
+
+    def review_design(self, idea, plan):
+        del idea
+        self.plans.append(plan)
+        if len(self.plans) == 1:
+            return GateVerdict(
+                "retry",
+                "make the endpoint implementation-ready",
+                1.0,
+                required_changes=("define the exact denominator",),
+            )
+        return GateVerdict("promote", "fixed", 1.0)
+
+
 class _RetryClient:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -338,6 +355,106 @@ def test_design_executor_compiles_typed_draft_before_decision_gate(
     assert (
         store.current_dir(idea.idea_id) / "plan.json"
     ).is_file()
+
+
+def test_design_repairs_decision_retry_inside_one_attempt(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="typed-design-repair",
+        idea_id=idea.idea_id,
+        kind=JobKind.DESIGN,
+        attempt_limit=1,
+    )
+    attempt = AttemptRecord(
+        attempt_id="typed-design-repair-attempt-01",
+        idea_id=idea.idea_id,
+        job_id=job.job_id,
+        number=1,
+        status=AttemptStatus.RUNNING,
+    )
+    role = _Role(_typed_draft())
+    gate = _RepairingGate()
+
+    outcome = DesignJobExecutor(
+        role,
+        decision_gate=gate,
+        max_revisions=2,
+    ).execute(
+        idea=idea,
+        job=job,
+        attempt=attempt,
+        store=store,
+    )
+
+    assert outcome.success
+    assert outcome.decision == "promote"
+    assert len(role.prompts) == 2
+    assert "DECISION REVIEW" in role.prompts[1]
+    assert "define the exact denominator" in role.prompts[1]
+    assert len(gate.plans) == 2
+    durable = store.get_attempt(attempt.attempt_id)
+    assert durable is not None
+    assert [item["decision"] for item in durable.validation["design_revisions"]] == [
+        "retry",
+        "promote",
+    ]
+
+
+def test_design_exhausts_bounded_internal_revisions(
+    tmp_path: Path,
+) -> None:
+    class _AlwaysRetryGate:
+        def review_design(self, idea, plan):
+            del idea, plan
+            return GateVerdict(
+                "retry",
+                "still underspecified",
+                1.0,
+                required_changes=("define the algorithm",),
+            )
+
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="typed-design-repair-limit",
+        idea_id=idea.idea_id,
+        kind=JobKind.DESIGN,
+        attempt_limit=1,
+    )
+    attempt = AttemptRecord(
+        attempt_id="typed-design-repair-limit-attempt-01",
+        idea_id=idea.idea_id,
+        job_id=job.job_id,
+        number=1,
+        status=AttemptStatus.RUNNING,
+    )
+    role = _Role(_typed_draft())
+
+    outcome = DesignJobExecutor(
+        role,
+        decision_gate=_AlwaysRetryGate(),
+        max_revisions=1,
+    ).execute(
+        idea=idea,
+        job=job,
+        attempt=attempt,
+        store=store,
+    )
+
+    assert not outcome.success
+    assert outcome.decision == "retry"
+    assert len(role.prompts) == 2
+    durable = store.get_attempt(attempt.attempt_id)
+    assert durable is not None
+    assert durable.status is AttemptStatus.REJECTED
+    assert len(durable.validation["design_revisions"]) == 2
 
 
 def test_first_design_attempt_has_no_revision_directive() -> None:

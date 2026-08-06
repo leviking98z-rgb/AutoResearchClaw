@@ -24,6 +24,8 @@ def test_config_accepts_parallel_defaults() -> None:
     )
     assert config.population.active_idea_target == 6
     assert config.concurrency.max_gpu_jobs == 6
+    assert config.budgets.max_job_attempts == 3
+    assert config.budgets.max_design_revisions == 1
 
 
 def test_config_rejects_impossible_target() -> None:
@@ -81,6 +83,19 @@ def test_attestation_key_cannot_live_in_generated_candidate(
                             / "controller.key"
                         ),
                     },
+                }
+            }
+        )
+
+
+def test_attempt_and_revision_budgets_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="attempt and revision budgets"):
+        V2Config.from_mapping(
+            {
+                "autoresearch_v2": {
+                    "budgets": {
+                        "max_design_revisions": 0,
+                    }
                 }
             }
         )

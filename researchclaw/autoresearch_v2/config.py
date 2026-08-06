@@ -47,7 +47,8 @@ class ConcurrencyConfig:
 @dataclass(frozen=True, slots=True)
 class BudgetConfig:
     max_build_attempts: int = 2
-    max_job_attempts: int = 2
+    max_job_attempts: int = 3
+    max_design_revisions: int = 1
     pilot_gpu_hours: float = 2.0
     scale_gpu_hours: float = 32.0
     max_llm_tokens_per_idea: int = 2_000_000
@@ -185,7 +186,10 @@ class V2Config:
             max_build_attempts=int(
                 budgets_raw.get("max_build_attempts", 2)
             ),
-            max_job_attempts=int(budgets_raw.get("max_job_attempts", 2)),
+            max_job_attempts=int(budgets_raw.get("max_job_attempts", 3)),
+            max_design_revisions=int(
+                budgets_raw.get("max_design_revisions", 1)
+            ),
             pilot_gpu_hours=float(
                 budgets_raw.get("pilot_gpu_hours", 2.0)
             ),
@@ -419,6 +423,12 @@ class V2Config:
             self.budgets.max_no_progress_hours,
         ) <= 0:
             raise ValueError("budget hours must be positive")
+        if min(
+            self.budgets.max_build_attempts,
+            self.budgets.max_job_attempts,
+            self.budgets.max_design_revisions,
+        ) < 1:
+            raise ValueError("attempt and revision budgets must be positive")
         if min(
             self.retention.event_jsonl_max_mb,
             self.retention.llm_audit_max_mb,

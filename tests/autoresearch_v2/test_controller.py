@@ -211,6 +211,27 @@ def test_bounded_retry_quarantines_one_idea_without_stopping_others(
     )
 
 
+def test_design_job_uses_one_outer_attempt(tmp_path: Path) -> None:
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([_candidate(0)]),
+        executors={kind: _SlowExecutor() for kind in JobKind},
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    controller.tick()
+
+    design = next(
+        job
+        for job in controller.store.list_jobs()
+        if job.kind is JobKind.DESIGN
+    )
+    assert design.attempt_limit == 1
+    controller.request_stop()
+    controller._pool.shutdown(wait=True)
+
+
 def test_restart_recovers_running_job_without_spending_retry_budget(
     tmp_path: Path,
 ) -> None:
