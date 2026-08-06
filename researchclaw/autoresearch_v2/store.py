@@ -113,12 +113,58 @@ class V2Store:
 
         if not self.ideas_root.is_dir():
             return
-        for idea_dir in self.ideas_root.iterdir():
-            if not idea_dir.is_dir():
-                continue
+        # Avoid scanning every historical idea on CephFS. Only interrupted
+        # swaps can leave these hidden paths, and a bounded find returns those
+        # paths in one filesystem traversal.
+        import subprocess
+
+        try:
+            completed = subprocess.run(
+                [
+                    "find",
+                    str(self.ideas_root),
+                    "-mindepth",
+                    "2",
+                    "-maxdepth",
+                    "2",
+                    "(",
+                    "-name",
+                    ".current.previous*",
+                    "-o",
+                    "-name",
+                    ".current.*.tmp",
+                    ")",
+                    "-print0",
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            # Recovery is best-effort. Durable job recovery recreates missing
+            # candidates, and later starts can retry hidden-path cleanup.
+            return
+        if completed.returncode != 0:
+            return
+        paths = [
+            Path(value.decode("utf-8", errors="surrogateescape"))
+            for value in completed.stdout.split(b"\0")
+            if value
+        ]
+        parents = {path.parent for path in paths}
+        for idea_dir in parents:
             current = idea_dir / "current"
-            backups = sorted(idea_dir.glob(".current.previous*"))
-            staged = sorted(idea_dir.glob(".current.*.tmp"))
+            backups = sorted(
+                path
+                for path in paths
+                if path.parent == idea_dir
+                and path.name.startswith(".current.previous")
+            )
+            staged = sorted(
+                path
+                for path in paths
+                if path.parent == idea_dir and path.name.endswith(".tmp")
+            )
             if not current.exists():
                 recoverable = next(
                     (path for path in reversed(backups) if path.is_dir()),
