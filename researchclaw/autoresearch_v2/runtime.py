@@ -9,6 +9,7 @@ from researchclaw.experiment.clusterbridge_pool import ClusterPoolError
 
 from .config import V2Config
 from .controller import V2Controller
+from .elastic_gpu import ResourceManagedGPUManager
 from .gates import LLMDecisionGate
 from .gpu import build_clusterbridge_broker, clusterbridge_capacity
 from .ideas import IdeaGenerator, LLMBoardIdeaGenerator
@@ -108,43 +109,57 @@ def build_production_controller(
         ),
         decision_gate=decision_gate,
     )
-    configured_gpu_capacity = (
-        clusterbridge_capacity(config.gpu.pool_config)
-        if config.gpu.enabled
-        else 0
-    )
+    task_env = {
+        key: value
+        for key in config.execution.allowed_env_keys
+        if (value := os.environ.get(key)) is not None
+        and not (
+            key in {
+                "HF_HUB_OFFLINE",
+                "TRANSFORMERS_OFFLINE",
+            }
+            and str(value).strip().casefold()
+            in {"1", "true", "yes", "on"}
+        )
+    }
+    configured_gpu_capacity = 0
     broker = None
+    gpu_manager = None
     gpu_broker_error = ""
     if config.gpu.enabled:
-        try:
-            broker = build_clusterbridge_broker(
-                config.gpu.pool_config,
-                reserved_gpus=config.gpu.reserved_gpus,
-                max_share_per_idea=config.gpu.max_share_per_idea,
-                target_utilization=config.gpu.target_utilization,
-                probe_failure_threshold=(
-                    config.gpu.probe_failure_threshold
-                ),
-                task_env={
-                    key: value
-                    for key in config.execution.allowed_env_keys
-                    if (value := os.environ.get(key)) is not None
-                    and not (
-                        key in {
-                            "HF_HUB_OFFLINE",
-                            "TRANSFORMERS_OFFLINE",
-                        }
-                        and str(value).strip().casefold()
-                        in {"1", "true", "yes", "on"}
-                    )
-                },
+        if config.gpu.mode == "resource_manager":
+            configured_gpu_capacity = (
+                config.gpu.resource_manager.desired_gpus
             )
-        except ClusterPoolError as exc:
-            # Idea generation, Design, and Build do not require a live physical
-            # allocation. Keep the Controller useful while the GPU pool is
-            # released; GPU jobs remain READY until a restart can adopt a
-            # freshly claimed/prepared pool.
-            gpu_broker_error = f"{type(exc).__name__}: {exc}"
+            gpu_manager = ResourceManagedGPUManager(
+                config.gpu,
+                task_env=task_env,
+            )
+            gpu_manager.bootstrap()
+            broker = gpu_manager.broker
+            manager_snapshot = gpu_manager.snapshot()
+            if broker is None and manager_snapshot.get("last_error"):
+                gpu_broker_error = str(manager_snapshot["last_error"])
+        else:
+            configured_gpu_capacity = clusterbridge_capacity(
+                config.gpu.pool_config
+            )
+            try:
+                broker = build_clusterbridge_broker(
+                    config.gpu.pool_config,
+                    reserved_gpus=config.gpu.reserved_gpus,
+                    max_share_per_idea=config.gpu.max_share_per_idea,
+                    target_utilization=config.gpu.target_utilization,
+                    probe_failure_threshold=(
+                        config.gpu.probe_failure_threshold
+                    ),
+                    task_env=task_env,
+                )
+            except ClusterPoolError as exc:
+                # Idea generation, Design, and Build do not require a live
+                # physical allocation. GPU jobs remain READY while elastic
+                # deployments hot-reconnect or static deployments restart.
+                gpu_broker_error = f"{type(exc).__name__}: {exc}"
     controller = V2Controller(
         config=config,
         store=store,
@@ -161,6 +176,7 @@ def build_production_controller(
             JobKind.REPORT: report,
         },
         gpu_broker=broker,
+        gpu_manager=gpu_manager,
         configured_gpu_capacity=configured_gpu_capacity,
         research_memory=research_memory,
     )

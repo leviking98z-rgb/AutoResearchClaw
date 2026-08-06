@@ -10,7 +10,8 @@ or CodeAgent. It directly reuses the stable parts of AutoResearchClaw:
 
 - the three configured model tiers and local LLM Bridge;
 - deterministic code validators;
-- the already-owned asynchronous ClusterBridge/Ray pool;
+- ClusterBridge/Ray execution, either from a static preclaimed pool or an
+  elastic central-resource-manager allocation;
 - persistent InfoHub literature memory;
 - dashboard styling and the existing FastAPI deployment stack.
 
@@ -113,8 +114,17 @@ Decision tier retains final admission and consequential gate authority.
 
 ## GPU policy
 
-One or more `GPUBroker` instances may adopt an already claimed and prepared
-pool. They never claim, prepare, or release physical nodes. A shared SQLite
+`gpu.mode` chooses the physical-capacity lifecycle:
+
+- `static_pool` preserves the original behavior. `pool_config` names an
+  already claimed and prepared ClusterBridge/Ray pool. AutoResearch adopts it
+  but never claims, prepares, or releases its physical nodes.
+- `resource_manager` delegates node ownership to the central ClusterBridge
+  resource manager. `ResourceManagedGPUManager` requests capacity, renews the
+  allocation, materializes a pool from granted nodes, and hot-attaches or
+  replaces the `GPUBroker` without restarting the Controller.
+
+The logical scheduler remains independent of either lifecycle. A shared SQLite
 lease registry performs atomic cross-Controller reservations, so two
 Controllers cannot overbook the same physical GPU pool. Jobs request malleable
 ranges:
@@ -132,6 +142,90 @@ The scheduler applies:
 - concurrent Pilot/Scale tasks from independent Ideas.
 - bounded tolerance for transient pool probe failures.
 - crash-safe global leases with heartbeat, task-probe recovery, and adoption.
+
+### Elastic resource-manager configuration
+
+```yaml
+gpu:
+  enabled: true
+  mode: resource_manager
+  # Not used in resource_manager mode. Keep pool_config for static_pool only.
+  pool_config: ""
+  resource_manager:
+    owner: 00000000-0000-0000-0000-000000000000
+    cb_command: /root/shared/.clusters/.tools/clusterbridge.sh
+    project: AutoResearchClaw-v2
+    purpose: AutoResearch v2 continuous multi-Idea experiments
+    min_gpus: 8
+    desired_gpus: 56
+    max_gpus: 64
+    duration_min: 1440
+    renew_ttl_min: 1440
+    renew_interval_sec: 900
+    reconcile_interval_sec: 15
+    allow_cross_cluster: true
+    gpu_type: H20
+    priority: normal
+    release_on_shutdown: false
+    log_root: /root/shared/.clusters/.tmp/autoresearch-v2/elastic-pools
+```
+
+The capacity bounds satisfy:
+
+```text
+0 < min_gpus <= desired_gpus <= max_gpus
+```
+
+`desired_gpus` is the request target and the configured capacity shown while a
+request is queued. `min_gpus` is the smallest allocation that may be attached;
+`max_gpus` is the policy ceiling for later resizing. `duration_min` controls
+the initial request, while `renew_ttl_min` and `renew_interval_sec` control
+lease renewal. The renewal interval must be shorter than the renewal TTL.
+
+`owner` must be a stable ClusterBridge owner identity for the unattended
+service. `project`, `purpose`, `gpu_type`, `priority`, and
+`allow_cross_cluster` are passed to the central resource request. `log_root`
+holds generated per-allocation pool state and task logs.
+
+`release_on_shutdown: false` is the safe default for a continuously restarted
+systemd service: the allocation survives a routine Controller restart and is
+re-adopted. Set it to `true` when every clean shutdown must explicitly return
+the allocation. Running GPU tasks remain governed by the durable Job and
+global GPU-lease recovery rules.
+
+The public manager contract is intentionally small:
+
+```text
+ResourceManagedGPUManager
+  properties: broker, configured_capacity
+  methods:    bootstrap(), reconcile(), snapshot(), close()
+```
+
+`bootstrap()` performs the initial best-effort reconciliation.
+`reconcile()` owns the ongoing request/renew/hot-attach lifecycle and is called
+from the Controller tick. `snapshot()` returns manager observability state.
+`close()` is idempotent and applies the configured release policy. Controller
+and dashboard code must not depend on the concrete resource client.
+
+### Elastic lifecycle and failure behavior
+
+At startup, `bootstrap()` performs a best-effort reconciliation:
+
+1. reuse an active allocation owned by the configured `owner` and `project`;
+2. otherwise submit one request for `desired_gpus`;
+3. remain available for Idea generation, Design, and Build while queued;
+4. attach the broker once at least `min_gpus` is granted.
+
+Every Controller tick calls the manager reconciliation path. A later grant,
+allocation replacement, or capacity change therefore updates
+`gpu_broker` and `configured_gpu_capacity` in-process. GPU-required jobs stay
+`READY` while no broker is attached; infrastructure waiting must not be
+misclassified as a scientific failure. Reconciliation and renewal failures are
+reported as degraded/unavailable state and retried on later ticks.
+
+The dashboard snapshot includes the normal broker metrics plus an `elastic`
+object with manager state, requested bounds, allocation ID, granted capacity,
+nodes, queue state, and last error.
 
 Every physical GPU task must write both:
 
@@ -296,7 +390,13 @@ a terminal state.
 ## Production preflight
 
 - `state_dir` must be inside `gpu.shared_workspace_root`;
-- the GPU pool must already be claimed and prepared;
+- choose exactly one GPU lifecycle:
+  - `static_pool`: `pool_config` must name an already claimed/prepared pool;
+  - `resource_manager`: `owner`, request metadata, valid capacity bounds,
+    positive lease intervals, and a writable `log_root` are required;
+- the configured `cb_command` must reach the central resource manager, and the
+  service owner must be authorized to request, renew, inspect, and optionally
+  release its own allocation;
 - Bridge and InfoHub must be reachable;
 - missing small runtime packages such as `arxiv` are installed by
   `bin/researchclaw-ensure-deps`;
@@ -331,6 +431,8 @@ The v2 suite covers:
 - direct Build smoke execution with shell-command rejection;
 - controller-issued execution contracts and signed artifact attestations;
 - cross-Controller global GPU lease accounting;
+- elastic GPU request, queued startup, hot attachment, capacity replacement,
+  lease renewal, and configurable shutdown release;
 - allocation/runtime and Pilot/Scale contract checks;
 - strict Scale expansion and untouched confirmatory-split checks;
 - accepted-attempt and interrupted-attempt restart reconciliation;

@@ -295,6 +295,23 @@ class ClusterBridgePool:
             )
         return records
 
+    def adopt_claimed_lease(self) -> None:
+        """Adopt externally allocated nodes after authoritative verification.
+
+        The central resource manager projects the same ``claim.json`` records
+        used by the legacy pool lifecycle.  Elastic controllers therefore do
+        not issue a second claim; they verify owner/purpose and durably mark
+        the pool claimed before preparing Ray.
+        """
+
+        self.verify_claim_ownership()
+        with self._state_lock:
+            self._claimed = True
+            self._prepared = False
+            self._ray_started = False
+        self._event("lease_adopted", nodes=self.node_addresses)
+        self._write_state()
+
     def claim(self, *, force: bool = False, start_keepalive: bool = True) -> None:
         """Atomically claim all configured nodes.
 

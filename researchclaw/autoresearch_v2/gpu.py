@@ -584,6 +584,29 @@ def build_clusterbridge_broker(
             "v2 requires an already claimed and prepared shared GPU pool; "
             "it will not claim, prepare, or release physical nodes"
         )
+    return build_clusterbridge_broker_from_pool(
+        pool,
+        total_gpus=summary.expected_total_gpus,
+        reserved_gpus=reserved_gpus,
+        max_share_per_idea=max_share_per_idea,
+        target_utilization=target_utilization,
+        probe_failure_threshold=probe_failure_threshold,
+        task_env=task_env,
+    )
+
+
+def build_clusterbridge_broker_from_pool(
+    pool: AsyncGPUPool,
+    *,
+    total_gpus: int,
+    reserved_gpus: int,
+    max_share_per_idea: float,
+    target_utilization: float,
+    probe_failure_threshold: int = 3,
+    task_env: Mapping[str, str] | None = None,
+) -> GPUBroker:
+    """Build a broker around an already claimed and prepared pool object."""
+
     config = getattr(pool, "config", None)
     nodes = [
         {
@@ -595,15 +618,15 @@ def build_clusterbridge_broker(
     ]
     pool_id = stable_pool_identity(
         nodes=nodes,
-        expected_total_gpus=summary.expected_total_gpus,
+        expected_total_gpus=total_gpus,
     )
     state_dir = Path(
-        getattr(pool, "state_dir", summary.config_path.parent)
+        getattr(pool, "state_dir", Path.cwd())
     ).resolve()
     lease_registry = SharedGPULeaseRegistry(
         shared_registry_path(state_dir, pool_id),
         pool_id=pool_id,
-        total_gpus=summary.expected_total_gpus,
+        total_gpus=total_gpus,
         reserved_gpus=reserved_gpus,
         max_share_per_idea=max_share_per_idea,
         owner_ttl_sec=max(
@@ -614,7 +637,7 @@ def build_clusterbridge_broker(
     return GPUBroker(
         pool=pool,
         scheduler=AdaptiveGPUScheduler(
-            total_gpus=summary.expected_total_gpus,
+            total_gpus=total_gpus,
             reserved_gpus=reserved_gpus,
             max_share_per_idea=max_share_per_idea,
             target_utilization=target_utilization,

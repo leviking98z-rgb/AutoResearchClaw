@@ -83,8 +83,45 @@ class ExecutionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GPUResourceManagerConfig:
+    """Elastic ClusterBridge allocation policy.
+
+    The resource manager owns the node lease.  AutoResearch materializes a
+    ClusterBridge/Ray pool from the returned allocation and may reconnect it
+    without restarting the controller.
+    """
+
+    owner: str = ""
+    cb_command: str = (
+        "/root/shared/.clusters/.tools/clusterbridge.sh"
+    )
+    project: str = "AutoResearchClaw-v2"
+    purpose: str = "AutoResearch v2 elastic GPU pool"
+    min_gpus: int = 8
+    desired_gpus: int = 32
+    max_gpus: int = 64
+    duration_min: int = 1440
+    renew_ttl_min: int = 1440
+    renew_interval_sec: float = 900.0
+    reconcile_interval_sec: float = 15.0
+    allow_cross_cluster: bool = True
+    gpu_type: str = ""
+    priority: str = "normal"
+    release_on_shutdown: bool = False
+    log_root: str = (
+        "/root/shared/.clusters/.tmp/autoresearch-v2/elastic-pools"
+    )
+    ray_command: str = "/opt/conda/envs/torch-base/bin/ray"
+    ray_python: str = "/opt/conda/envs/torch-base/bin/python3"
+    ray_port: int = 6379
+    command_timeout_sec: float = 180.0
+    prepare_timeout_sec: float = 900.0
+
+
+@dataclass(frozen=True, slots=True)
 class GPUConfig:
     enabled: bool = False
+    mode: str = "static_pool"
     pool_config: str = ""
     reserved_gpus: int = 0
     target_utilization: float = 0.90
@@ -94,6 +131,9 @@ class GPUConfig:
     probe_failure_threshold: int = 3
     shared_workspace_root: str = (
         "/root/shared/.clusters/.workdir/autoresearch-v2/runs"
+    )
+    resource_manager: GPUResourceManagerConfig = field(
+        default_factory=GPUResourceManagerConfig
     )
 
 
@@ -304,8 +344,101 @@ class V2Config:
             ),
         )
         gpu_raw = _mapping(data.get("gpu"), "gpu")
+        resource_manager_raw = _mapping(
+            gpu_raw.get("resource_manager"),
+            "gpu.resource_manager",
+        )
+        resource_manager = GPUResourceManagerConfig(
+            owner=str(resource_manager_raw.get("owner", "") or ""),
+            cb_command=str(
+                resource_manager_raw.get(
+                    "cb_command",
+                    "/root/shared/.clusters/.tools/clusterbridge.sh",
+                )
+                or ""
+            ),
+            project=str(
+                resource_manager_raw.get(
+                    "project",
+                    "AutoResearchClaw-v2",
+                )
+                or ""
+            ),
+            purpose=str(
+                resource_manager_raw.get(
+                    "purpose",
+                    "AutoResearch v2 elastic GPU pool",
+                )
+                or ""
+            ),
+            min_gpus=int(resource_manager_raw.get("min_gpus", 8)),
+            desired_gpus=int(
+                resource_manager_raw.get("desired_gpus", 32)
+            ),
+            max_gpus=int(resource_manager_raw.get("max_gpus", 64)),
+            duration_min=int(
+                resource_manager_raw.get("duration_min", 1440)
+            ),
+            renew_ttl_min=int(
+                resource_manager_raw.get("renew_ttl_min", 1440)
+            ),
+            renew_interval_sec=float(
+                resource_manager_raw.get("renew_interval_sec", 900.0)
+            ),
+            reconcile_interval_sec=float(
+                resource_manager_raw.get(
+                    "reconcile_interval_sec",
+                    15.0,
+                )
+            ),
+            allow_cross_cluster=bool(
+                resource_manager_raw.get("allow_cross_cluster", True)
+            ),
+            gpu_type=str(
+                resource_manager_raw.get("gpu_type", "") or ""
+            ),
+            priority=str(
+                resource_manager_raw.get("priority", "normal")
+                or "normal"
+            ),
+            release_on_shutdown=bool(
+                resource_manager_raw.get("release_on_shutdown", False)
+            ),
+            log_root=str(
+                resource_manager_raw.get(
+                    "log_root",
+                    "/root/shared/.clusters/.tmp/"
+                    "autoresearch-v2/elastic-pools",
+                )
+                or ""
+            ),
+            ray_command=str(
+                resource_manager_raw.get(
+                    "ray_command",
+                    "/opt/conda/envs/torch-base/bin/ray",
+                )
+                or ""
+            ),
+            ray_python=str(
+                resource_manager_raw.get(
+                    "ray_python",
+                    "/opt/conda/envs/torch-base/bin/python3",
+                )
+                or ""
+            ),
+            ray_port=int(resource_manager_raw.get("ray_port", 6379)),
+            command_timeout_sec=float(
+                resource_manager_raw.get("command_timeout_sec", 180.0)
+            ),
+            prepare_timeout_sec=float(
+                resource_manager_raw.get("prepare_timeout_sec", 900.0)
+            ),
+        )
         gpu = GPUConfig(
             enabled=bool(gpu_raw.get("enabled", False)),
+            mode=str(gpu_raw.get("mode", "static_pool") or "static_pool")
+            .strip()
+            .casefold(),
             pool_config=str(gpu_raw.get("pool_config", "") or ""),
             reserved_gpus=int(gpu_raw.get("reserved_gpus", 0)),
             target_utilization=float(
@@ -326,6 +459,7 @@ class V2Config:
                 )
                 or ""
             ),
+            resource_manager=resource_manager,
         )
         models_raw = _mapping(data.get("models"), "models")
         models = ModelConfig(
@@ -518,8 +652,69 @@ class V2Config:
             raise ValueError(
                 "gpu.probe_failure_threshold must be positive"
             )
-        if self.gpu.enabled and not self.gpu.pool_config:
-            raise ValueError("gpu.pool_config is required when GPU is enabled")
+        if self.gpu.mode not in {"static_pool", "resource_manager"}:
+            raise ValueError(
+                "gpu.mode must be static_pool or resource_manager"
+            )
+        if (
+            self.gpu.enabled
+            and self.gpu.mode == "static_pool"
+            and not self.gpu.pool_config
+        ):
+            raise ValueError(
+                "gpu.pool_config is required in static_pool mode"
+            )
+        if self.gpu.enabled and self.gpu.mode == "resource_manager":
+            elastic = self.gpu.resource_manager
+            if not elastic.owner.strip():
+                raise ValueError(
+                    "gpu.resource_manager.owner is required in "
+                    "resource_manager mode"
+                )
+            if not (
+                0
+                < elastic.min_gpus
+                <= elastic.desired_gpus
+                <= elastic.max_gpus
+            ):
+                raise ValueError(
+                    "gpu.resource_manager GPU bounds must satisfy "
+                    "0 < min_gpus <= desired_gpus <= max_gpus"
+                )
+            if min(
+                elastic.duration_min,
+                elastic.renew_ttl_min,
+                elastic.renew_interval_sec,
+                elastic.reconcile_interval_sec,
+                elastic.command_timeout_sec,
+                elastic.prepare_timeout_sec,
+            ) <= 0:
+                raise ValueError(
+                    "gpu.resource_manager durations must be positive"
+                )
+            if (
+                elastic.renew_interval_sec
+                >= elastic.renew_ttl_min * 60
+            ):
+                raise ValueError(
+                    "gpu.resource_manager.renew_interval_sec must be "
+                    "shorter than renew_ttl_min"
+                )
+            if not all(
+                value.strip()
+                for value in (
+                    elastic.cb_command,
+                    elastic.project,
+                    elastic.purpose,
+                    elastic.log_root,
+                    elastic.ray_command,
+                    elastic.ray_python,
+                )
+            ):
+                raise ValueError(
+                    "gpu.resource_manager command, project, purpose, "
+                    "log_root, and Ray fields are required"
+                )
         if self.gpu.enabled and not self.gpu.shared_workspace_root:
             raise ValueError(
                 "gpu.shared_workspace_root is required when GPU is enabled"

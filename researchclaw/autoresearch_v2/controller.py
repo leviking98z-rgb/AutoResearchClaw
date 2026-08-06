@@ -73,6 +73,9 @@ _STATUS_FOR_KIND = {
 }
 
 _LLM_KINDS = {JobKind.DESIGN, JobKind.BUILD, JobKind.REPORT}
+_BUDGET_PAUSE_STARTED_EVENT = "idea_budget_pause_started"
+_BUDGET_PAUSE_RESUMED_EVENT = "idea_budget_pause_resumed"
+_GPU_UNAVAILABLE_EVENT = "gpu_broker_unavailable"
 
 
 @dataclass(slots=True)
@@ -104,6 +107,7 @@ class V2Controller:
         generator: IdeaGenerator,
         executors: Mapping[JobKind, JobExecutor] | None = None,
         gpu_broker: GPUBroker | None = None,
+        gpu_manager: Any | None = None,
         configured_gpu_capacity: int = 0,
         research_memory: ResearchMemory | None = None,
         sleep: Any = time.sleep,
@@ -121,6 +125,7 @@ class V2Controller:
             else _MissingExecutor()
         )
         self.gpu_broker = gpu_broker
+        self.gpu_manager = gpu_manager
         self.research_memory = research_memory
         self.configured_gpu_capacity = max(
             0,
@@ -171,12 +176,18 @@ class V2Controller:
         self._stop_reason = ""
         self._initialized = False
         self._tick_count = 0
+        self._budget_pause_intervals: list[
+            tuple[datetime, datetime]
+        ] = []
+        self._budget_pause_started_at: datetime | None = None
 
     def initialize(self) -> None:
         if self._initialized:
             return
         self.store.initialize()
         self.store.acquire_writer_lock()
+        self._restore_budget_pause_state()
+        self._sync_gpu_budget_pause_state()
         self._recover_interrupted_jobs()
         self._initialized = True
         self.store.event(
@@ -193,7 +204,10 @@ class V2Controller:
         )
         self._idea_pool.shutdown(wait=True, cancel_futures=False)
         self._pool.shutdown(wait=True, cancel_futures=False)
-        if self.gpu_broker is not None:
+        if self.gpu_manager is not None:
+            self.gpu_manager.close()
+            self.gpu_broker = None
+        elif self.gpu_broker is not None:
             self.gpu_broker.close()
         self.store.release_writer_lock()
         self._initialized = False
@@ -303,10 +317,12 @@ class V2Controller:
         self._tick_count += 1
         if self.store.control_requested("stop"):
             self.request_stop(reason="control_stop")
+        self._reconcile_gpu_manager()
         self._collect_finished()
         self._collect_idea_generation()
         self._collect_research_memory_sync()
         self._collect_gpu_finished()
+        self._sync_gpu_budget_pause_state()
         self._enforce_liveness_budgets()
         if not self.store.control_requested("pause") and not self._stop:
             # Static generators are test/simulation fixtures and complete
@@ -350,6 +366,29 @@ class V2Controller:
         snapshot = self.snapshot()
         self.store.event("controller_tick", **snapshot)
         return snapshot
+
+    def _reconcile_gpu_manager(self) -> None:
+        manager = self.gpu_manager
+        if manager is None:
+            return
+        prior = self.gpu_broker
+        changed = manager.reconcile()
+        self.gpu_broker = manager.broker
+        self.configured_gpu_capacity = max(
+            0,
+            int(manager.configured_capacity),
+        )
+        if not changed and prior is self.gpu_broker:
+            return
+        state = manager.snapshot()
+        self.store.event(
+            "gpu_broker_reconnected"
+            if self.gpu_broker is not None
+            else "gpu_broker_disconnected",
+            **state,
+        )
+        if self.gpu_broker is not None:
+            self._adopt_interrupted_gpu_jobs()
 
     def _start_research_memory_sync(self) -> None:
         if self._research_memory_sync is not None:
@@ -2519,6 +2558,34 @@ class V2Controller:
                 scientific_attempt=job.attempt,
             )
 
+    def _adopt_interrupted_gpu_jobs(self) -> None:
+        """Adopt only durable remote tasks when an elastic broker appears."""
+
+        if self.gpu_broker is None:
+            return
+        for job in self.store.list_jobs(statuses={JobStatus.RUNNING}):
+            if (
+                not job.requires_gpu
+                or not job.submitted_task_id
+                or job.job_id in self.gpu_broker.leases
+            ):
+                continue
+            self.gpu_broker.adopt(
+                job,
+                task_id=job.submitted_task_id,
+                allocated_gpus=int(
+                    job.result.get("allocated_gpus", job.min_gpus) or 1
+                ),
+            )
+            self.store.event(
+                "gpu_job_adopted",
+                idea_id=job.idea_id,
+                job_id=job.job_id,
+                attempt_id=job.attempt_id,
+                task_id=job.submitted_task_id,
+                reconnect=True,
+            )
+
     def _budget_block_reason(
         self,
         idea: IdeaRecord,
@@ -2571,9 +2638,10 @@ class V2Controller:
                 self.store.save_job(job)
         created = _parse_time(idea.created_at)
         if created is not None:
-            age_hours = (
-                datetime.now(UTC) - created
-            ).total_seconds() / 3600.0
+            age_hours = self._budget_elapsed_hours(
+                created,
+                datetime.now(UTC),
+            )
             if age_hours >= (
                 self.config.budgets.max_wall_clock_hours_per_idea
             ):
@@ -2600,13 +2668,165 @@ class V2Controller:
             reason=reason,
         )
 
+    def _restore_budget_pause_state(self) -> None:
+        """Rebuild durable GPU-outage budget pauses from the event stream."""
+
+        events: list[dict[str, Any]] = []
+        for event_type in (
+            _BUDGET_PAUSE_STARTED_EVENT,
+            _BUDGET_PAUSE_RESUMED_EVENT,
+        ):
+            events.extend(
+                self.store.list_events_between(
+                    event_type=event_type,
+                    started_at="0001-01-01T00:00:00+00:00",
+                    ended_at="9999-12-31T23:59:59.999999+00:00",
+                )
+            )
+        events.sort(
+            key=lambda event: (
+                int(event.get("seq", 0)),
+                str(event.get("timestamp", "")),
+            )
+        )
+        intervals: list[tuple[datetime, datetime]] = []
+        started_at: datetime | None = None
+        for event in events:
+            event_type = str(event.get("event_type", ""))
+            if event_type == _BUDGET_PAUSE_STARTED_EVENT:
+                parsed = _parse_time(
+                    str(
+                        event.get("started_at")
+                        or event.get("timestamp")
+                        or ""
+                    )
+                )
+                if parsed is not None and started_at is None:
+                    started_at = parsed
+                continue
+            if (
+                event_type != _BUDGET_PAUSE_RESUMED_EVENT
+                or started_at is None
+            ):
+                continue
+            resumed_at = _parse_time(
+                str(
+                    event.get("resumed_at")
+                    or event.get("timestamp")
+                    or ""
+                )
+            )
+            if resumed_at is None:
+                continue
+            intervals.append((started_at, max(started_at, resumed_at)))
+            started_at = None
+        self._budget_pause_intervals = intervals
+        self._budget_pause_started_at = started_at
+
+    def _sync_gpu_budget_pause_state(self) -> None:
+        """Open/close one durable pause around unavailable GPU infrastructure."""
+
+        now = datetime.now(UTC)
+        unavailable = self._gpu_infrastructure_unavailable()
+        if unavailable:
+            if self._budget_pause_started_at is not None:
+                return
+            started_at = self._gpu_unavailable_since_hint(now)
+            self.store.event(
+                _BUDGET_PAUSE_STARTED_EVENT,
+                cause="gpu_infrastructure_unavailable",
+                started_at=started_at.isoformat(timespec="milliseconds"),
+                configured_gpu_capacity=self.configured_gpu_capacity,
+            )
+            self._budget_pause_started_at = started_at
+            return
+        started_at = self._budget_pause_started_at
+        if started_at is None:
+            return
+        resumed_at = max(started_at, now)
+        paused_seconds = (resumed_at - started_at).total_seconds()
+        self.store.event(
+            _BUDGET_PAUSE_RESUMED_EVENT,
+            cause="gpu_infrastructure_available",
+            started_at=started_at.isoformat(timespec="milliseconds"),
+            resumed_at=resumed_at.isoformat(timespec="milliseconds"),
+            paused_seconds=paused_seconds,
+        )
+        self._budget_pause_intervals.append((started_at, resumed_at))
+        self._budget_pause_started_at = None
+
+    def _gpu_infrastructure_unavailable(self) -> bool:
+        if not self.config.gpu.enabled:
+            return False
+        if self.gpu_manager is not None:
+            return self.gpu_broker is None
+        # A static controller can only recover a missing broker after restart.
+        # Avoid treating an intentionally broker-less unit/simulation fixture
+        # as a real outage unless runtime recorded why the configured pool was
+        # unavailable.
+        if self.gpu_broker is not None:
+            return False
+        return bool(
+            self.store.list_events_between(
+                event_type=_GPU_UNAVAILABLE_EVENT,
+                started_at="0001-01-01T00:00:00+00:00",
+                ended_at=datetime.now(UTC).isoformat(
+                    timespec="milliseconds"
+                ),
+            )
+        )
+
+    def _gpu_unavailable_since_hint(self, now: datetime) -> datetime:
+        """Backfill an in-flight outage from runtime's durable startup event."""
+
+        events = self.store.list_events_between(
+            event_type=_GPU_UNAVAILABLE_EVENT,
+            started_at="0001-01-01T00:00:00+00:00",
+            ended_at=now.isoformat(timespec="milliseconds"),
+        )
+        if not events:
+            return now
+        candidate = _parse_time(str(events[-1].get("timestamp", "")))
+        if candidate is None:
+            return now
+        latest_resume = (
+            self._budget_pause_intervals[-1][1]
+            if self._budget_pause_intervals
+            else None
+        )
+        if latest_resume is not None and candidate < latest_resume:
+            return now
+        return min(candidate, now)
+
+    def _budget_elapsed_hours(
+        self,
+        started_at: datetime,
+        now: datetime,
+    ) -> float:
+        elapsed_seconds = max(0.0, (now - started_at).total_seconds())
+        paused_seconds = 0.0
+        intervals = list(self._budget_pause_intervals)
+        if self._budget_pause_started_at is not None:
+            intervals.append((self._budget_pause_started_at, now))
+        for pause_started, pause_ended in intervals:
+            overlap_started = max(started_at, pause_started)
+            overlap_ended = min(now, pause_ended)
+            if overlap_ended > overlap_started:
+                paused_seconds += (
+                    overlap_ended - overlap_started
+                ).total_seconds()
+        return max(
+            0.0,
+            elapsed_seconds - min(elapsed_seconds, paused_seconds),
+        ) / 3600.0
+
     def _enforce_liveness_budgets(self) -> None:
         now = datetime.now(UTC)
         for idea in self.store.list_ideas(statuses=set(ACTIVE_IDEA_STATUSES)):
             last = _parse_time(idea.last_progress_at)
             if last is None:
                 continue
-            stagnant_hours = (now - last).total_seconds() / 3600.0
+            stagnant_hours = self._budget_elapsed_hours(last, now)
             if stagnant_hours < self.config.budgets.max_no_progress_hours:
                 continue
             job = (
@@ -2670,6 +2890,11 @@ class V2Controller:
                 ),
             }
         )
+        if self.gpu_manager is not None:
+            gpu = {
+                **gpu,
+                "elastic": self.gpu_manager.snapshot(),
+            }
         return {
             "timestamp": utc_now(),
             "status": (
@@ -2695,6 +2920,16 @@ class V2Controller:
                 idea.gpu_seconds_spent for idea in ideas
             )
             / 3600.0,
+            "idea_budget_paused": (
+                self._budget_pause_started_at is not None
+            ),
+            "idea_budget_pause_started_at": (
+                self._budget_pause_started_at.isoformat(
+                    timespec="milliseconds"
+                )
+                if self._budget_pause_started_at is not None
+                else ""
+            ),
             "gpu": gpu,
         }
 

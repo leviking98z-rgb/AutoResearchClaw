@@ -59,7 +59,31 @@ autoresearch_v2:
 
   gpu:
     enabled: false
-    pool_config: config.cluster32.yaml
+    # resource_manager requests/renews/reconciles ClusterBridge capacity and
+    # hot-attaches the resulting broker without restarting the Controller.
+    # Use static_pool plus pool_config to adopt a preclaimed legacy pool.
+    mode: resource_manager
+    pool_config: ""
+    resource_manager:
+      # Stable AgentMail/ClusterBridge owner identity for this service.
+      owner: 00000000-0000-0000-0000-000000000000
+      cb_command: /root/shared/.clusters/.tools/clusterbridge.sh
+      project: AutoResearchClaw-v2
+      purpose: AutoResearch v2 continuous multi-Idea experiments
+      min_gpus: 8
+      desired_gpus: 56
+      max_gpus: 64
+      duration_min: 1440
+      renew_ttl_min: 1440
+      renew_interval_sec: 900
+      reconcile_interval_sec: 15
+      allow_cross_cluster: true
+      gpu_type: H20
+      priority: normal
+      # false preserves the allocation across a routine Controller restart.
+      # Set true only when every shutdown should return capacity immediately.
+      release_on_shutdown: false
+      log_root: /root/shared/.clusters/.tmp/autoresearch-v2/elastic-pools
     reserved_gpus: 0
     target_utilization: 0.90
     max_share_per_idea: 0.50
