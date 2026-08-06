@@ -798,6 +798,27 @@ if args.mode == "smoke":
         "environment": "gpu_pool",
         "reason": "deferred_to_controller_managed_remote_smoke",
     }
+    build = json.loads(
+        (store.attempt_dir(attempt) / "candidate" / "build.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert build["controller_runtime"]["schema"] == (
+        "autoresearch_v2.controller_runtime"
+    )
+    assert build["commands"]["smoke"][:2] == [
+        "python",
+        "_autoresearch_runtime.py",
+    ]
+    assert build["controller_runtime"]["core_commands"]["pilot"][-2:] == [
+        "--output",
+        "artifacts/pilot",
+    ]
+    assert (
+        store.attempt_dir(attempt)
+        / "candidate"
+        / "_autoresearch_runtime.py"
+    ).is_file()
 
 
 def test_build_smoke_uses_configured_local_interpreter(

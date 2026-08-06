@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import Any
 
 
-def validate_python_tree(root: Path) -> dict[str, Any]:
+def validate_python_tree(
+    root: Path,
+    *,
+    trusted_files: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     from researchclaw.experiment.validator import validate_code
 
     errors: list[dict[str, Any]] = []
@@ -41,10 +45,13 @@ def validate_python_tree(root: Path) -> dict[str, Any]:
                 }
             )
             continue
+        relative = str(path.relative_to(root))
+        if relative in trusted_files:
+            continue
         result = validate_code(path.read_text(encoding="utf-8"))
         for issue in result.issues:
             row = {
-                "file": str(path.relative_to(root)),
+                "file": relative,
                 "category": issue.category,
                 "message": issue.message,
                 "line": issue.line,
@@ -62,6 +69,7 @@ def validate_research_implementation(
     root: Path,
     *,
     plan: dict[str, Any],
+    controller_runtime: bool = False,
 ) -> dict[str, Any]:
     """Verify the generated project contains a real model/benchmark path."""
 
@@ -132,9 +140,9 @@ def validate_research_implementation(
         Path(str(row["path"])).name
         for row in evidence["artifact_writes"]
     }
-    if "metrics.json" not in artifact_names:
+    if not controller_runtime and "metrics.json" not in artifact_names:
         errors.append("no metrics.json artifact write found")
-    if "runtime_evidence.json" not in artifact_names:
+    if not controller_runtime and "runtime_evidence.json" not in artifact_names:
         errors.append("no runtime_evidence.json artifact write found")
     combined = "\n".join(
         path.read_text(encoding="utf-8", errors="replace").casefold()
@@ -148,10 +156,16 @@ def validate_research_implementation(
     ):
         if marker in combined:
             errors.append(f"forbidden synthetic implementation marker: {marker}")
-    schema_errors, schema_evidence = _validate_generated_runtime_schema(
-        python_files,
-        plan=plan,
-    )
+    if controller_runtime:
+        schema_errors: list[str] = []
+        schema_evidence: dict[str, Any] = {
+            "controller_owned": True,
+        }
+    else:
+        schema_errors, schema_evidence = _validate_generated_runtime_schema(
+            python_files,
+            plan=plan,
+        )
     errors.extend(schema_errors)
     evidence["runtime_schema"] = schema_evidence
     declared_models = [
@@ -2706,8 +2720,8 @@ def validate_metrics_file(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         errors.append("metrics root must be an object")
         value = {}
-    if value.get("result_valid") is not True:
-        errors.append("result_valid must be true")
+    if not isinstance(value.get("result_valid"), bool):
+        errors.append("result_valid must be boolean")
     if not isinstance(value.get("metrics"), dict) or not value.get("metrics"):
         errors.append("finite metrics object is required")
     else:
@@ -2750,7 +2764,8 @@ def validate_runtime_evidence_file(path: Path) -> dict[str, Any]:
     for field in required:
         if field not in value:
             errors.append(f"missing runtime evidence {field}")
-    if not str(value.get("model_loaded", "") or "").strip():
+    model_loaded = value.get("model_loaded")
+    if not isinstance(model_loaded, str) or not model_loaded.strip():
         errors.append("model_loaded must identify a real model")
     if not isinstance(value.get("datasets_loaded"), list) or not value.get(
         "datasets_loaded"

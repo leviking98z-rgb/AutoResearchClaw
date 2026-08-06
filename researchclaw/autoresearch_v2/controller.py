@@ -760,6 +760,14 @@ class V2Controller:
             idea = self.store.get_idea(job.idea_id)
             if idea is None:
                 continue
+            if (
+                self._is_remote_smoke_job(job)
+                and self._block_unchanged_remote_smoke(
+                    idea=idea,
+                    job=job,
+                )
+            ):
+                continue
             budget_reason = self._budget_block_reason(idea, job)
             if budget_reason:
                 self._reject_budget(idea, job, budget_reason)
@@ -974,6 +982,9 @@ class V2Controller:
             implementation = validate_research_implementation(
                 candidate,
                 plan=plan,
+                controller_runtime=bool(
+                    build.get("controller_runtime")
+                ),
             )
             if not implementation.get("ok"):
                 raise ValueError(
@@ -1167,7 +1178,25 @@ class V2Controller:
                     elapsed_sec=elapsed_sec,
                 )
                 continue
+            plan = self._read_current_json(idea.idea_id, "plan.json")
+            wrapper = (
+                {"compiled": False, "simulation": True}
+                if self._simulation_mode
+                else self._normalize_controller_runtime_artifacts(
+                    output_dir=output_dir,
+                    plan=plan,
+                    mode=job.kind.value,
+                    allocated_gpus=allocated,
+                    returncode=returncode,
+                )
+            )
             validation = validate_experiment_artifacts(output_dir)
+            if wrapper.get("error"):
+                validation["errors"] = [
+                    *validation.get("errors", []),
+                    str(wrapper["error"]),
+                ]
+                validation["ok"] = False
             if self._simulation_mode:
                 validation["execution_attestation"] = {
                     "simulation": True
@@ -1189,7 +1218,6 @@ class V2Controller:
                     validation["ok"] = False
                 else:
                     validation["execution_attestation"] = attestation
-            plan = self._read_current_json(idea.idea_id, "plan.json")
             pilot_runtime = (
                 self._read_current_json(
                     idea.idea_id,
@@ -1337,7 +1365,21 @@ class V2Controller:
         allocated_gpus: int,
         elapsed_sec: float,
     ) -> None:
+        plan = self._read_current_json(idea.idea_id, "plan.json")
+        wrapper = self._normalize_controller_runtime_artifacts(
+            output_dir=output_dir,
+            plan=plan,
+            mode="smoke",
+            allocated_gpus=allocated_gpus,
+            returncode=returncode,
+        )
         smoke_artifacts = validate_experiment_artifacts(output_dir)
+        if wrapper.get("error"):
+            smoke_artifacts["errors"] = [
+                *smoke_artifacts.get("errors", []),
+                str(wrapper["error"]),
+            ]
+            smoke_artifacts["ok"] = False
         trusted_evidence = result.get("trusted_gpu_evidence")
         if not isinstance(trusted_evidence, Mapping):
             trusted_evidence = {}
@@ -1381,7 +1423,6 @@ class V2Controller:
             smoke_errors.append(
                 "remote smoke runtime gpu_count must match allocated_gpus"
             )
-        plan = self._read_current_json(idea.idea_id, "plan.json")
         smoke_errors.extend(
             validate_runtime_against_contract(
                 plan=plan,
@@ -1538,17 +1579,41 @@ class V2Controller:
                     0.0,
                     elapsed_sec,
                 )
+                diagnostics = {
+                    "failure_class": "runtime_contract_invalid",
+                    "failure_code": "remote_smoke_validation_failed",
+                    "returncode": returncode,
+                    "errors": validation["errors"],
+                    **self._implementation_failure_fingerprint(
+                        idea_id=idea.idea_id,
+                        errors=validation["errors"],
+                    ),
+                }
+                prior = idea.candidate.get(
+                    "_autoresearch_v2_last_implementation_failure"
+                )
+                if (
+                    isinstance(prior, Mapping)
+                    and prior.get("fingerprint")
+                    == diagnostics.get("fingerprint")
+                ):
+                    diagnostics["no_progress"] = True
+                    self.store.event(
+                        "remote_smoke_no_progress",
+                        idea_id=idea.idea_id,
+                        job_id=job.job_id,
+                        attempt_id=attempt.attempt_id,
+                        fingerprint=diagnostics.get("fingerprint", ""),
+                    )
+                idea.candidate[
+                    "_autoresearch_v2_last_implementation_failure"
+                ] = diagnostics
                 self._queue_build_repair(
                     idea=idea,
                     job=job,
                     attempt=attempt,
                     reason="remote_smoke_invalid",
-                    diagnostics={
-                        "failure_class": "runtime_contract_invalid",
-                        "failure_code": "remote_smoke_validation_failed",
-                        "returncode": returncode,
-                        "errors": validation["errors"],
-                    },
+                    diagnostics=diagnostics,
                 )
                 return
         idea.gpu_seconds_spent += allocated_gpus * max(0.0, elapsed_sec)
@@ -1565,6 +1630,137 @@ class V2Controller:
                 elapsed_sec=0.0,
             ),
         )
+
+    @staticmethod
+    def _normalize_controller_runtime_artifacts(
+        *,
+        output_dir: Path,
+        plan: Mapping[str, Any],
+        mode: str,
+        allocated_gpus: int,
+        returncode: int,
+    ) -> dict[str, Any]:
+        """Recovery path for candidates built before the wrapper existed."""
+
+        try:
+            from .runtime_wrapper import normalize_runtime_artifacts
+
+            value = normalize_runtime_artifacts(
+                output_dir=output_dir,
+                plan=plan,
+                mode=mode,
+                allocated_gpus=allocated_gpus,
+                core_returncode=returncode,
+                cwd=output_dir.parent.parent,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"runtime_artifact_compile_failed: {exc}"}
+        return {"compiled": True, **value}
+
+    def _implementation_failure_fingerprint(
+        self,
+        *,
+        idea_id: str,
+        errors: list[Any],
+    ) -> dict[str, str]:
+        from .runtime_wrapper import WRAPPER_SCHEMA, WRAPPER_VERSION
+
+        current = self.store.current_dir(idea_id)
+        implementation = validate_research_implementation(
+            current,
+            plan=self._read_current_json(idea_id, "plan.json"),
+            controller_runtime=True,
+        )
+        source_hashes = implementation.get("evidence", {}).get(
+            "source_sha256",
+            {},
+        )
+        try:
+            build = self._read_current_json(idea_id, "build.json")
+        except (OSError, ValueError, json.JSONDecodeError):
+            build = {}
+        runtime_compiler = f"{WRAPPER_SCHEMA}:v{WRAPPER_VERSION}"
+        implementation_identity = {
+            "source_sha256": source_hashes,
+            "build_sha256": canonical_json_sha256(build),
+            "runtime_compiler": runtime_compiler,
+        }
+        normalized_errors = sorted(
+            " ".join(str(error).casefold().split())
+            for error in errors
+        )
+        payload = {
+            "implementation": implementation_identity,
+            "errors": normalized_errors,
+        }
+        return {
+            "fingerprint": canonical_json_sha256(payload),
+            "source_sha256": canonical_json_sha256(
+                implementation_identity
+            ),
+            "runtime_compiler": runtime_compiler,
+        }
+
+    def _block_unchanged_remote_smoke(
+        self,
+        *,
+        idea: IdeaRecord,
+        job: JobRecord,
+    ) -> bool:
+        """Fail closed before GPU allocation when Build made no source change."""
+
+        prior = idea.candidate.get(
+            "_autoresearch_v2_last_implementation_failure"
+        )
+        if not isinstance(prior, Mapping):
+            return False
+        prior_source = str(prior.get("source_sha256", "") or "")
+        prior_errors = prior.get("errors")
+        prior_compiler = str(prior.get("runtime_compiler", "") or "")
+        if (
+            not prior_source
+            or not isinstance(prior_errors, list)
+            or not prior_compiler
+        ):
+            return False
+        current = self._implementation_failure_fingerprint(
+            idea_id=idea.idea_id,
+            errors=prior_errors,
+        )
+        if (
+            current.get("source_sha256") != prior_source
+            or current.get("runtime_compiler") != prior_compiler
+        ):
+            return False
+        diagnostics = {
+            **dict(prior),
+            **current,
+            "no_progress": True,
+            "blocked_before_gpu_submit": True,
+        }
+        idea.status = IdeaStatus.QUARANTINED
+        idea.exit_reason = "remote_smoke_no_progress"
+        idea.current_job_id = ""
+        idea.last_progress_at = utc_now()
+        job.status = JobStatus.FAILED
+        job.retry_not_before = ""
+        job.result = {
+            **job.result,
+            "decision": "quarantine",
+            "reason": "remote_smoke_no_progress",
+            "failure_class": "implementation_invalid",
+            "diagnostics": diagnostics,
+        }
+        self.store.save_job(job)
+        self.store.save_idea(idea)
+        self.store.event(
+            "remote_smoke_blocked_no_progress",
+            idea_id=idea.idea_id,
+            job_id=job.job_id,
+            fingerprint=current.get("fingerprint", ""),
+            source_sha256=current.get("source_sha256", ""),
+        )
+        return True
 
     def _queue_build_repair(
         self,

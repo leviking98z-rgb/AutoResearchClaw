@@ -32,6 +32,11 @@ from .protocols import (
     compile_screening_protocol,
     infer_protocol_template,
 )
+from .runtime_wrapper import (
+    WRAPPER_FILENAME,
+    RuntimeArtifactError,
+    compile_build_output,
+)
 from .store import V2Store
 from .validation import (
     validate_execution_argv,
@@ -720,11 +725,33 @@ class BuildJobExecutor:
             max_tokens=12000,
             temperature=0.20,
         )
-        result, output, validation, implementation = self._materialize_and_validate(
-            result=result,
-            candidate=candidate,
-            plan=plan,
-        )
+        try:
+            result, output, validation, implementation = (
+                self._materialize_and_validate(
+                    result=result,
+                    candidate=candidate,
+                    plan=plan,
+                )
+            )
+        except RuntimeArtifactError as exc:
+            validation = {
+                "ok": False,
+                "errors": [
+                    {
+                        "file": "",
+                        "category": "runtime_wrapper",
+                        "message": str(exc),
+                    }
+                ],
+                "warnings": [],
+                "files_checked": [],
+            }
+            output = dict(result.value)
+            implementation = {
+                "ok": False,
+                "errors": [str(exc)],
+                "evidence": {},
+            }
         if not validation["ok"]:
             repair_errors = [
                 str(error)
@@ -735,23 +762,44 @@ class BuildJobExecutor:
                 for issue in validation.get("errors", [])
                 if str(issue.get("message", "") or "")
             )
-            if repair_errors:
+            repair = getattr(self.role, "repair", None)
+            if repair_errors and callable(repair):
                 shutil.rmtree(candidate, ignore_errors=True)
                 candidate = store.snapshot_current(attempt)
-                result = self.role.repair(
+                result = repair(
                     output,
                     repair_errors,
                     retry_context=self._validation_repair_context,
                     max_tokens=12000,
                     temperature=0.10,
                 )
-                result, output, validation, implementation = (
-                    self._materialize_and_validate(
-                        result=result,
-                        candidate=candidate,
-                        plan=plan,
+                try:
+                    result, output, validation, implementation = (
+                        self._materialize_and_validate(
+                            result=result,
+                            candidate=candidate,
+                            plan=plan,
+                        )
                     )
-                )
+                except RuntimeArtifactError as exc:
+                    validation = {
+                        "ok": False,
+                        "errors": [
+                            {
+                                "file": "",
+                                "category": "runtime_wrapper",
+                                "message": str(exc),
+                            }
+                        ],
+                        "warnings": [],
+                        "files_checked": [],
+                    }
+                    output = dict(result.value)
+                    implementation = {
+                        "ok": False,
+                        "errors": [str(exc)],
+                        "evidence": {},
+                    }
         validation["research_contract"] = implementation
         validation["ok"] = bool(
             validation.get("ok") and implementation.get("ok")
@@ -813,7 +861,7 @@ class BuildJobExecutor:
         candidate: Path,
         plan: dict[str, Any],
     ) -> tuple[Any, dict[str, Any], dict[str, Any], dict[str, Any]]:
-        output = result.value
+        output = compile_build_output(result.value)
         for filename, content in output["files"].items():
             target = (candidate / filename).resolve()
             if not target.is_relative_to(candidate.resolve()):
@@ -821,10 +869,14 @@ class BuildJobExecutor:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
         _write_json(candidate / "build.json", output)
-        validation = validate_python_tree(candidate)
+        validation = validate_python_tree(
+            candidate,
+            trusted_files={WRAPPER_FILENAME},
+        )
         implementation = validate_research_implementation(
             candidate,
             plan=plan,
+            controller_runtime=True,
         )
         validation["ok"] = bool(
             validation.get("ok") and implementation.get("ok")
@@ -842,13 +894,10 @@ scientific design, commands, model, benchmark, budgets, and overall file
 structure. Change only what is necessary to satisfy the deterministic
 Build-to-Runtime validation errors.
 
-The runtime artifacts must follow these exact Controller contracts:
-- metrics.json root: {{"result_valid": boolean, "metrics": finite-number object}}
-- runtime_evidence.model_loaded: the exact non-empty model identifier string
-- runtime_evidence.seeds: a non-empty list of scalar seed identifiers
-- criterion_results entries: {{"value": finite number, "passed": boolean}}
-- examples_by_role keys: development, screening, confirmatory
-- call_counts keys: the exact compiled call_ledger component names
+The Controller now owns the final artifact envelope and decision schema.
+Generated code must only make every measured criterion metric available as a
+finite scalar and report the exact model identifier, real datasets, examples,
+seed identifiers, and compiled call-ledger component counts.
 
 PREVIOUS PROJECT JSON:
 {json.dumps(dict(previous_value), ensure_ascii=False, indent=2)[:24000]}
@@ -897,10 +946,11 @@ Requirements:
   package boilerplate, notebooks, documentation, vendored code, or tests.
 - Reuse transformers/datasets/torch directly instead of reimplementing model,
   dataset, statistics, or orchestration libraries.
-- The runtime must write metrics.json with result_valid and metrics.
-- The runtime must write runtime_evidence.json with exact model, datasets,
-  examples, seeds, GPU count, call counts, dataset/split declarations,
-  evidence_valid, criterion_results, and the compiled gate decision.
+- The runtime must write raw metrics.json and runtime_evidence.json. The
+  Controller wraps your commands and owns the final artifact envelope,
+  criterion_results schema, dataset/split declarations, GPU count, and gate
+  decision. Your raw runtime_evidence must still report the measured model id,
+  datasets, examples, seeds, call counts, and scalar scientific metrics.
 - Smoke mode is a real integration test, not a dry run: load the declared
   pretrained LLM through the actual transformers/model loader, load at least
   one real example from a declared benchmark, move the model and tensors to
@@ -908,11 +958,9 @@ Requirements:
   write the measured artifacts. Never fake CUDA, GPU UUID, utilization, memory,
   model, dataset, or benchmark evidence; Controller-owned trusted telemetry
   independently verifies the physical execution.
-- Implement the compiled decision_contract mechanically. Every
-  validity_criteria and promotion_criteria id must appear in
-  runtime_evidence.json criterion_results with its measured value and pass
-  boolean. Retry only on invalid evidence; any valid result that does not
-  satisfy every promotion criterion must reject.
+- Emit measured values for every metric referenced by validity_criteria and
+  promotion_criteria. The Controller mechanically applies the compiled
+  operators, thresholds, and retry/promote/reject decision table.
 - The metric named by gate_statistic.name must be emitted in both metrics
   artifacts. Do not derive promotion direction from primary_metric or
   metric_direction.
