@@ -1161,17 +1161,23 @@ class ClusterBridgePool:
                 "}"
             )
             execution_env = ""
+            execution_root = remote_task_dir
         else:
             execution = f"bash -lc {shlex.quote(command)}"
             execution_env = f"env {env_text} "
+            execution_root = task_dir
+        execution_stdout_path = execution_root / "stdout.log"
+        execution_stderr_path = execution_root / "stderr.log"
+        execution_result_path = execution_root / "result.json"
         inner = (
             "set +e; "
             "trap '' HUP; "
             f"{execution_env}{execution} "
-            f"> {shlex.quote(str(stdout_path))} "
-            f"2> {shlex.quote(str(stderr_path))}; "
+            f"> {shlex.quote(str(execution_stdout_path))} "
+            f"2> {shlex.quote(str(execution_stderr_path))}; "
             "rc=$?; "
-            f"python3 - \"$rc\" {shlex.quote(str(result_path))} <<'PY'\n"
+            f"python3 - \"$rc\" "
+            f"{shlex.quote(str(execution_result_path))} <<'PY'\n"
             "import json, os, sys, time\n"
             "path=sys.argv[2]\n"
             "tmp=path+'.tmp.'+str(os.getpid())\n"
@@ -1536,12 +1542,10 @@ class ClusterBridgePool:
         )
         return (
             "set -euo pipefail; "
-            f"python3 - {shlex.quote(str(task_dir))} "
-            f"{shlex.quote(str(remote_task_dir))} "
+            f"python3 - {shlex.quote(str(remote_task_dir))} "
             f"{shlex.quote(_REMOTE_RESULT_PREFIX)} <<'PY'\n"
             "import json, os, pathlib, sys\n"
-            "root=pathlib.Path(sys.argv[1]); remote=pathlib.Path(sys.argv[2]); "
-            "prefix=sys.argv[3]\n"
+            "root=pathlib.Path(sys.argv[1]); prefix=sys.argv[2]\n"
             "result=root/'result.json'; pidfile=root/'pid'\n"
             "payload={}\n"
             "if result.is_file():\n"
@@ -1562,7 +1566,7 @@ class ClusterBridgePool:
             "    try: payload[name]=path.read_text(encoding='utf-8', "
             "errors='replace')\n"
             "    except FileNotFoundError: payload[name]=''\n"
-            "evidence=remote/'trusted_gpu_evidence.json'\n"
+            "evidence=root/'trusted_gpu_evidence.json'\n"
             "if evidence.is_file():\n"
             "    try:\n"
             "        value=json.loads(evidence.read_text(encoding='utf-8'))\n"
@@ -1589,9 +1593,16 @@ class ClusterBridgePool:
 
     def _terminate_task(self, node: ClusterNode, task_dir: Path) -> None:
         grace = self.config.task_kill_grace_sec
+        remote_task_dir = (
+            _REMOTE_TASK_ROOT
+            / self.config.pool_id
+            / "tasks"
+            / task_dir.name
+        )
         command = (
             "set -euo pipefail; "
-            f"pid=$(cat {shlex.quote(str(task_dir / 'pid'))} 2>/dev/null || true); "
+            f"pid=$(cat {shlex.quote(str(remote_task_dir / 'pid'))} "
+            "2>/dev/null || true); "
             "if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then "
             "kill -TERM -- \"-$pid\" 2>/dev/null || "
             "kill -TERM \"$pid\" 2>/dev/null || true; "

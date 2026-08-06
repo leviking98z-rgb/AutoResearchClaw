@@ -749,8 +749,12 @@ def test_async_task_uses_ray_resource_reservation(tmp_path: Path) -> None:
     assert "RESEARCHCLAW_RAY_TASK_JSON" in launch
     assert str(task_dir / "ray_task.py") not in launch
     command_group = launch.index("{")
-    stdout_redirect = launch.index(str(task_dir / "stdout.log"))
+    remote_task_dir = (
+        "/tmp/researchclaw-autoresearch-v2/test-pool/tasks/ray-reserved"
+    )
+    stdout_redirect = launch.index(f"{remote_task_dir}/stdout.log")
     assert command_group < stdout_redirect
+    assert f"{remote_task_dir}/result.json" in launch
 
 
 def test_async_ray_task_returns_remote_trusted_gpu_evidence(
@@ -781,6 +785,7 @@ def test_async_ray_task_returns_remote_trusted_gpu_evidence(
                 "ray-evidence"
             ) in command
             assert "trusted_gpu_evidence.json" in command
+            assert str(pool.state_dir) not in command
             return _result(
                 "__RESEARCHCLAW_POOL_RESULT__="
                 + json.dumps(
@@ -908,6 +913,12 @@ def test_background_task_timeout_sends_term_and_kill(tmp_path: Path) -> None:
 
     commands = [call[2] for call in client.calls if call[0] == "run"]
     assert any("kill -TERM" in command for command in commands)
+    assert any(
+        "/tmp/researchclaw-autoresearch-v2/test-pool/tasks/"
+        "timeout-task/pid" in command
+        for command in commands
+        if "kill -TERM" in command
+    )
     assert any("kill -KILL" in command for command in commands)
 
 
@@ -949,6 +960,12 @@ def test_cancel_task_terminates_running_detached_task(tmp_path: Path) -> None:
     assert pool.cancel_task("cancel-me") == result
     commands = [call[2] for call in client.calls if call[0] == "run"]
     assert any("kill -TERM" in command for command in commands)
+    assert any(
+        "/tmp/researchclaw-autoresearch-v2/test-pool/tasks/cancel-me/pid"
+        in command
+        for command in commands
+        if "kill -TERM" in command
+    )
 
 
 def test_keepalive_renews_and_reports_terminal_failure() -> None:
