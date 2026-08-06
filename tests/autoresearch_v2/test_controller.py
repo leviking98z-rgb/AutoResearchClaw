@@ -15,6 +15,7 @@ from researchclaw.autoresearch_v2.ideas import (
 from researchclaw.autoresearch_v2.jobs import JobOutcome, SimulatedJobExecutor
 from researchclaw.autoresearch_v2.models import (
     AttemptRecord,
+    AttemptStatus,
     IdeaStatus,
     JobKind,
     JobRecord,
@@ -119,6 +120,17 @@ class _VerySlowExecutor(SimulatedJobExecutor):
         return super().execute(**kwargs)
 
 
+class _ControlledExecutor:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def execute(self, **kwargs):
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        return SimulatedJobExecutor().execute(**kwargs)
+
+
 class _InterruptedExecutor:
     def execute(self, **kwargs):
         del kwargs
@@ -183,6 +195,158 @@ def test_controller_reaches_configured_parallelism(tmp_path: Path) -> None:
     assert controller.snapshot()["running_futures"] == 4
     controller.request_stop()
     controller._pool.shutdown(wait=True)
+
+
+def test_dispatch_cancels_non_current_and_inactive_jobs(
+    tmp_path: Path,
+) -> None:
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([]),
+        executors={kind: _SlowExecutor() for kind in JobKind},
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+
+    active = candidate_to_idea(_candidate(0))
+    active.status = IdeaStatus.DESIGNING
+    active.current_job_id = f"{active.idea_id}-design-current"
+    controller.store.save_idea(active)
+    current = JobRecord(
+        job_id=active.current_job_id,
+        idea_id=active.idea_id,
+        kind=JobKind.DESIGN,
+        status=JobStatus.READY,
+    )
+    superseded = JobRecord(
+        job_id=f"{active.idea_id}-design-old",
+        idea_id=active.idea_id,
+        kind=JobKind.DESIGN,
+        status=JobStatus.RETRY_WAIT,
+    )
+    controller.store.save_job(current)
+    controller.store.save_job(superseded)
+
+    inactive = candidate_to_idea(_candidate(1))
+    inactive.status = IdeaStatus.QUARANTINED
+    inactive.current_job_id = f"{inactive.idea_id}-build"
+    controller.store.save_idea(inactive)
+    stale = JobRecord(
+        job_id=inactive.current_job_id,
+        idea_id=inactive.idea_id,
+        kind=JobKind.BUILD,
+        status=JobStatus.READY,
+    )
+    controller.store.save_job(stale)
+
+    controller._dispatch()
+
+    assert controller.store.get_job(current.job_id).status is JobStatus.RUNNING
+    durable_superseded = controller.store.get_job(superseded.job_id)
+    durable_stale = controller.store.get_job(stale.job_id)
+    assert durable_superseded.status is JobStatus.CANCELLED
+    assert durable_superseded.result["reason"] == "superseded_job"
+    assert durable_stale.status is JobStatus.CANCELLED
+    assert durable_stale.result["reason"] == "inactive_idea"
+    assert controller.store.get_idea(inactive.idea_id).current_job_id == ""
+
+    controller.request_stop()
+    controller._pool.shutdown(wait=True)
+
+
+def test_initialize_cancels_stale_running_job_before_recovery(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    inactive = candidate_to_idea(_candidate(0))
+    inactive.status = IdeaStatus.REJECTED
+    inactive.current_job_id = f"{inactive.idea_id}-pilot"
+    store.save_idea(inactive)
+    stale = JobRecord(
+        job_id=inactive.current_job_id,
+        idea_id=inactive.idea_id,
+        kind=JobKind.PILOT,
+        status=JobStatus.RUNNING,
+        requires_gpu=False,
+        attempt=1,
+        attempt_id=f"{inactive.current_job_id}-attempt-01",
+    )
+    store.save_job(stale)
+    attempt = AttemptRecord(
+        attempt_id=stale.attempt_id,
+        idea_id=inactive.idea_id,
+        job_id=stale.job_id,
+        number=1,
+        status=AttemptStatus.RUNNING,
+    )
+    store.save_attempt(attempt)
+
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([]),
+        executors={kind: SimulatedJobExecutor() for kind in JobKind},
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+
+    durable = controller.store.get_job(stale.job_id)
+    durable_attempt = controller.store.get_attempt(stale.attempt_id)
+    assert durable.status is JobStatus.CANCELLED
+    assert durable.result["reason"] == "inactive_idea"
+    assert durable_attempt.status is AttemptStatus.CANCELLED
+    assert controller.store.get_idea(inactive.idea_id).current_job_id == ""
+    assert not controller.store.list_jobs(statuses={JobStatus.RETRY_WAIT})
+    controller.close()
+
+
+def test_completed_local_future_cannot_resurrect_cancelled_job(
+    tmp_path: Path,
+) -> None:
+    executor = _ControlledExecutor()
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([]),
+        executors={JobKind.DESIGN: executor},
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    idea = candidate_to_idea(_candidate(0))
+    idea.status = IdeaStatus.DESIGNING
+    idea.current_job_id = f"{idea.idea_id}-design"
+    controller.store.save_idea(idea)
+    job = JobRecord(
+        job_id=idea.current_job_id,
+        idea_id=idea.idea_id,
+        kind=JobKind.DESIGN,
+        status=JobStatus.READY,
+    )
+    controller.store.save_job(job)
+    controller._dispatch()
+    assert executor.started.wait(timeout=1)
+
+    idea = controller.store.get_idea(idea.idea_id)
+    idea.status = IdeaStatus.QUARANTINED
+    controller.store.save_idea(idea)
+    controller._reconcile_current_jobs()
+    assert controller.store.get_job(job.job_id).status is JobStatus.CANCELLED
+
+    executor.release.set()
+    controller._running[job.job_id].future.result(timeout=2)
+    controller._collect_finished()
+
+    durable_job = controller.store.get_job(job.job_id)
+    durable_idea = controller.store.get_idea(idea.idea_id)
+    durable_attempt = controller.store.get_attempt(
+        f"{job.job_id}-attempt-01"
+    )
+    assert durable_job.status is JobStatus.CANCELLED
+    assert durable_idea.status is IdeaStatus.QUARANTINED
+    assert durable_attempt.status is AttemptStatus.CANCELLED
+    controller.close()
 
 
 class _AlwaysFail:

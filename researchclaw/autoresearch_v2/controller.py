@@ -189,6 +189,7 @@ class V2Controller:
         self.store.recover_filesystem_commits()
         self._restore_budget_pause_state()
         self._sync_gpu_budget_pause_state()
+        self._reconcile_current_jobs()
         self._recover_interrupted_jobs()
         self._initialized = True
         self.store.start_database_backup_loop()
@@ -327,6 +328,7 @@ class V2Controller:
         self._collect_research_memory_sync()
         self._collect_gpu_finished()
         self._sync_gpu_budget_pause_state()
+        self._reconcile_current_jobs()
         self._enforce_liveness_budgets()
         if not self.store.control_requested("pause") and not self._stop:
             # Static generators are test/simulation fixtures and complete
@@ -785,6 +787,136 @@ class V2Controller:
                 remote_smoke=remote_smoke,
             )
 
+    def _reconcile_current_jobs(self) -> None:
+        """Enforce exactly one runnable Job for every active Idea.
+
+        Jobs are durable and may outlive the Idea transition that created
+        them. A retry-wait Job from a rejected/quarantined Idea, or an older
+        Job superseded by ``current_job_id``, must never consume CPU/GPU
+        capacity after restart. Reconcile before recovery and every dispatch
+        tick so the database invariant is repaired deterministically.
+        """
+
+        runnable_statuses = {
+            JobStatus.READY,
+            JobStatus.RETRY_WAIT,
+            JobStatus.RUNNING,
+        }
+        if self.gpu_broker is not None:
+            for job in self.store.list_jobs(statuses={JobStatus.CANCELLED}):
+                if not job.result.get("remote_cancel_pending"):
+                    continue
+                if self._cancel_remote_stale_job(job):
+                    job.result = {
+                        **job.result,
+                        "remote_cancel_pending": False,
+                    }
+                    self.store.save_job(job)
+                    self.store.event(
+                        "stale_remote_job_cancelled",
+                        idea_id=job.idea_id,
+                        job_id=job.job_id,
+                        task_id=job.submitted_task_id,
+                    )
+        ideas = {
+            idea.idea_id: idea for idea in self.store.list_ideas()
+        }
+        for job in self.store.list_jobs(statuses=runnable_statuses):
+            idea = ideas.get(job.idea_id)
+            if idea is None:
+                reason = "missing_idea"
+            elif idea.status not in ACTIVE_IDEA_STATUSES:
+                reason = "inactive_idea"
+            elif idea.current_job_id != job.job_id:
+                reason = "superseded_job"
+            else:
+                continue
+
+            prior_status = job.status
+            remote_cancel_pending = False
+            if job.status is JobStatus.RUNNING:
+                running = self._running.get(job.job_id)
+                if running is not None:
+                    if running.future.cancel():
+                        self._running.pop(job.job_id, None)
+                if (
+                    job.requires_gpu
+                    and job.submitted_task_id
+                    and not self._cancel_remote_stale_job(job)
+                ):
+                    remote_cancel_pending = True
+                attempt = (
+                    self.store.get_attempt(job.attempt_id)
+                    if job.attempt_id
+                    else None
+                )
+                if (
+                    attempt is not None
+                    and attempt.status
+                    in {
+                        AttemptStatus.CREATED,
+                        AttemptStatus.RUNNING,
+                        AttemptStatus.VALIDATING,
+                    }
+                ):
+                    attempt.status = AttemptStatus.CANCELLED
+                    attempt.error = reason
+                    attempt.finished_at = utc_now()
+                    self.store.save_attempt(attempt)
+            job.status = JobStatus.CANCELLED
+            job.retry_not_before = ""
+            job.result = {
+                **job.result,
+                "decision": "cancel",
+                "reason": reason,
+                "remote_cancel_pending": remote_cancel_pending,
+            }
+            self.store.save_job(job)
+            if (
+                idea is not None
+                and idea.status not in ACTIVE_IDEA_STATUSES
+                and idea.current_job_id == job.job_id
+            ):
+                idea.current_job_id = ""
+                self.store.save_idea(idea)
+            self.store.event(
+                "stale_job_cancelled",
+                idea_id=job.idea_id,
+                job_id=job.job_id,
+                reason=reason,
+                prior_status=prior_status.value,
+                remote_cancel_pending=remote_cancel_pending,
+            )
+
+    def _cancel_remote_stale_job(self, job: JobRecord) -> bool:
+        broker = self.gpu_broker
+        if broker is None or not job.submitted_task_id:
+            return False
+        try:
+            if job.job_id not in broker.leases:
+                broker.adopt(
+                    job,
+                    task_id=job.submitted_task_id,
+                    allocated_gpus=int(
+                        job.result.get(
+                            "allocated_gpus",
+                            max(1, job.min_gpus),
+                        )
+                        or 1
+                    ),
+                )
+            broker.cancel(job.job_id)
+        except Exception as exc:  # noqa: BLE001
+            self.store.event(
+                "stale_job_cancel_failed",
+                idea_id=job.idea_id,
+                job_id=job.job_id,
+                task_id=job.submitted_task_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return False
+        return True
+
     @staticmethod
     def _initial_job_result(
         *,
@@ -852,6 +984,7 @@ class V2Controller:
         return False
 
     def _dispatch(self) -> None:
+        self._reconcile_current_jobs()
         running_llm = self._running_llm_count()
         running_cpu = len(self._running)
         running_gpu = len(self.gpu_broker.leases) if self.gpu_broker else 0
@@ -1282,6 +1415,39 @@ class V2Controller:
                 continue
             idea = self.store.get_idea(job.idea_id)
             if idea is None:
+                continue
+            if (
+                job.status is JobStatus.CANCELLED
+                or idea.status not in ACTIVE_IDEA_STATUSES
+                or idea.current_job_id != job.job_id
+            ):
+                attempt = (
+                    self.store.get_attempt(job.attempt_id)
+                    if job.attempt_id
+                    else None
+                )
+                if (
+                    attempt is not None
+                    and attempt.status
+                    in {
+                        AttemptStatus.CREATED,
+                        AttemptStatus.RUNNING,
+                        AttemptStatus.VALIDATING,
+                    }
+                ):
+                    attempt.status = AttemptStatus.CANCELLED
+                    attempt.error = str(
+                        job.result.get("reason", "stale_job")
+                    )
+                    attempt.finished_at = utc_now()
+                    self.store.save_attempt(attempt)
+                self.store.event(
+                    "stale_gpu_result_discarded",
+                    idea_id=job.idea_id,
+                    job_id=job.job_id,
+                    attempt_id=job.attempt_id,
+                    task_id=str(result.get("task_id", "")),
+                )
                 continue
             attempt = (
                 self.store.get_attempt(job.attempt_id)
@@ -2359,6 +2525,30 @@ class V2Controller:
             idea = self.store.get_idea(job.idea_id)
             if idea is None:
                 del self._running[job_id]
+                continue
+            if (
+                job.status is JobStatus.CANCELLED
+                or idea.status not in ACTIVE_IDEA_STATUSES
+                or idea.current_job_id != job.job_id
+            ):
+                try:
+                    running.future.result()
+                except Exception:  # noqa: BLE001, S110
+                    pass
+                if attempt.status is not AttemptStatus.CANCELLED:
+                    attempt.status = AttemptStatus.CANCELLED
+                    attempt.error = str(
+                        job.result.get("reason", "stale_job")
+                    )
+                    attempt.finished_at = utc_now()
+                    self.store.save_attempt(attempt)
+                del self._running[job_id]
+                self.store.event(
+                    "stale_local_result_discarded",
+                    idea_id=job.idea_id,
+                    job_id=job.job_id,
+                    attempt_id=attempt.attempt_id,
+                )
                 continue
             try:
                 outcome = running.future.result()

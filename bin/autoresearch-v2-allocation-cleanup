@@ -53,15 +53,26 @@ if (( status_rc != 0 )); then
   exit "$status_rc"
 fi
 
-read -r allocation_owner allocation_status < <(
+parsed="$(
   python3 -c '
 import json, sys
-value = json.load(sys.stdin)
+text = sys.stdin.read()
+start = text.find("{")
+if start < 0:
+    raise SystemExit("resource status did not contain JSON")
+value, _ = json.JSONDecoder().raw_decode(text[start:])
 if isinstance(value.get("allocation"), dict):
     value = value["allocation"]
 print(value.get("owner", ""), value.get("status", ""))
 ' <<<"$status"
-)
+)"
+parse_rc=$?
+if (( parse_rc != 0 )); then
+  echo "$(stamp) cleanup-status-json-invalid"
+  printf '%s\n' "$status"
+  exit 4
+fi
+read -r allocation_owner allocation_status <<<"$parsed"
 if [[ "$allocation_owner" != "$owner" ]]; then
   echo "$(stamp) cleanup-refused owner-mismatch"
   exit 3

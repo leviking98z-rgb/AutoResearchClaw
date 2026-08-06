@@ -40,6 +40,7 @@ from researchclaw.cluster import (
 from researchclaw.factory.io import append_jsonl
 
 _REMOTE_RESULT_PREFIX = "__RESEARCHCLAW_POOL_RESULT__="
+_REMOTE_TASK_ROOT = Path("/tmp/researchclaw-autoresearch-v2")
 
 
 class ClusterPoolError(RuntimeError):
@@ -1113,10 +1114,9 @@ class ClusterBridgePool:
             "sys.exit(int(result['returncode']))\n"
         )
         if num_gpus or num_cpus != 1:
-            trusted_gpu_evidence_path = task_dir / "trusted_gpu_evidence.json"
-            remote_task_dir = Path(
-                "/tmp/researchclaw-autoresearch-v2"
-            ) / self.config.pool_id / "tasks" / task_id
+            remote_task_dir = (
+                _REMOTE_TASK_ROOT / self.config.pool_id / "tasks" / task_id
+            )
             remote_payload_path = remote_task_dir / "ray_task.json"
             remote_task_script = remote_task_dir / "ray_task.py"
             remote_trusted_gpu_evidence_path = (
@@ -1153,15 +1153,12 @@ class ClusterBridgePool:
                 "RESEARCHCLAW_RAY_TASK_JSON\n"
             )
             execution = (
+                "{\n"
                 f"{staged_files}"
                 f"{shlex.quote(self.config.ray.python)} "
                 f"{shlex.quote(str(remote_task_script))} "
-                f"{shlex.quote(str(remote_payload_path))}; "
-                "rc=$?; "
-                f"if [ -f {shlex.quote(str(remote_trusted_gpu_evidence_path))} ]; "
-                f"then cat {shlex.quote(str(remote_trusted_gpu_evidence_path))} "
-                f"> {shlex.quote(str(trusted_gpu_evidence_path))}; fi; "
-                "exit \"$rc\""
+                f"{shlex.quote(str(remote_payload_path))}\n"
+                "}"
             )
             execution_env = ""
         else:
@@ -1531,12 +1528,20 @@ class ClusterBridgePool:
         return metadata
 
     def _task_probe_command(self, task_dir: Path) -> str:
+        remote_task_dir = (
+            _REMOTE_TASK_ROOT
+            / self.config.pool_id
+            / "tasks"
+            / task_dir.name
+        )
         return (
             "set -euo pipefail; "
             f"python3 - {shlex.quote(str(task_dir))} "
+            f"{shlex.quote(str(remote_task_dir))} "
             f"{shlex.quote(_REMOTE_RESULT_PREFIX)} <<'PY'\n"
             "import json, os, pathlib, sys\n"
-            "root=pathlib.Path(sys.argv[1]); prefix=sys.argv[2]\n"
+            "root=pathlib.Path(sys.argv[1]); remote=pathlib.Path(sys.argv[2]); "
+            "prefix=sys.argv[3]\n"
             "result=root/'result.json'; pidfile=root/'pid'\n"
             "payload={}\n"
             "if result.is_file():\n"
@@ -1557,6 +1562,16 @@ class ClusterBridgePool:
             "    try: payload[name]=path.read_text(encoding='utf-8', "
             "errors='replace')\n"
             "    except FileNotFoundError: payload[name]=''\n"
+            "evidence=remote/'trusted_gpu_evidence.json'\n"
+            "if evidence.is_file():\n"
+            "    try:\n"
+            "        value=json.loads(evidence.read_text(encoding='utf-8'))\n"
+            "        if isinstance(value, dict): "
+            "payload['trusted_gpu_evidence']=value\n"
+            "        else: payload['trusted_gpu_evidence_error']="
+            "'evidence is not a JSON object'\n"
+            "    except Exception as exc:\n"
+            "        payload['trusted_gpu_evidence_error']=str(exc)\n"
             "print(prefix+json.dumps(payload, sort_keys=True))\n"
             "PY"
         )
@@ -1604,6 +1619,12 @@ class ClusterBridgePool:
         timed_out: bool,
         pid: int | None,
     ) -> PoolTaskResult:
+        trusted_gpu_evidence = payload.get("trusted_gpu_evidence")
+        if not isinstance(trusted_gpu_evidence, Mapping):
+            trusted_gpu_evidence = (
+                _read_json_mapping(task_dir / "trusted_gpu_evidence.json")
+                or None
+            )
         result = PoolTaskResult(
             task_id=task_id,
             returncode=int(payload.get("returncode", 124 if timed_out else -1)),
@@ -1616,10 +1637,11 @@ class ClusterBridgePool:
             stderr_path=str(task_dir / "stderr.log"),
             result_path=str(task_dir / "result.json"),
             pid=pid,
-            trusted_gpu_evidence=_read_json_mapping(
-                task_dir / "trusted_gpu_evidence.json"
-            )
-            or None,
+            trusted_gpu_evidence=(
+                dict(trusted_gpu_evidence)
+                if isinstance(trusted_gpu_evidence, Mapping)
+                else None
+            ),
         )
         summary_path = task_dir / "summary.json"
         _atomic_json_write(summary_path, asdict(result))

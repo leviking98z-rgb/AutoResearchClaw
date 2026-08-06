@@ -748,6 +748,76 @@ def test_async_task_uses_ray_resource_reservation(tmp_path: Path) -> None:
     assert "RESEARCHCLAW_RAY_TASK_PY" in launch
     assert "RESEARCHCLAW_RAY_TASK_JSON" in launch
     assert str(task_dir / "ray_task.py") not in launch
+    command_group = launch.index("{")
+    stdout_redirect = launch.index(str(task_dir / "stdout.log"))
+    assert command_group < stdout_redirect
+
+
+def test_async_ray_task_returns_remote_trusted_gpu_evidence(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    pool = ClusterBridgePool(
+        _config(tmp_path, node_count=1),
+        client=client,
+    )
+    pool.claim(start_keepalive=False)
+    pool._prepared = True
+    evidence = {
+        "schema": "autoresearch_v2.trusted_gpu_evidence",
+        "version": 1,
+        "task_id": "ray-evidence",
+        "allocated_gpus": 1,
+        "gpu_uuids": ["GPU-unit-test"],
+    }
+
+    def handler(node: ClusterNode, command: str) -> BridgeResult:
+        del node
+        if "nohup setsid bash" in command:
+            return _result("77\n")
+        if "__RESEARCHCLAW_POOL_RESULT__" in command:
+            assert (
+                "/tmp/researchclaw-autoresearch-v2/test-pool/tasks/"
+                "ray-evidence"
+            ) in command
+            assert "trusted_gpu_evidence.json" in command
+            return _result(
+                "__RESEARCHCLAW_POOL_RESULT__="
+                + json.dumps(
+                    {
+                        "state": "finished",
+                        "pid": 77,
+                        "returncode": 0,
+                        "stdout.log": "trained\n",
+                        "stderr.log": "",
+                        "trusted_gpu_evidence": evidence,
+                    }
+                )
+                + "\n"
+            )
+        return _result()
+
+    client.run_handler = handler
+    pool.submit_task(
+        "python train.py",
+        timeout_sec=10,
+        task_id="ray-evidence",
+        num_gpus=1,
+        num_cpus=2,
+    )
+
+    assert pool.probe_task("ray-evidence").state == "finished"
+    result = pool.collect_task("ray-evidence")
+    assert result.trusted_gpu_evidence == evidence
+    summary = json.loads(
+        (
+            pool.state_dir
+            / "tasks"
+            / "ray-evidence"
+            / "summary.json"
+        ).read_text()
+    )
+    assert summary["trusted_gpu_evidence"] == evidence
 
 
 def test_async_task_resource_change_conflicts_with_existing_task(
