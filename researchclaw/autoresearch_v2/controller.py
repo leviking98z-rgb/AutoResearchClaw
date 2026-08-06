@@ -191,6 +191,7 @@ class V2Controller:
         self._sync_gpu_budget_pause_state()
         self._reconcile_current_jobs()
         self._recover_interrupted_jobs()
+        self.store.recover_retry_candidate_workspaces()
         self._initialized = True
         self.store.start_database_backup_loop()
         self.store.event(

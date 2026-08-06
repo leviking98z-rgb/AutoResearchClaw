@@ -355,6 +355,66 @@ class V2Store:
         self._recover_filesystem_commits()
         self._recover_orphan_attempt_candidates()
 
+    def recover_retry_candidate_workspaces(self) -> None:
+        """Quarantine candidates left by refunded/retryable attempts.
+
+        A durable attempt row can survive a controller interruption before its
+        parent Job is updated. Startup recovery may then refund that attempt
+        number and clear ``job.attempt_id``. The next dispatch intentionally
+        reuses the number, so its old candidate must be preserved under an
+        audit name rather than blocking ``snapshot_current`` forever.
+        """
+
+        if self._writer_lock_stream is None:
+            raise RuntimeError(
+                "retry workspace recovery requires the controller writer lock"
+            )
+        for job in self.list_jobs(
+            statuses={JobStatus.READY, JobStatus.RETRY_WAIT}
+        ):
+            next_number = job.attempt + 1
+            attempt_id = f"{job.job_id}-attempt-{next_number:02d}"
+            attempt = self.get_attempt(attempt_id)
+            candidate = (
+                self.idea_dir(job.idea_id)
+                / "attempts"
+                / job.job_id
+                / f"attempt-{next_number:02d}"
+                / "candidate"
+            )
+            if not candidate.is_dir():
+                continue
+            if (
+                attempt is not None
+                and attempt.status is AttemptStatus.ACCEPTED
+            ):
+                # An accepted attempt is reconciled by the Controller before a
+                # new attempt is scheduled; never move accepted evidence.
+                continue
+            quarantine = candidate.with_name(
+                "candidate.interrupted-retry"
+            )
+            if quarantine.exists():
+                quarantine = candidate.with_name(
+                    "candidate.interrupted-retry."
+                    + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+                )
+            try:
+                os.replace(candidate, quarantine)
+            except FileNotFoundError:
+                continue
+            self.event(
+                "retry_attempt_candidate_quarantined",
+                idea_id=job.idea_id,
+                job_id=job.job_id,
+                attempt_id=attempt_id,
+                candidate=str(candidate),
+                quarantine_path=str(quarantine),
+                attempt_status=(
+                    attempt.status.value if attempt is not None else ""
+                ),
+            )
+
     def _recover_orphan_attempt_candidates(self) -> None:
         """Quarantine candidate workspaces that have no durable attempt row.
 

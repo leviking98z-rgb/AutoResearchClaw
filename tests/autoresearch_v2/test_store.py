@@ -9,6 +9,7 @@ from researchclaw.autoresearch_v2.models import (
     IdeaRecord,
     JobKind,
     JobRecord,
+    JobStatus,
 )
 from researchclaw.autoresearch_v2.store import V2Store
 
@@ -349,6 +350,81 @@ def test_writer_recovery_keeps_durable_attempt_candidate(
     assert (candidate / "partial.json").read_text(encoding="utf-8") == "{}"
     assert not list(
         store.attempt_dir(attempt).glob("candidate.interrupted-orphan*")
+    )
+
+
+def test_retry_workspace_recovery_quarantines_reused_attempt_candidate(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="idea-test-pilot",
+        idea_id=idea.idea_id,
+        kind=JobKind.PILOT,
+        status=JobStatus.RETRY_WAIT,
+        attempt=3,
+        attempt_id="",
+    )
+    store.save_job(job)
+    attempt = store.create_attempt(job)
+    attempt.status = AttemptStatus.RUNNING
+    store.save_attempt(attempt)
+    candidate = store.snapshot_current(attempt)
+    (candidate / "partial.json").write_text("{}", encoding="utf-8")
+
+    store.acquire_writer_lock()
+    try:
+        store.recover_retry_candidate_workspaces()
+    finally:
+        store.release_writer_lock()
+
+    assert not candidate.exists()
+    quarantined = (
+        store.attempt_dir(attempt) / "candidate.interrupted-retry"
+    )
+    assert (quarantined / "partial.json").read_text(encoding="utf-8") == "{}"
+    assert store.snapshot_current(attempt).is_dir()
+    events = store.list_events(limit=10)
+    assert any(
+        event["event_type"]
+        == "retry_attempt_candidate_quarantined"
+        and event["attempt_id"] == attempt.attempt_id
+        for event in events
+    )
+
+
+def test_retry_workspace_recovery_preserves_accepted_candidate(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="idea-test-pilot",
+        idea_id=idea.idea_id,
+        kind=JobKind.PILOT,
+        status=JobStatus.RETRY_WAIT,
+    )
+    store.save_job(job)
+    attempt = store.create_attempt(job)
+    candidate = store.prepare_candidate(attempt)
+    (candidate / "result.json").write_text("{}", encoding="utf-8")
+    attempt.status = AttemptStatus.ACCEPTED
+    store.save_attempt(attempt)
+
+    store.acquire_writer_lock()
+    try:
+        store.recover_retry_candidate_workspaces()
+    finally:
+        store.release_writer_lock()
+
+    assert (candidate / "result.json").is_file()
+    assert not list(
+        store.attempt_dir(attempt).glob("candidate.interrupted-retry*")
     )
 
 
