@@ -637,6 +637,7 @@ def build_clusterbridge_broker_from_pool(
     target_utilization: float,
     probe_failure_threshold: int = 3,
     task_env: Mapping[str, str] | None = None,
+    lease_registry_path: str | Path | None = None,
 ) -> GPUBroker:
     """Build a broker around an already claimed and prepared pool object."""
 
@@ -653,11 +654,14 @@ def build_clusterbridge_broker_from_pool(
         nodes=nodes,
         expected_total_gpus=total_gpus,
     )
-    state_dir = Path(
-        getattr(pool, "state_dir", Path.cwd())
-    ).resolve()
+    state_dir = Path(getattr(pool, "state_dir", Path.cwd())).resolve()
+    registry_path = (
+        Path(lease_registry_path).expanduser().resolve()
+        if lease_registry_path is not None
+        else shared_registry_path(state_dir, pool_id)
+    )
     lease_registry = SharedGPULeaseRegistry(
-        shared_registry_path(state_dir, pool_id),
+        registry_path,
         pool_id=pool_id,
         total_gpus=total_gpus,
         reserved_gpus=reserved_gpus,

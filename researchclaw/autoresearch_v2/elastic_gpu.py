@@ -558,6 +558,10 @@ class ResourceManagedGPUManager:
             target_utilization=self.config.target_utilization,
             probe_failure_threshold=self.config.probe_failure_threshold,
             task_env=self.task_env,
+            lease_registry_path=(
+                Path("/root/.local/state/autoresearch-v2/gpu-leases")
+                / f"{pool_id}.sqlite3"
+            ),
         )
         with self._lock:
             if self._closed:
