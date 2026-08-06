@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from researchclaw.experiment.clusterbridge_pool import ClusterPoolError
@@ -118,6 +119,11 @@ def build_production_controller(
                 probe_failure_threshold=(
                     config.gpu.probe_failure_threshold
                 ),
+                task_env={
+                    key: value
+                    for key in config.execution.allowed_env_keys
+                    if (value := os.environ.get(key)) is not None
+                },
             )
         except ClusterPoolError as exc:
             # Idea generation, Design, and Build do not require a live physical

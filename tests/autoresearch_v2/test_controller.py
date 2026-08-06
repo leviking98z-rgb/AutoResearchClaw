@@ -183,6 +183,47 @@ class _AlwaysFail:
         return JobOutcome(False, "retry", "deterministic failure", {})
 
 
+class _InfrastructureFail:
+    def execute(self, **kwargs):
+        del kwargs
+        return JobOutcome(
+            False,
+            "retry",
+            "temporary infrastructure failure",
+            {
+                "failure_class": "infrastructure_transient",
+                "consume_attempt": False,
+            },
+        )
+
+
+def test_infrastructure_retry_does_not_spend_scientific_attempt(
+    tmp_path: Path,
+) -> None:
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([_candidate(0)]),
+        executors={kind: _InfrastructureFail() for kind in JobKind},
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    controller.tick()
+    for _ in range(50):
+        controller._collect_finished()
+        jobs = controller.store.list_jobs()
+        if jobs and jobs[0].status is JobStatus.RETRY_WAIT:
+            break
+        time.sleep(0.002)
+    job = controller.store.list_jobs()[0]
+    assert job.status is JobStatus.RETRY_WAIT
+    assert job.attempt == 1
+    assert job.attempt_limit == 2
+    assert job.result["infrastructure_retries"] == 1
+    controller.request_stop()
+    controller._pool.shutdown(wait=True)
+
+
 def test_bounded_retry_quarantines_one_idea_without_stopping_others(
     tmp_path: Path,
 ) -> None:

@@ -44,6 +44,7 @@ from .store import V2Store
 from .validation import (
     validate_execution_argv,
     validate_experiment_artifacts,
+    validate_research_implementation,
     validate_runtime_against_contract,
 )
 
@@ -598,13 +599,10 @@ class V2Controller:
                     if remote_smoke
                     else self._job_timeout(idea, kind)
                 ),
-                result=(
-                    {
-                        "remote_smoke": True,
-                        "next_kind": JobKind.PILOT.value,
-                    }
-                    if remote_smoke
-                    else {}
+                result=self._initial_job_result(
+                    idea=idea,
+                    kind=kind,
+                    remote_smoke=remote_smoke,
                 ),
             )
             idea.current_job_id = job.job_id
@@ -619,6 +617,27 @@ class V2Controller:
                 kind=dispatch_kind.value,
                 remote_smoke=remote_smoke,
             )
+
+    @staticmethod
+    def _initial_job_result(
+        *,
+        idea: IdeaRecord,
+        kind: JobKind,
+        remote_smoke: bool,
+    ) -> dict[str, Any]:
+        if remote_smoke:
+            return {
+                "remote_smoke": True,
+                "next_kind": JobKind.PILOT.value,
+            }
+        if kind is JobKind.BUILD:
+            feedback = idea.candidate.pop(
+                "_autoresearch_v2_build_repair_feedback",
+                None,
+            )
+            if isinstance(feedback, Mapping):
+                return {"remote_smoke_repair": dict(feedback)}
+        return {}
 
     def _job_timeout(self, idea: IdeaRecord, kind: JobKind) -> float:
         if kind not in {JobKind.PILOT, JobKind.SCALE}:
@@ -771,6 +790,18 @@ class V2Controller:
                 attempt.error = f"{type(exc).__name__}: {exc}"
                 attempt.finished_at = utc_now()
                 self.store.save_attempt(attempt)
+                if (
+                    self._is_remote_smoke_job(job)
+                    and "Build-to-Runtime contract" in attempt.error
+                ):
+                    self._queue_build_repair(
+                        idea=idea,
+                        job=job,
+                        attempt=attempt,
+                        reason="remote_smoke_preflight_invalid",
+                        diagnostics={"error": attempt.error},
+                    )
+                    continue
                 outcome = JobOutcome(
                     False,
                     "retry",
@@ -936,6 +967,20 @@ class V2Controller:
     ) -> tuple[str, Path]:
         build_path = candidate / "build.json"
         build = json.loads(build_path.read_text(encoding="utf-8"))
+        if not self._simulation_mode:
+            plan = json.loads(
+                (candidate / "plan.json").read_text(encoding="utf-8")
+            )
+            implementation = validate_research_implementation(
+                candidate,
+                plan=plan,
+            )
+            if not implementation.get("ok"):
+                raise ValueError(
+                    "generated implementation violates the "
+                    "Build-to-Runtime contract: "
+                    + "; ".join(implementation.get("errors", []))
+                )
         raw_argv = build["commands"][mode]
         if isinstance(raw_argv, str):
             argv = shlex.split(raw_argv)
@@ -1032,6 +1077,8 @@ class V2Controller:
             "expected=%d visible=%r' % (expected, visible))\n"
             "env['PYTHONUNBUFFERED']='1'\n"
             "env['TOKENIZERS_PARALLELISM']='false'\n"
+            "env.setdefault('HF_HUB_OFFLINE','1')\n"
+            "env.setdefault('TRANSFORMERS_OFFLINE','1')\n"
             "raise SystemExit(subprocess.run("
             "contract['argv'], cwd=candidate, env=env, shell=False).returncode)"
         )
@@ -1332,6 +1379,15 @@ class V2Controller:
             smoke_errors.append(
                 "remote smoke runtime gpu_count must match allocated_gpus"
             )
+        plan = self._read_current_json(idea.idea_id, "plan.json")
+        smoke_errors.extend(
+            validate_runtime_against_contract(
+                plan=plan,
+                runtime_evidence=dict(evidence),
+                allocated_gpus=allocated_gpus,
+                mode="smoke",
+            )
+        )
         try:
             trusted_allocated = int(
                 trusted_evidence.get("allocated_gpus", -1)
@@ -1452,17 +1508,47 @@ class V2Controller:
             )
             attempt.finished_at = utc_now()
             self.store.save_attempt(attempt)
-            outcome = JobOutcome(
-                False,
-                "retry",
-                "remote_smoke_invalid",
-                {
-                    "returncode": returncode,
-                    "validation": validation,
-                    "pool_result": dict(result),
-                },
-                elapsed_sec=elapsed_sec,
+            infrastructure_code = self._remote_smoke_infrastructure_code(
+                result=result,
+                stderr=stderr_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                ),
+                returncode=returncode,
             )
+            if infrastructure_code:
+                outcome = JobOutcome(
+                    False,
+                    "retry",
+                    "remote_smoke_infrastructure_retry",
+                    {
+                        "failure_class": "infrastructure_transient",
+                        "failure_code": infrastructure_code,
+                        "consume_attempt": False,
+                        "returncode": returncode,
+                        "validation": validation,
+                        "pool_result": dict(result),
+                    },
+                    elapsed_sec=elapsed_sec,
+                )
+            else:
+                idea.gpu_seconds_spent += allocated_gpus * max(
+                    0.0,
+                    elapsed_sec,
+                )
+                self._queue_build_repair(
+                    idea=idea,
+                    job=job,
+                    attempt=attempt,
+                    reason="remote_smoke_invalid",
+                    diagnostics={
+                        "failure_class": "runtime_contract_invalid",
+                        "failure_code": "remote_smoke_validation_failed",
+                        "returncode": returncode,
+                        "errors": validation["errors"],
+                    },
+                )
+                return
         idea.gpu_seconds_spent += allocated_gpus * max(0.0, elapsed_sec)
         self._apply_outcome(
             idea,
@@ -1477,6 +1563,109 @@ class V2Controller:
                 elapsed_sec=0.0,
             ),
         )
+
+    def _queue_build_repair(
+        self,
+        *,
+        idea: IdeaRecord,
+        job: JobRecord,
+        attempt: AttemptRecord,
+        reason: str,
+        diagnostics: Mapping[str, Any],
+    ) -> None:
+        """Return an invalid implementation to Build instead of rerunning it."""
+
+        try:
+            repair_count = int(
+                idea.candidate.get(
+                    "_autoresearch_v2_build_repair_count",
+                    0,
+                )
+                or 0
+            ) + 1
+        except (TypeError, ValueError):
+            repair_count = 1
+        if repair_count > self.config.budgets.max_build_attempts:
+            job.attempt = max(job.attempt, job.attempt_limit)
+            self._apply_outcome(
+                idea,
+                job,
+                attempt,
+                JobOutcome(
+                    False,
+                    "retry",
+                    "build_repair_budget_exhausted",
+                    {
+                        "failure_class": "implementation_invalid",
+                        "failure_code": reason,
+                        "diagnostics": dict(diagnostics),
+                    },
+                ),
+            )
+            return
+        feedback = {
+            "source_job_id": job.job_id,
+            "source_attempt_id": attempt.attempt_id,
+            "reason": reason,
+            "repair_count": repair_count,
+            "diagnostics": dict(diagnostics),
+        }
+        idea.candidate[
+            "_autoresearch_v2_build_repair_count"
+        ] = repair_count
+        idea.candidate[
+            "_autoresearch_v2_build_repair_feedback"
+        ] = feedback
+        idea.status = IdeaStatus.BUILDING
+        idea.current_job_id = ""
+        idea.exit_reason = ""
+        idea.last_progress_at = utc_now()
+        job.status = JobStatus.FAILED
+        job.retry_not_before = ""
+        job.result = {
+            **job.result,
+            "decision": "repair_build",
+            "reason": reason,
+            "failure_class": "implementation_invalid",
+            "diagnostics": dict(diagnostics),
+        }
+        self.store.save_transition(
+            idea=idea,
+            job=job,
+            attempt=attempt,
+            event_type="remote_smoke_returned_to_build",
+            payload={
+                "reason": reason,
+                "repair_count": repair_count,
+                "diagnostics": dict(diagnostics),
+            },
+        )
+
+    @staticmethod
+    def _remote_smoke_infrastructure_code(
+        *,
+        result: Mapping[str, Any],
+        stderr: str,
+        returncode: int,
+    ) -> str:
+        """Classify failures outside the generated experiment's control."""
+
+        if bool(result.get("timed_out")) or returncode == 124:
+            if any(
+                marker in stderr
+                for marker in (
+                    "Network is unreachable",
+                    "Connection timed out",
+                    "Temporary failure in name resolution",
+                )
+            ):
+                return "dependency_network_unreachable"
+            return "gpu_task_timeout"
+        if str(result.get("pool_state", "") or "") in {"lost", "unknown"}:
+            return "gpu_task_lost"
+        if result.get("error"):
+            return "gpu_pool_collect_failed"
+        return ""
 
     def _attest_gpu_execution(
         self,
@@ -1689,6 +1878,14 @@ class V2Controller:
         }
         attempt.finished_at = attempt.finished_at or utc_now()
         if not outcome.success:
+            consume_attempt = outcome.result.get("consume_attempt", True)
+            if consume_attempt is False:
+                infrastructure_retries = int(
+                    job.result.get("infrastructure_retries", 0) or 0
+                ) + 1
+                job.result["infrastructure_retries"] = infrastructure_retries
+                if infrastructure_retries <= 5:
+                    job.attempt_limit += 1
             if job.attempt < job.attempt_limit:
                 job.status = JobStatus.RETRY_WAIT
                 delay_sec = (

@@ -171,6 +171,7 @@ class GPUBroker:
         lease_registry: SharedGPULeaseRegistry | None = None,
         owner_id: str | None = None,
         lease_heartbeat_interval_sec: float | None = None,
+        task_env: Mapping[str, str] | None = None,
     ) -> None:
         self.pool = pool
         self.scheduler = scheduler
@@ -178,6 +179,10 @@ class GPUBroker:
             1,
             int(probe_failure_threshold),
         )
+        self.task_env = {
+            str(key): str(value)
+            for key, value in (task_env or {}).items()
+        }
         self.leases: dict[str, GPULease] = {}
         self.lease_registry = lease_registry
         self.owner_id = owner_id or (
@@ -257,6 +262,7 @@ class GPUBroker:
                 num_gpus=decision.allocated_gpus,
                 num_cpus=2,
                 env={
+                    **self.task_env,
                     "AUTORESEARCH_V2_IDEA_ID": job.idea_id,
                     "AUTORESEARCH_V2_JOB_ID": job.job_id,
                     "AUTORESEARCH_V2_ATTEMPT_ID": job.attempt_id,
@@ -551,6 +557,7 @@ def build_clusterbridge_broker(
     max_share_per_idea: float,
     target_utilization: float,
     probe_failure_threshold: int = 3,
+    task_env: Mapping[str, str] | None = None,
     restore_state: bool = True,
 ) -> GPUBroker:
     """Adopt a prepared ClusterBridge/Ray pool without owning its lifecycle."""
@@ -614,6 +621,7 @@ def build_clusterbridge_broker(
         ),
         probe_failure_threshold=probe_failure_threshold,
         lease_registry=lease_registry,
+        task_env=task_env,
     )
 
 

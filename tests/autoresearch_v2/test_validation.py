@@ -964,6 +964,75 @@ def test_research_implementation_requires_real_loaders(
     assert "no real dataset/benchmark loader call found" in value["errors"]
 
 
+def test_research_implementation_rejects_known_runtime_schema_mismatches(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "main.py").write_text(
+        """
+import json
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM
+
+AutoModelForCausalLM.from_pretrained("Qwen")
+load_dataset("gsm8k")
+criterion_results = {
+    "minimum_completed_examples": {"value": 1, "pass": True},
+    "primary_effect": {"value": None, "pass": False},
+}
+call_counts = {"mutation_calls": 1}
+examples_by_role = {"development_diagnostic": 1, "screening": 1}
+runtime_evidence = {
+    "model_loaded": True,
+    "datasets_loaded": ["gsm8k"],
+    "examples_processed": 2,
+    "examples_by_role": examples_by_role,
+    "gpu_count": 1,
+    "seeds": [0],
+    "gate_decision": "reject",
+    "metrics": {"gain": 0.0},
+    "call_counts": call_counts,
+    "criterion_results": criterion_results,
+}
+metrics = {"result_valid": True, "gain": 0.0}
+with open("metrics.json", "w") as f:
+    json.dump(metrics, f)
+with open("runtime_evidence.json", "w") as f:
+    json.dump(runtime_evidence, f)
+""",
+        encoding="utf-8",
+    )
+    plan = {
+        "models": ["Qwen"],
+        "datasets": ["GSM8K"],
+        "required_runtime_evidence": [
+            "model_loaded",
+            "datasets_loaded",
+            "examples_processed",
+            "examples_by_role",
+            "gpu_count",
+            "seeds",
+            "gate_decision",
+            "metrics",
+            "call_counts",
+            "criterion_results",
+        ],
+        "validity_criteria": [{"id": "minimum_completed_examples"}],
+        "promotion_criteria": [{"id": "primary_effect"}],
+        "call_ledger": {
+            "components": [
+                {"name": "candidate_generation"},
+                {"name": "final_evaluation"},
+            ]
+        },
+    }
+    value = validate_research_implementation(tmp_path, plan=plan)
+    assert not value["ok"]
+    assert any("result_valid and metrics" in error for error in value["errors"])
+    assert any("model_loaded" in error for error in value["errors"])
+    assert any("passed, not pass" in error for error in value["errors"])
+    assert any("finite numbers" in error for error in value["errors"])
+
+
 def _production_runtime_plan() -> dict[str, object]:
     return _screening_plan()
 

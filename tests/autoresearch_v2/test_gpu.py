@@ -100,6 +100,34 @@ def test_broker_owns_keepalive_but_never_releases_adopted_pool() -> None:
     assert pool.released == 0
 
 
+def test_broker_forwards_trusted_task_environment() -> None:
+    class Pool:
+        def __init__(self) -> None:
+            self.request: dict[str, object] = {}
+
+        def submit_task(self, command: str, **kwargs):
+            self.request = {"command": command, **kwargs}
+            return {"task_id": kwargs["task_id"]}
+
+    pool = Pool()
+    broker = GPUBroker(
+        pool=pool,
+        scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        task_env={
+            "https_proxy": "http://proxy.invalid:3128",
+            "HF_HOME": "/root/.cache/huggingface",
+        },
+    )
+    job = _job("idea-env", (1, 1, 1))
+    job.command = "true"
+    decision = broker.submit(job, priorities={})
+    assert decision.admitted
+    environment = pool.request["env"]
+    assert environment["https_proxy"] == "http://proxy.invalid:3128"
+    assert environment["HF_HOME"] == "/root/.cache/huggingface"
+    assert environment["AUTORESEARCH_V2_IDEA_ID"] == "idea-env"
+
+
 def test_transient_probe_failure_keeps_lease() -> None:
     class Pool:
         def __init__(self) -> None:

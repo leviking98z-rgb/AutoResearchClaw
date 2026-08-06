@@ -66,11 +66,12 @@ def validate_research_implementation(
     """Verify the generated project contains a real model/benchmark path."""
 
     errors: list[str] = []
-    evidence = {
+    evidence: dict[str, Any] = {
         "model_loader_calls": [],
         "dataset_loader_calls": [],
         "artifact_writes": [],
         "source_sha256": {},
+        "runtime_schema": {},
     }
     python_files = sorted(root.rglob("*.py"))
     for path in python_files:
@@ -147,6 +148,12 @@ def validate_research_implementation(
     ):
         if marker in combined:
             errors.append(f"forbidden synthetic implementation marker: {marker}")
+    schema_errors, schema_evidence = _validate_generated_runtime_schema(
+        python_files,
+        plan=plan,
+    )
+    errors.extend(schema_errors)
+    evidence["runtime_schema"] = schema_evidence
     declared_models = [
         str(item.get("name", "") if isinstance(item, dict) else item)
         for item in plan.get("models", [])
@@ -158,6 +165,303 @@ def validate_research_implementation(
     evidence["declared_models"] = declared_models
     evidence["declared_datasets"] = declared_datasets
     return {"ok": not errors, "errors": errors, "evidence": evidence}
+
+
+def _validate_generated_runtime_schema(
+    python_files: list[Path],
+    *,
+    plan: Mapping[str, Any],
+) -> tuple[list[str], dict[str, Any]]:
+    """Catch deterministic artifact-schema errors before consuming a GPU."""
+
+    errors: list[str] = []
+    evidence: dict[str, Any] = {
+        "metrics_payloads": 0,
+        "runtime_payloads": 0,
+        "criterion_ids": [],
+        "call_count_keys": [],
+        "example_role_keys": [],
+    }
+    assignments: dict[str, list[ast.expr]] = {}
+    subscript_assignments: dict[str, dict[str, list[ast.expr]]] = {}
+    trees: list[ast.AST] = []
+    for path in python_files:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        trees.append(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+            )
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    assignments.setdefault(target.id, []).append(value)
+                elif (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and isinstance(target.slice, ast.Constant)
+                    and isinstance(target.slice.value, str)
+                ):
+                    subscript_assignments.setdefault(
+                        target.value.id,
+                        {},
+                    ).setdefault(target.slice.value, []).append(value)
+
+    def dict_keys(node: ast.AST | None) -> set[str] | None:
+        if not isinstance(node, ast.Dict):
+            return None
+        keys: set[str] = set()
+        for key in node.keys:
+            if not isinstance(key, ast.Constant) or not isinstance(
+                key.value,
+                str,
+            ):
+                return None
+            keys.add(key.value)
+        return keys
+
+    def resolve_dicts(node: ast.AST | None) -> list[ast.Dict]:
+        if isinstance(node, ast.Dict):
+            return [node]
+        if isinstance(node, ast.Name):
+            return [
+                value
+                for value in assignments.get(node.id, [])
+                if isinstance(value, ast.Dict)
+            ]
+        return []
+
+    def resolved_keys(node: ast.AST | None) -> set[str] | None:
+        direct = dict_keys(node)
+        if direct is not None:
+            return direct
+        if not isinstance(node, ast.Name):
+            return None
+        keys: set[str] = set()
+        resolved = False
+        for value in assignments.get(node.id, []):
+            literal = dict_keys(value)
+            if literal is not None:
+                keys.update(literal)
+                resolved = True
+                continue
+            if isinstance(value, ast.DictComp):
+                for generator in value.generators:
+                    if not isinstance(generator.iter, (ast.Tuple, ast.List)):
+                        continue
+                    for item in generator.iter.elts:
+                        if isinstance(item, ast.Constant) and isinstance(
+                            item.value,
+                            str,
+                        ):
+                            keys.add(item.value)
+                            resolved = True
+        keys.update(subscript_assignments.get(node.id, {}))
+        return keys if resolved or keys else None
+
+    def contains_string(node: ast.AST, suffix: str) -> bool:
+        return any(
+            isinstance(item, ast.Constant)
+            and isinstance(item.value, str)
+            and item.value.endswith(suffix)
+            for item in ast.walk(node)
+        )
+
+    def output_payloads(name: str) -> list[ast.Dict]:
+        payloads: list[ast.Dict] = []
+        for tree in trees:
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.With, ast.AsyncWith)):
+                    continue
+                open_handles: set[str] = set()
+                for item in node.items:
+                    call = item.context_expr
+                    if not isinstance(call, ast.Call) or _call_name(
+                        call.func
+                    ) not in {"open", "Path.open"}:
+                        continue
+                    if not contains_string(call, name):
+                        continue
+                    if isinstance(item.optional_vars, ast.Name):
+                        open_handles.add(item.optional_vars.id)
+                if not open_handles:
+                    continue
+                for statement in node.body:
+                    for child in ast.walk(statement):
+                        if not isinstance(child, ast.Call):
+                            continue
+                        if (
+                            _call_name(child.func) == "json.dump"
+                            and len(child.args) >= 2
+                            and isinstance(child.args[1], ast.Name)
+                            and child.args[1].id in open_handles
+                        ):
+                            payloads.extend(resolve_dicts(child.args[0]))
+        return payloads
+
+    metrics_payloads = output_payloads("metrics.json")
+    runtime_payloads = output_payloads("runtime_evidence.json")
+    evidence["metrics_payloads"] = len(metrics_payloads)
+    evidence["runtime_payloads"] = len(runtime_payloads)
+    for payload in metrics_payloads:
+        keys = dict_keys(payload)
+        if keys is not None and not {"result_valid", "metrics"}.issubset(keys):
+            errors.append(
+                "metrics.json payload must contain result_valid and metrics"
+            )
+    for payload in runtime_payloads:
+        keys = dict_keys(payload)
+        if keys is None:
+            continue
+        required = set(plan.get("required_runtime_evidence", []))
+        required.update(
+            {
+                "model_loaded",
+                "datasets_loaded",
+                "examples_processed",
+                "seeds",
+                "gpu_count",
+                "gate_decision",
+                "metrics",
+            }
+        )
+        missing = sorted(required - keys)
+        if missing:
+            errors.append(
+                "runtime_evidence.json payload missing fields: "
+                + ", ".join(missing)
+            )
+
+    for node in assignments.get("runtime_evidence", []):
+        if not isinstance(node, ast.Dict):
+            continue
+        values = {
+            str(key.value): value
+            for key, value in zip(node.keys, node.values)
+            if isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+        }
+        model_loaded = values.get("model_loaded")
+        if isinstance(model_loaded, ast.Constant) and isinstance(
+            model_loaded.value,
+            bool,
+        ):
+            errors.append(
+                "runtime_evidence.model_loaded must identify the model, "
+                "not use a boolean"
+            )
+        roles = resolved_keys(values.get("examples_by_role"))
+        if roles is not None:
+            evidence["example_role_keys"] = sorted(roles)
+            invalid = sorted(
+                role
+                for role in roles
+                if _dataset_role(role)
+                not in {"development", "screening", "confirmatory"}
+            )
+            if invalid:
+                errors.append(
+                    "examples_by_role contains non-canonical roles: "
+                    + ", ".join(invalid)
+                )
+        calls = resolved_keys(values.get("call_counts"))
+        if calls is not None:
+            evidence["call_count_keys"] = sorted(calls)
+            ledger = plan.get("call_ledger")
+            components = (
+                ledger.get("components", [])
+                if isinstance(ledger, Mapping)
+                else []
+            )
+            expected = {
+                str(component.get("name", "") or "")
+                for component in components
+                if isinstance(component, Mapping)
+                and str(component.get("name", "") or "")
+            }
+            missing = sorted(expected - calls)
+            if missing:
+                errors.append(
+                    "call_counts missing compiled components: "
+                    + ", ".join(missing)
+                )
+
+    expected_criteria = {
+        str(item.get("id", "") or "")
+        for field in ("validity_criteria", "promotion_criteria")
+        for item in plan.get(field, [])
+        if isinstance(item, Mapping) and str(item.get("id", "") or "")
+    }
+    criterion_containers = (
+        "criterion_results",
+        "results",
+    )
+    for values in [
+        value
+        for name in criterion_containers
+        for value in assignments.get(name, [])
+    ]:
+        if not isinstance(values, ast.Dict):
+            continue
+        criterion_ids = dict_keys(values)
+        if criterion_ids is not None:
+            for name in criterion_containers:
+                criterion_ids.update(subscript_assignments.get(name, {}))
+            evidence["criterion_ids"] = sorted(criterion_ids)
+            missing = sorted(expected_criteria - criterion_ids)
+            if missing:
+                errors.append(
+                    "criterion_results missing compiled criteria: "
+                    + ", ".join(missing)
+                )
+        for result in values.values:
+            if not isinstance(result, ast.Dict):
+                continue
+            keys = dict_keys(result)
+            if keys is not None and "pass" in keys and "passed" not in keys:
+                errors.append(
+                    "criterion_results entries must use passed, not pass"
+                )
+            for key, value in zip(result.keys, result.values):
+                if (
+                    isinstance(key, ast.Constant)
+                    and key.value == "value"
+                    and isinstance(value, ast.Constant)
+                    and value.value is None
+                ):
+                    errors.append(
+                        "criterion_results values must be finite numbers, "
+                        "not null"
+                    )
+    for name in criterion_containers:
+        for result_values in subscript_assignments.get(name, {}).values():
+            for result in result_values:
+                if not isinstance(result, ast.Dict):
+                    continue
+                keys = dict_keys(result)
+                if keys is not None and "pass" in keys and "passed" not in keys:
+                    errors.append(
+                        "criterion_results entries must use passed, not pass"
+                    )
+                for key, value in zip(result.keys, result.values):
+                    if (
+                        isinstance(key, ast.Constant)
+                        and key.value == "value"
+                        and isinstance(value, ast.Constant)
+                        and value.value is None
+                    ):
+                        errors.append(
+                            "criterion_results values must be finite numbers, "
+                            "not null"
+                        )
+    return _deduplicate(errors), evidence
 
 
 def _call_name(node: ast.expr) -> str:
