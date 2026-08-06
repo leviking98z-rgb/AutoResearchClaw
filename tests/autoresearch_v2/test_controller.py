@@ -4,6 +4,7 @@ import threading
 import time
 from pathlib import Path
 
+import researchclaw.autoresearch_v2.controller as controller_module
 from researchclaw.autoresearch_v2.config import V2Config
 from researchclaw.autoresearch_v2.controller import V2Controller
 from researchclaw.autoresearch_v2.ideas import (
@@ -294,6 +295,28 @@ def test_report_job_uses_one_outer_attempt(tmp_path: Path) -> None:
     )
     assert report.attempt_limit == 1
     controller.request_stop()
+    controller._pool.shutdown(wait=True)
+
+
+def test_detached_gateway_calls_count_toward_llm_capacity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([]),
+        executors={kind: _SlowExecutor() for kind in JobKind},
+        sleep=lambda _: None,
+    )
+    monkeypatch.setattr(
+        controller_module,
+        "_live_model_gateway_calls",
+        lambda: 3,
+    )
+    controller._simulation_mode = False
+
+    assert controller._running_llm_count() == 3
     controller._pool.shutdown(wait=True)
 
 

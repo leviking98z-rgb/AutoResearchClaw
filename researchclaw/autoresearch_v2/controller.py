@@ -480,7 +480,7 @@ class V2Controller:
         }
 
     def _running_llm_count(self) -> int:
-        return sum(
+        local = sum(
             1
             for entry in self._running.values()
             if (
@@ -488,6 +488,14 @@ class V2Controller:
                 and job.kind in _LLM_KINDS
             )
         ) + int(self._idea_generation is not None)
+        if self._simulation_mode:
+            return local
+        # A service restart deliberately detaches non-cancellable CLI-backed
+        # LLM calls and refunds their durable Jobs. Those old bridge requests
+        # can still be consuming the shared local model gateway for several
+        # minutes, so count live gateway children as well as this process's
+        # in-memory futures before dispatching replacements.
+        return max(local, _live_model_gateway_calls())
 
     def _admit_reservoir(self) -> None:
         ideas = self.store.list_ideas()
@@ -2594,6 +2602,55 @@ def _parse_time(value: str) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed
+
+
+def _live_model_gateway_calls() -> int:
+    """Count live plain-LLM CLI calls owned by the local bridge service."""
+
+    bridge_pids: set[int] = set()
+    process_rows: list[tuple[int, int, str]] = []
+    proc = Path("/proc")
+    try:
+        entries = tuple(proc.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+            closing = stat.rfind(")")
+            ppid = int(stat[closing + 2 :].split()[1])
+            cmdline = (
+                (entry / "cmdline")
+                .read_bytes()
+                .replace(b"\0", b" ")
+                .decode("utf-8", errors="replace")
+            )
+        except (OSError, ValueError, IndexError):
+            continue
+        pid = int(entry.name)
+        process_rows.append((pid, ppid, cmdline))
+        if "claude-bridge" in cmdline and (
+            "researchclaw" in cmdline or "uvicorn app:app" in cmdline
+        ):
+            bridge_pids.add(pid)
+    if not bridge_pids:
+        return 0
+    count = 0
+    for _, ppid, cmdline in process_rows:
+        if ppid not in bridge_pids:
+            continue
+        if (
+            "codebuddy -p" in cmdline
+            and "plain language-model API backend" in cmdline
+            and "--tools  --strict-mcp-config" in cmdline
+        ):
+            count += 1
+    return count
 
 
 class _MissingExecutor:
