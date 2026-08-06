@@ -48,7 +48,7 @@ class ConcurrencyConfig:
 class BudgetConfig:
     max_build_attempts: int = 2
     max_job_attempts: int = 3
-    max_design_revisions: int = 1
+    max_design_revisions: int = 2
     pilot_gpu_hours: float = 2.0
     scale_gpu_hours: float = 32.0
     max_llm_tokens_per_idea: int = 2_000_000
@@ -188,7 +188,7 @@ class V2Config:
             ),
             max_job_attempts=int(budgets_raw.get("max_job_attempts", 3)),
             max_design_revisions=int(
-                budgets_raw.get("max_design_revisions", 1)
+                budgets_raw.get("max_design_revisions", 2)
             ),
             pilot_gpu_hours=float(
                 budgets_raw.get("pilot_gpu_hours", 2.0)

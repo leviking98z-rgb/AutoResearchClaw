@@ -25,7 +25,7 @@ def test_config_accepts_parallel_defaults() -> None:
     assert config.population.active_idea_target == 6
     assert config.concurrency.max_gpu_jobs == 6
     assert config.budgets.max_job_attempts == 3
-    assert config.budgets.max_design_revisions == 1
+    assert config.budgets.max_design_revisions == 2
 
 
 def test_config_rejects_impossible_target() -> None:

@@ -30,7 +30,7 @@ autoresearch_v2:
     max_build_attempts: 2
     # Design repairs happen inside one immutable attempt so the worker and
     # Decision board can converge without restarting from another Job attempt.
-    max_design_revisions: 1
+    max_design_revisions: 2
     max_job_attempts: 3
     pilot_gpu_hours: 2
     scale_gpu_hours: 32
