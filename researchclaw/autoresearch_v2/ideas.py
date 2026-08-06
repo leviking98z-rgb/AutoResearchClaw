@@ -854,6 +854,21 @@ Recent and reusable literature evidence from InfoHub:
 Each candidate must test a mechanism of LLM/agent recursive self-improvement,
 not merely benchmark a prompt. Favor ideas whose cheap pilot can falsify the
 premise in <=2 GPU-hours before scale-up. Preserve valuable negative results.
+Only propose an Idea if one concrete implementation-ready screening protocol
+fits the supported protocol families and all of these constraints:
+- exactly one public benchmark in the Pilot;
+- one open-weight subject model, one seed, one GPU, and 16-32 paired examples;
+- two primary arms plus an independent no-self-improvement reference;
+- a complete fixed algorithm with explicit pairing, update order, tie/zero
+  handling, endpoint denominator, and non-adaptive frozen threshold;
+- no hidden-label tuning, no confirmatory access before Scale, and no endpoint
+  data reused for selection, memory, calibration, or thresholds;
+- one attainable coarse primary threshold and at most one support criterion;
+- complete-case validity: partial/missing pairs are operationally invalid,
+  while zero events, absent classes, undefined scientific ratios, flat
+  outcomes, CI crossing, or futility are valid rejects, never retries;
+- the complete Pilot fits in at most 512 model calls and 90 minutes.
+If the mechanism cannot be isolated under those bounds, do not propose it.
 
 Return:
 {{

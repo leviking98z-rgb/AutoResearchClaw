@@ -426,6 +426,23 @@ Scientific responsibilities that remain yours:
 - never use confirmatory labels/assertions for tuning, selection, calibration,
   prompts, memory, inheritance, or stopping thresholds before Scale. Scale may
   present confirmatory inputs for generation and score them exactly once.
+- keep the Pilot deliberately minimal: one public benchmark, one open-weight
+  subject model, one seed, one GPU, 16-32 complete paired examples, two primary
+  arms plus one independent no-self-improvement reference, at most 512 model
+  calls, and at most one primary plus one support promotion criterion;
+- specify the complete executable algorithm in the model-owned text fields:
+  input partition, candidate/update order, frozen parameters, pairing, random
+  streams, selection/promotion rule, tie/duplicate/unscorable handling, metric
+  numerator and denominator, and comparable outcome for every arm;
+- use complete-case operational validity when missing pairs could alter the
+  coarse gate. Scientific zero events, absent classes, undefined ratios,
+  low variation, CI crossing, or futility are valid rejects, not retry;
+- keep endpoint data independent of adaptation and selection. If screening
+  outcomes drive cross-example state, define a separate frozen evaluation
+  partition for the endpoint instead of scoring the adaptation stream itself.
+- defer extra baselines, ablations, datasets, and stronger claims to Scale;
+  do not list them as Pilot measurements unless their exact calls are in the
+  ledger and they are required for the one go/no-go question.
 
 Mechanical fields that the Controller owns and will overwrite:
 - dataset roles and stable split identifiers;

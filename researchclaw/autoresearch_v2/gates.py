@@ -142,6 +142,11 @@ effect. Instead require:
 - a precise unit of analysis and paired/comparable outcomes;
 - 2-3 primary arms with an independent no-self-improvement control;
 - exact, internally consistent sample/call arithmetic;
+- a deliberately minimal one-benchmark, one-model, one-seed Pilot with 16-32
+  complete paired examples and at most 512 model calls;
+- an implementation-complete algorithm: frozen inputs/parameters, update and
+  evaluation order, pairing/random streams, selection rule, tie/duplicate/
+  unscorable handling, and an explicit numerator/denominator for every metric;
 - a raw endpoint direction kept distinct from the signed gate statistic;
 - a threshold no finer than finite-sample metric resolution and a typed
   conjunction of every promotion criterion;
@@ -156,6 +161,10 @@ effect. Instead require:
 
 Still fail closed on leakage, missing controls, impossible compute, ambiguous
 outcomes, manipulated metrics, or a pilot framed as confirmatory evidence.
+Do not request extra Pilot baselines, ablations, datasets, precision, or
+bibliographic coverage when the one coarse go/no-go question is already
+identified; record those as Scale follow-ups. Judge the exact compiled
+screening contract, not a stronger idealized study.
 Check novelty evidence, falsifiability, controls, metric alignment, screening
 discrimination, and compute feasibility. Grounded closest-paper evidence has
 already passed deterministic preflight: do not require an exhaustive
