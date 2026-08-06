@@ -177,25 +177,29 @@ class ResourceManagedGPUManager:
         self._state = "starting"
         self._closed = False
         self._prepare_thread: threading.Thread | None = None
+        self._renew_thread: threading.Thread | None = None
+        self._reconcile_thread: threading.Thread | None = None
         atexit.register(self._shutdown_hook)
 
     @property
     def broker(self) -> GPUBroker | None:
-        with self._lock:
-            return self._broker
+        # Pointer reads are atomic under CPython. Keep this non-blocking because
+        # the background resource-manager RPC may be waiting on the shared
+        # control plane while the Controller still needs to heartbeat.
+        return self._broker
 
     @property
     def configured_capacity(self) -> int:
-        with self._lock:
-            if self._allocation is not None:
-                return int(
-                    self._allocation.get(
-                        "gpu_count",
-                        self.elastic.desired_gpus,
-                    )
-                    or self.elastic.desired_gpus
+        allocation = self._allocation
+        if allocation is not None:
+            return int(
+                allocation.get(
+                    "gpu_count",
+                    self.elastic.desired_gpus,
                 )
-            return self.elastic.desired_gpus
+                or self.elastic.desired_gpus
+            )
+        return self.elastic.desired_gpus
 
     def bootstrap(self) -> None:
         """Try once immediately; failure remains retryable on later ticks."""
@@ -204,6 +208,34 @@ class ResourceManagedGPUManager:
 
     def reconcile(self, *, force: bool = False) -> bool:
         """Reconcile allocation, lease renewal, pool readiness and broker."""
+
+        if not self._prepare_async:
+            return self._reconcile_sync(force=force)
+        with self._lock:
+            if self._closed:
+                return False
+            now = self._monotonic()
+            if not force and now < self._next_reconcile:
+                return False
+            thread = self._reconcile_thread
+            if thread is not None and thread.is_alive():
+                return False
+            self._next_reconcile = (
+                now + self.elastic.reconcile_interval_sec
+            )
+            self._reconcile_thread = threading.Thread(
+                target=self._reconcile_worker,
+                name="autoresearch-v2-gpu-reconcile",
+                daemon=True,
+            )
+            self._reconcile_thread.start()
+        return False
+
+    def _reconcile_worker(self) -> None:
+        self._reconcile_sync(force=True)
+
+    def _reconcile_sync(self, *, force: bool = False) -> bool:
+        """Blocking implementation used by tests and the background worker."""
 
         to_close: GPUBroker | None = None
         early_result: bool | None = None
@@ -274,13 +306,7 @@ class ResourceManagedGPUManager:
                         to_close = self._take_broker()
                     self._allocation = dict(allocation)
                     if now >= self._next_renew:
-                        self.client.renew(
-                            allocation_id,
-                            ttl_min=self.elastic.renew_ttl_min,
-                        )
-                        self._next_renew = (
-                            now + self.elastic.renew_interval_sec
-                        )
+                        self._start_renew(allocation_id)
                     if self._broker is None:
                         self._start_attach(allocation)
                     if self._broker is not None:
@@ -317,6 +343,18 @@ class ResourceManagedGPUManager:
         thread = self._prepare_thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5.0)
+        renew_thread = self._renew_thread
+        if (
+            renew_thread is not None
+            and renew_thread is not threading.current_thread()
+        ):
+            renew_thread.join(timeout=5.0)
+        reconcile_thread = self._reconcile_thread
+        if (
+            reconcile_thread is not None
+            and reconcile_thread is not threading.current_thread()
+        ):
+            reconcile_thread.join(timeout=5.0)
 
     def _shutdown_hook(self) -> None:
         """Stop pool renewal on abrupt interpreter exit without releasing."""
@@ -337,22 +375,55 @@ class ResourceManagedGPUManager:
                 pass
 
     def snapshot(self) -> dict[str, Any]:
-        with self._lock:
-            allocation = dict(self._allocation or {})
-            return {
-                "mode": "resource_manager",
-                "state": self._state,
-                "desired_gpus": self.elastic.desired_gpus,
-                "min_gpus": self.elastic.min_gpus,
-                "max_gpus": self.elastic.max_gpus,
-                "allocation_id": allocation.get("id", ""),
-                "allocated_gpus": int(
-                    allocation.get("gpu_count", 0) or 0
-                ),
-                "nodes": list(allocation.get("nodes", ()) or ()),
-                "last_error": self._last_error,
-                "request_pending": self._request_pending,
-            }
+        allocation = dict(self._allocation or {})
+        return {
+            "mode": "resource_manager",
+            "state": self._state,
+            "desired_gpus": self.elastic.desired_gpus,
+            "min_gpus": self.elastic.min_gpus,
+            "max_gpus": self.elastic.max_gpus,
+            "allocation_id": allocation.get("id", ""),
+            "allocated_gpus": int(
+                allocation.get("gpu_count", 0) or 0
+            ),
+            "nodes": list(allocation.get("nodes", ()) or ()),
+            "last_error": self._last_error,
+            "request_pending": self._request_pending,
+        }
+
+    def _start_renew(self, allocation_id: str) -> None:
+        """Renew the allocation off the controller heartbeat thread."""
+
+        thread = getattr(self, "_renew_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        # Schedule the next attempt immediately. The worker records any
+        # failure and pulls the next attempt forward to the reconcile cadence.
+        self._next_renew = (
+            self._monotonic() + self.elastic.renew_interval_sec
+        )
+        self._renew_thread = threading.Thread(
+            target=self._renew_worker,
+            args=(allocation_id,),
+            name="autoresearch-v2-gpu-renew",
+            daemon=True,
+        )
+        self._renew_thread.start()
+
+    def _renew_worker(self, allocation_id: str) -> None:
+        try:
+            self.client.renew(
+                allocation_id,
+                ttl_min=self.elastic.renew_ttl_min,
+            )
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                self._next_renew = min(
+                    self._next_renew,
+                    self._monotonic()
+                    + self.elastic.reconcile_interval_sec,
+                )
 
     def _select_allocation(
         self,

@@ -344,6 +344,71 @@ def test_later_reconcile_hot_attaches_granted_allocation(
     assert manager.snapshot()["allocated_gpus"] == 16
 
 
+def test_renewal_does_not_block_reconcile(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingClient(_FakeResourceClient):
+        def renew(self, allocation_id: str, *, ttl_min: int) -> None:
+            started.set()
+            release.wait(timeout=2)
+            super().renew(allocation_id, ttl_min=ttl_min)
+
+    client = _BlockingClient()
+    client.allocations = [_allocation()]
+    pools = _PoolFactory()
+    brokers = _BrokerFactory()
+    manager = ResourceManagedGPUManager(
+        config.gpu,
+        client=client,
+        pool_factory=pools,
+        broker_factory=brokers,
+        monotonic=lambda: 0.0,
+        prepare_async=False,
+    )
+
+    manager.bootstrap()
+
+    assert started.wait(timeout=1)
+    assert manager.broker is brokers.brokers[0]
+    release.set()
+    manager.close()
+
+
+def test_async_resource_snapshot_never_blocks_status_reads(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingClient(_FakeResourceClient):
+        def snapshot(self) -> dict[str, Any]:
+            started.set()
+            release.wait(timeout=2)
+            return super().snapshot()
+
+    client = _BlockingClient()
+    manager = ResourceManagedGPUManager(
+        config.gpu,
+        client=client,
+        pool_factory=_PoolFactory(),
+        broker_factory=_BrokerFactory(),
+        monotonic=lambda: 0.0,
+        prepare_async=True,
+    )
+
+    manager.bootstrap()
+
+    assert started.wait(timeout=1)
+    assert manager.broker is None
+    assert manager.configured_capacity == 16
+    assert manager.snapshot()["state"] == "starting"
+    release.set()
+    manager.close()
+
+
 def test_allocation_change_replaces_broker_and_updates_capacity(
     tmp_path: Path,
 ) -> None:
