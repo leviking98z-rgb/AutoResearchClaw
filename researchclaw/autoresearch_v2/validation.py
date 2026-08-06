@@ -403,6 +403,7 @@ def _validate_generated_runtime_schema(
         "criterion_results",
         "results",
     )
+    static_criterion_objects = 0
     for values in [
         value
         for name in criterion_containers
@@ -424,6 +425,7 @@ def _validate_generated_runtime_schema(
         for result in values.values:
             if not isinstance(result, ast.Dict):
                 continue
+            static_criterion_objects += 1
             keys = dict_keys(result)
             if keys is not None and "pass" in keys and "passed" not in keys:
                 errors.append(
@@ -445,6 +447,7 @@ def _validate_generated_runtime_schema(
             for result in result_values:
                 if not isinstance(result, ast.Dict):
                     continue
+                static_criterion_objects += 1
                 keys = dict_keys(result)
                 if keys is not None and "pass" in keys and "passed" not in keys:
                     errors.append(
@@ -461,6 +464,15 @@ def _validate_generated_runtime_schema(
                             "criterion_results values must be finite numbers, "
                             "not null"
                         )
+    if expected_criteria and static_criterion_objects == 0:
+        combined = "\n".join(
+            ast.unparse(tree)
+            for tree in trees
+        )
+        if '"pass"' in combined or "'pass'" in combined:
+            errors.append(
+                "criterion_results entries must use passed, not pass"
+            )
     return _deduplicate(errors), evidence
 
 
