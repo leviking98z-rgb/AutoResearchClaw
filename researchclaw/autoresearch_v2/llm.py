@@ -121,6 +121,33 @@ class StructuredRole:
             )
         raise ValueError(f"structured role failed validation: {error}")
 
+    def repair(
+        self,
+        previous_value: Mapping[str, Any],
+        errors: list[str],
+        *,
+        retry_context: Callable[
+            [Mapping[str, Any], list[str]], str
+        ],
+        max_tokens: int,
+        temperature: float,
+    ) -> StructuredResult:
+        """Run a bounded structured repair from the rejected JSON itself.
+
+        ``call`` intentionally raises after exhausting its local attempts, but
+        the caller may still own a broader revision budget.  Exposing this
+        method lets that outer loop continue from the exact rejected object
+        instead of discarding it and asking the model to redesign from
+        scratch.
+        """
+
+        return self.call(
+            retry_context(previous_value, errors),
+            max_tokens=max_tokens,
+            temperature=temperature,
+            retry_context=retry_context,
+        )
+
 
 class RoleRouter:
     """Create exactly three model-tier clients without importing old control."""

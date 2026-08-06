@@ -126,17 +126,66 @@ class DesignJobExecutor:
         )
         total_tokens = 0
         design_revisions: list[dict[str, Any]] = []
+        pending_draft: dict[str, Any] | None = None
+        pending_errors: list[str] = []
         for revision in range(self.max_revisions + 1):
-            result = self.role.call(
-                prompt,
-                max_tokens=10000,
-                temperature=0.25 if revision == 0 else 0.10,
-                retry_context=self._validation_repair_context,
-            )
+            try:
+                if pending_draft is None:
+                    result = self.role.call(
+                        prompt,
+                        max_tokens=10000,
+                        temperature=0.25 if revision == 0 else 0.10,
+                        retry_context=self._validation_repair_context,
+                    )
+                else:
+                    repair = getattr(self.role, "repair", None)
+                    if not callable(repair):
+                        raise ValueError(
+                            "structured role cannot repair a compiler-rejected "
+                            "draft"
+                        )
+                    result = repair(
+                        pending_draft,
+                        pending_errors,
+                        retry_context=self._validation_repair_context,
+                        max_tokens=10000,
+                        temperature=0.10,
+                    )
+            except ValueError as exc:
+                attempt.validation = {
+                    "ok": False,
+                    "protocol_compiler": {"error": str(exc)},
+                    "design_revisions": design_revisions,
+                }
+                attempt.status = AttemptStatus.REJECTED
+                attempt.error = f"protocol_draft_failed: {exc}"
+                store.save_attempt(attempt)
+                return JobOutcome(
+                    False,
+                    "retry",
+                    attempt.error,
+                    {"validation": attempt.validation},
+                    tokens=total_tokens,
+                    elapsed_sec=time.monotonic() - started,
+                )
             total_tokens += result.total_tokens
+            pending_draft = None
+            pending_errors = []
             try:
                 plan = compile_screening_protocol(idea, result.value)
             except (TypeError, ValueError) as exc:
+                design_revisions.append(
+                    {
+                        "revision": revision,
+                        "decision": "compiler_retry",
+                        "reason": str(exc),
+                        "required_changes": [str(exc)],
+                    }
+                )
+                if revision < self.max_revisions:
+                    pending_draft = dict(result.value)
+                    pending_errors = [str(exc)]
+                    continue
                 attempt.validation = {
                     "ok": False,
                     "protocol_compiler": {
@@ -477,11 +526,15 @@ Allowed scopes are:
 - per_arm_seed: fixed per selected arm and seed, without example multiplier;
 - per_seed: fixed shared calls per seed;
 - fixed: one fixed call.
+Do not invent aliases such as per_task, per_example, per_arm, once, or global.
+For a call repeated once per benchmark item use per_example_seed; for a call
+repeated once per arm and item use per_arm_example_seed.
 For scopes containing "arm", omit arms to apply to all arms or name the exact
 subset. For scopes containing "example", dataset_role must be development or
 screening. Other scopes use dataset_role=none. Include zero-cost operations in
-prose, not as components. This pilot must use 16-50 screening examples, at most
-50 development examples, one seed and one GPU.
+prose, not as components. This pilot must use 16-32 screening examples, at most
+32 development examples, one seed and one GPU, and at most 512 total model
+calls.
 """
 
     @staticmethod
@@ -524,6 +577,7 @@ For call_ledger:
   exact arm subset; never duplicate the same name/scope/dataset_role/arms;
 - allowed scopes are per_arm_example_seed, per_example_seed, per_arm_seed,
   per_seed, fixed;
+- never invent aliases such as per_task, per_example, per_arm, once, or global;
 - scopes containing "arm" may name an exact arm subset;
 - scopes containing "example" require dataset_role development or screening;
 - every calls_per_unit must be a positive integer.

@@ -55,6 +55,15 @@ _LEDGER_SCOPES = frozenset(
         "fixed",
     }
 )
+_LEDGER_SCOPE_ALIASES = {
+    "per_task": "per_example_seed",
+    "per_example": "per_example_seed",
+    "per_arm_example": "per_arm_example_seed",
+    "per_arm": "per_arm_seed",
+    "once_per_seed": "per_seed",
+    "once": "fixed",
+    "global": "fixed",
+}
 _LEDGER_DATASET_ROLES = frozenset(
     {"development", "screening", "none"}
 )
@@ -173,6 +182,10 @@ def compile_screening_protocol(
     )
     plan["call_ledger"] = ledger
     total_calls = int(ledger["total_model_calls"])
+    if total_calls > 512:
+        raise ValueError(
+            "screening pilot call_ledger.total_model_calls must be at most 512"
+        )
     plan["sample_accounting"] = {
         "arms": len(plan["arms"]),
         "development_examples": pilot["development_examples"],
@@ -374,12 +387,17 @@ def validate_protocol_draft(value: Mapping[str, Any]) -> list[str]:
         }
     if arms:
         try:
-            _compile_call_ledger(
+            ledger = _compile_call_ledger(
                 value.get("call_ledger"),
                 value.get("sample_accounting"),
                 arms=arms,
                 pilot=pilot,
             )
+            if int(ledger["total_model_calls"]) > 512:
+                errors.append(
+                    "screening pilot call_ledger.total_model_calls must be "
+                    "at most 512"
+                )
         except (TypeError, ValueError) as exc:
             errors.append(str(exc))
     try:
@@ -849,15 +867,15 @@ def _compile_pilot(value: Any) -> dict[str, int]:
         default=32,
         field="pilot.max_examples",
     )
-    if not 16 <= examples <= 50:
-        raise ValueError("pilot.max_examples must be between 16 and 50")
+    if not 16 <= examples <= 32:
+        raise ValueError("pilot.max_examples must be between 16 and 32")
     development_examples = _positive_int(
         raw.get("development_examples"),
         default=min(16, examples),
         field="pilot.development_examples",
     )
-    if development_examples > 50:
-        raise ValueError("pilot.development_examples must be at most 50")
+    if development_examples > 32:
+        raise ValueError("pilot.development_examples must be at most 32")
     seeds = _positive_int(
         raw.get("max_seeds", raw.get("seeds")),
         default=1,
@@ -918,6 +936,7 @@ def _compile_call_ledger(
             scope = _slug(
                 str(item.get("scope", "per_arm_example_seed") or "")
             )
+            scope = _LEDGER_SCOPE_ALIASES.get(scope, scope)
             if scope not in _LEDGER_SCOPES:
                 raise ValueError(
                     f"unsupported call_ledger scope for {name}: {scope}"

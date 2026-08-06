@@ -328,6 +328,26 @@ def test_compiler_allows_one_component_across_distinct_ledger_scopes() -> None:
         2,
     ]
     assert plan["call_ledger"]["total_model_calls"] == 18
+
+
+def test_compiler_normalizes_common_ledger_scope_aliases() -> None:
+    draft = _draft()
+    draft["call_ledger"] = {
+        "components": [
+            {
+                "name": "baseline_reference",
+                "scope": "per_task",
+                "dataset_role": "screening",
+                "calls_per_unit": 1,
+            }
+        ]
+    }
+
+    plan = compile_screening_protocol(_idea(), draft)
+
+    component = plan["call_ledger"]["components"][0]
+    assert component["scope"] == "per_example_seed"
+    assert component["total_calls"] == plan["pilot"]["max_examples"]
     assert validate_plan(plan) == []
 
 

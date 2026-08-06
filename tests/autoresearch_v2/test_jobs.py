@@ -72,6 +72,31 @@ class _Role:
         return SimpleNamespace(value=self.value, total_tokens=10)
 
 
+class _CompilerRepairRole(_Role):
+    def __init__(self, values):
+        self.values = list(values)
+        self.prompts: list[str] = []
+        self.repairs: list[tuple[dict, list[str]]] = []
+
+    def call(self, prompt: str, **kwargs):
+        del kwargs
+        self.prompts.append(prompt)
+        return SimpleNamespace(value=self.values.pop(0), total_tokens=10)
+
+    def repair(
+        self,
+        previous_value,
+        errors,
+        *,
+        retry_context,
+        max_tokens,
+        temperature,
+    ):
+        del retry_context, max_tokens, temperature
+        self.repairs.append((dict(previous_value), list(errors)))
+        return SimpleNamespace(value=self.values.pop(0), total_tokens=10)
+
+
 class _Gate:
     def __init__(self):
         self.plan = None
@@ -455,6 +480,53 @@ def test_design_exhausts_bounded_internal_revisions(
     assert durable is not None
     assert durable.status is AttemptStatus.REJECTED
     assert len(durable.validation["design_revisions"]) == 2
+
+
+def test_design_repairs_compiler_error_inside_revision_budget(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="typed-design-compiler-repair",
+        idea_id=idea.idea_id,
+        kind=JobKind.DESIGN,
+        attempt_limit=1,
+    )
+    attempt = AttemptRecord(
+        attempt_id="typed-design-compiler-repair-attempt-01",
+        idea_id=idea.idea_id,
+        job_id=job.job_id,
+        number=1,
+        status=AttemptStatus.RUNNING,
+    )
+    invalid = _typed_draft()
+    invalid["call_ledger"]["components"][0]["scope"] = "per_benchmark_item"
+    role = _CompilerRepairRole([invalid, _typed_draft()])
+
+    outcome = DesignJobExecutor(
+        role,
+        decision_gate=_Gate(),
+        max_revisions=2,
+    ).execute(
+        idea=idea,
+        job=job,
+        attempt=attempt,
+        store=store,
+    )
+
+    assert outcome.success
+    assert outcome.decision == "promote"
+    assert len(role.prompts) == 1
+    assert len(role.repairs) == 1
+    assert "unsupported call_ledger scope" in role.repairs[0][1][0]
+    durable = store.get_attempt(attempt.attempt_id)
+    assert durable is not None
+    assert durable.validation["design_revisions"][0]["decision"] == (
+        "compiler_retry"
+    )
 
 
 def test_first_design_attempt_has_no_revision_directive() -> None:
