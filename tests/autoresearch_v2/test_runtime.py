@@ -124,7 +124,7 @@ def test_invalid_pool_configuration_is_not_silently_degraded(
         raise AssertionError("invalid pool configuration must fail closed")
 
 
-def test_production_gpu_tasks_do_not_inherit_forced_offline_mode(
+def test_production_gpu_tasks_strip_forced_offline_mode_when_online(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -178,5 +178,71 @@ def test_production_gpu_tasks_do_not_inherit_forced_offline_mode(
     )
 
     assert captured["task_env"] == {"HF_TOKEN": "test-token"}
+    controller._pool.shutdown(wait=True)
+    controller._idea_pool.shutdown(wait=True)
+
+
+def test_production_gpu_tasks_force_configured_offline_cache(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class _Router:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self.decision = object()
+            self.worker = object()
+            self.utility = object()
+
+    captured: dict[str, object] = {}
+
+    def build_broker(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    pool_config = _pool_config(tmp_path / "pool.yaml")
+    cache_dir = tmp_path / "node-cache"
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path / "runs" / "canary"),
+                "models": {
+                    "researchclaw_config": str(tmp_path / "unused.yaml"),
+                },
+                "execution": {
+                    "gpu_dependency_mode": "offline",
+                    "gpu_cache_dir": str(cache_dir),
+                    "allowed_env_keys": ["HF_TOKEN"],
+                },
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": str(pool_config),
+                    "shared_workspace_root": str(tmp_path / "runs"),
+                },
+            }
+        }
+    )
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setattr(runtime, "RoleRouter", _Router)
+    monkeypatch.setattr(runtime, "build_clusterbridge_broker", build_broker)
+
+    controller = runtime.build_production_controller(
+        config,
+        generator=StaticIdeaGenerator([]),
+    )
+
+    assert captured["task_env"] == {
+        "HF_TOKEN": "test-token",
+        "HF_HOME": str(cache_dir),
+        "HF_HUB_CACHE": str(cache_dir / "hub"),
+        "HUGGINGFACE_HUB_CACHE": str(cache_dir / "hub"),
+        "TRANSFORMERS_CACHE": str(cache_dir / "hub"),
+        "XDG_CACHE_HOME": str(cache_dir / "xdg"),
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "HF_HUB_DISABLE_XET": "1",
+    }
     controller._pool.shutdown(wait=True)
     controller._idea_pool.shutdown(wait=True)

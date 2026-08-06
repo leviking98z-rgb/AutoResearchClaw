@@ -388,6 +388,9 @@ def test_prepare_orders_cleanup_pause_gpu_ray_and_validation(
     monkeypatch.setattr(pool, "cleanup_nodes", lambda: order.append("cleanup"))
     monkeypatch.setattr(pool, "pause_spin", lambda: order.append("pause"))
     monkeypatch.setattr(
+        pool, "prepare_cache", lambda: order.append("prepare-cache")
+    )
+    monkeypatch.setattr(
         pool, "validate_node_gpus", lambda: order.append("validate-gpus")
     )
     monkeypatch.setattr(pool, "start_ray", lambda: order.append("start-ray"))
@@ -403,11 +406,47 @@ def test_prepare_orders_cleanup_pause_gpu_ray_and_validation(
     assert order == [
         "cleanup",
         "pause",
+        "prepare-cache",
         "validate-gpus",
         "start-ray",
         "validate-ray",
     ]
     assert pool.prepared is True
+
+
+def test_prepare_cache_is_idempotent_and_node_local(tmp_path: Path) -> None:
+    base = _config(tmp_path)
+    config = ClusterBridgePoolConfig(
+        nodes=base.nodes,
+        cb_command=base.cb_command,
+        purpose=base.purpose,
+        pool_id=base.pool_id,
+        log_root=base.log_root,
+        claim_ttl_min=base.claim_ttl_min,
+        renew_interval_sec=base.renew_interval_sec,
+        max_renew_failures=base.max_renew_failures,
+        command_timeout_sec=base.command_timeout_sec,
+        parallelism=base.parallelism,
+        expected_total_gpus=base.expected_total_gpus,
+        node_cleanup_script=base.node_cleanup_script,
+        node_spin_script=base.node_spin_script,
+        task_kill_grace_sec=base.task_kill_grace_sec,
+        prepare_cache_dir="/data/cache/autoresearch-v2/huggingface",
+        prepare_cache_archive="/root/sync/autoresearch-cache.tar",
+        ray=base.ray,
+    )
+    client = FakeClient()
+    pool = ClusterBridgePool(config, client=client)
+    pool.claim(start_keepalive=False)
+
+    results = pool.prepare_cache()
+
+    assert sorted(results) == sorted(pool.node_addresses)
+    commands = [call[2] for call in client.calls if call[0] == "run"]
+    assert len(commands) == len(config.nodes)
+    assert all("sha256sum \"$archive\"" in command for command in commands)
+    assert all("cache-ready" in command for command in commands)
+    assert all("tar -xf \"$archive\"" in command for command in commands)
 
 
 def test_ray_start_commands_are_backgrounded_and_gpu_scoped(

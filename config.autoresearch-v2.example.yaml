@@ -56,6 +56,13 @@ autoresearch_v2:
     # auto: use the GPU pool whenever gpu.enabled=true, otherwise local.
     # This prevents Controller-host dependency gaps from rejecting valid code.
     smoke_environment: auto
+    # online preserves legacy behavior. offline requires a prepared local cache
+    # and prevents generated GPU jobs from downloading dependencies at runtime.
+    gpu_dependency_mode: online
+    gpu_cache_dir: ""
+    # Optional immutable tar archive extracted once per allocated node before
+    # Ray starts. Prefer a large-file sync/object-store path, not Ceph small files.
+    gpu_cache_archive: ""
 
   gpu:
     enabled: false
@@ -83,6 +90,9 @@ autoresearch_v2:
       # false preserves the allocation across a routine Controller restart.
       # Set true only when every shutdown should return capacity immediately.
       release_on_shutdown: false
+      # Optional exact allocation pin for controlled canaries. When set, the
+      # manager never attaches or releases another matching project allocation.
+      preferred_allocation_id: ""
       log_root: /root/shared/.clusters/.tmp/autoresearch-v2/elastic-pools
     reserved_gpus: 0
     target_utilization: 0.90

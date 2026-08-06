@@ -181,6 +181,47 @@ def test_gpu_job_remains_ready_when_configured_pool_is_unavailable(
     controller.close()
 
 
+def test_remote_smoke_infrastructure_classifier_reads_stdout() -> None:
+    classify = V2Controller._remote_smoke_infrastructure_code
+
+    assert (
+        classify(
+            result={"timed_out": True},
+            stdout="xet-core CAS client Status Code: 500",
+            stderr="",
+            returncode=124,
+        )
+        == "dependency_hub_5xx"
+    )
+    assert (
+        classify(
+            result={"timed_out": True},
+            stdout="Fetching 4 files from huggingface",
+            stderr="",
+            returncode=124,
+        )
+        == "dependency_download_timeout"
+    )
+    assert (
+        classify(
+            result={},
+            stdout="",
+            stderr="LocalEntryNotFoundError: offline cache miss",
+            returncode=1,
+        )
+        == "dependency_cache_miss"
+    )
+    assert (
+        classify(
+            result={"pool_state": "probe_failed"},
+            stdout="",
+            stderr="",
+            returncode=-1,
+        )
+        == "gpu_task_lost"
+    )
+
+
 def test_controller_runs_build_smoke_on_gpu_pool_before_pilot(
     tmp_path: Path,
 ) -> None:

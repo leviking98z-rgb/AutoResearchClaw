@@ -503,6 +503,7 @@ class ClusterBridgePool:
         try:
             self.cleanup_nodes()
             self.pause_spin()
+            self.prepare_cache()
             self.validate_node_gpus()
             self.start_ray()
             resources = self.wait_for_ray_resources(
@@ -533,6 +534,60 @@ class ClusterBridgePool:
         self._event("prepare_succeeded", resources=asdict(resources))
         self._write_state()
         return resources
+
+    def prepare_cache(self) -> dict[str, BridgeResult]:
+        """Materialize an optional immutable dependency cache per node."""
+
+        self._require_claimed()
+        cache_dir = self.config.prepare_cache_dir.strip()
+        archive = self.config.prepare_cache_archive.strip()
+        if not cache_dir or not archive:
+            return {}
+        command = (
+            "set -euo pipefail; "
+            f"archive={shlex.quote(archive)}; "
+            f"target={shlex.quote(cache_dir)}; "
+            "[ -s \"$archive\" ]; "
+            "digest=$(sha256sum \"$archive\" | awk '{print $1}'); "
+            "marker=\"$target/.autoresearch-cache-sha256\"; "
+            "if [ -f \"$marker\" ] && "
+            "[ \"$(cat \"$marker\")\" = \"$digest\" ]; then "
+            "printf 'cache-ready %s\\n' \"$digest\"; exit 0; fi; "
+            "parent=$(dirname \"$target\"); base=$(basename \"$target\"); "
+            "mkdir -p \"$parent\"; "
+            "stage=\"$parent/.${base}.stage.$digest\"; "
+            "previous=\"$parent/.${base}.previous\"; "
+            "if [ -d \"$stage\" ]; then "
+            "find \"$stage\" -mindepth 1 -delete; "
+            "else mkdir -p \"$stage\"; fi; "
+            "if [ -d \"$previous\" ]; then "
+            "find \"$previous\" -mindepth 1 -delete; "
+            "rmdir \"$previous\"; fi; "
+            "tar -xf \"$archive\" -C \"$stage\"; "
+            "printf '%s\\n' \"$digest\" > "
+            "\"$stage/.autoresearch-cache-sha256\"; "
+            "if [ -d \"$target\" ]; then "
+            "mv \"$target\" \"$previous\"; fi; "
+            "mv \"$stage\" \"$target\"; "
+            "if [ -d \"$previous\" ]; then "
+            "find \"$previous\" -mindepth 1 -delete; "
+            "rmdir \"$previous\"; fi; "
+            "printf 'cache-prepared %s\\n' \"$digest\""
+        )
+        results = self._run_all(
+            command,
+            operation="cache_prepare",
+            timeout_sec=max(
+                self.config.command_timeout_sec,
+                self.config.ray.resource_timeout_sec,
+            ),
+        )
+        self._event(
+            "cache_prepare_succeeded",
+            cache_dir=cache_dir,
+            archive=archive,
+        )
+        return results
 
     def validate_node_gpus(self) -> dict[str, dict[str, Any]]:
         """Verify every configured GPU ID is visible on its assigned node."""

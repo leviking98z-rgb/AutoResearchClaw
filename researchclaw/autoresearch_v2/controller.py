@@ -1782,6 +1782,10 @@ class V2Controller:
             self.store.save_attempt(attempt)
             infrastructure_code = self._remote_smoke_infrastructure_code(
                 result=result,
+                stdout=stdout_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                ),
                 stderr=stderr_path.read_text(
                     encoding="utf-8",
                     errors="replace",
@@ -2108,26 +2112,87 @@ class V2Controller:
     def _remote_smoke_infrastructure_code(
         *,
         result: Mapping[str, Any],
+        stdout: str,
         stderr: str,
         returncode: int,
     ) -> str:
         """Classify failures outside the generated experiment's control."""
 
-        if bool(result.get("timed_out")) or returncode == 124:
-            if any(
-                marker in stderr
-                for marker in (
-                    "Network is unreachable",
-                    "Connection timed out",
-                    "Temporary failure in name resolution",
-                )
-            ):
-                return "dependency_network_unreachable"
-            return "gpu_task_timeout"
-        if str(result.get("pool_state", "") or "") in {"lost", "unknown"}:
+        text = "\n".join(
+            (
+                str(stdout or ""),
+                str(stderr or ""),
+                str(result.get("error", "") or ""),
+            )
+        ).casefold()
+        if str(result.get("pool_state", "") or "") in {
+            "lost",
+            "unknown",
+            "probe_failed",
+        }:
             return "gpu_task_lost"
         if result.get("error"):
             return "gpu_pool_collect_failed"
+        if any(
+            marker in text
+            for marker in (
+                "localentrynotfounderror",
+                "cannot find the requested files in the disk cache",
+                "couldn't find cache",
+                "not found in the cached files",
+                "offline mode is enabled",
+                "hf_hub_offline",
+                "hf_datasets_offline",
+            )
+        ):
+            return "dependency_cache_miss"
+        if any(
+            marker in text
+            for marker in (
+                "cas service error",
+                "cas client error",
+                "xet-core",
+                "status code: 429",
+                "status code: 500",
+                "status code: 502",
+                "status code: 503",
+                "status code: 504",
+                "response status code 429",
+                "response status code 500",
+                "response status code 502",
+                "response status code 503",
+                "response status code 504",
+            )
+        ):
+            return "dependency_hub_5xx"
+        if any(
+            marker in text
+            for marker in (
+                "network is unreachable",
+                "connection timed out",
+                "temporary failure in name resolution",
+                "name or service not known",
+                "connection reset by peer",
+                "connection aborted",
+                "nodename nor servname provided",
+            )
+        ):
+            return "dependency_network_unreachable"
+        if bool(result.get("timed_out")) or returncode == 124:
+            if any(
+                marker in text
+                for marker in (
+                    "fetching ",
+                    "downloading",
+                    "huggingface",
+                    "snapshot_download",
+                    "hf_hub_download",
+                    "load_dataset",
+                    "from_pretrained",
+                )
+            ):
+                return "dependency_download_timeout"
+            return "gpu_task_timeout"
         return ""
 
     def _attest_gpu_execution(

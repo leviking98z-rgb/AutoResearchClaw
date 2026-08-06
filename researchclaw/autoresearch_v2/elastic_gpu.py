@@ -143,6 +143,8 @@ class ResourceManagedGPUManager:
         config: GPUConfig,
         *,
         task_env: Mapping[str, str] | None = None,
+        cache_dir: str = "",
+        cache_archive: str = "",
         client: ClusterBridgeResourceClient | None = None,
         pool_factory: Callable[..., ClusterBridgePool] = ClusterBridgePool,
         broker_factory: Callable[..., GPUBroker] = (
@@ -157,6 +159,8 @@ class ResourceManagedGPUManager:
             str(key): str(value)
             for key, value in (task_env or {}).items()
         }
+        self.cache_dir = str(cache_dir or "").strip()
+        self.cache_archive = str(cache_archive or "").strip()
         self.client = client or ClusterBridgeResourceClient(
             self.elastic.cb_command,
             owner=self.elastic.owner,
@@ -442,6 +446,16 @@ class ResourceManagedGPUManager:
         ]
         if not owned:
             return None
+        preferred = self.elastic.preferred_allocation_id.strip()
+        if preferred:
+            return next(
+                (
+                    item
+                    for item in owned
+                    if str(item.get("id", "")) == preferred
+                ),
+                None,
+            )
         owned.sort(
             key=lambda item: (
                 -int(item.get("gpu_count", 0) or 0),
@@ -511,6 +525,8 @@ class ResourceManagedGPUManager:
             expected_total_gpus=total,
             allow_force_claim=False,
             expected_claim_owner=self.elastic.owner,
+            prepare_cache_dir=self.cache_dir,
+            prepare_cache_archive=self.cache_archive,
             ray=RayPoolConfig(
                 command=self.elastic.ray_command,
                 python=self.elastic.ray_python,

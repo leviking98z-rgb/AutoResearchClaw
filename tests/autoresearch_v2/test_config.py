@@ -117,6 +117,46 @@ def test_execution_smoke_environment_is_validated() -> None:
         )
 
 
+def test_offline_gpu_dependencies_require_cache_dir(tmp_path) -> None:
+    with pytest.raises(ValueError, match="gpu_cache_dir"):
+        V2Config.from_mapping(
+            {
+                "autoresearch_v2": {
+                    "state_dir": str(tmp_path / "runs" / "state"),
+                    "execution": {
+                        "gpu_dependency_mode": "offline",
+                    },
+                    "gpu": {
+                        "enabled": True,
+                        "pool_config": str(tmp_path / "pool.yaml"),
+                        "shared_workspace_root": str(tmp_path / "runs"),
+                    },
+                }
+            }
+        )
+
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "state_dir": str(tmp_path / "runs" / "state"),
+                "execution": {
+                    "gpu_dependency_mode": "OFFLINE",
+                    "gpu_cache_dir": "/data/cache/autoresearch-v2/huggingface",
+                    "gpu_cache_archive": "/root/sync/autoresearch-cache.tar",
+                },
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": str(tmp_path / "pool.yaml"),
+                    "shared_workspace_root": str(tmp_path / "runs"),
+                },
+            }
+        }
+    )
+    assert config.execution.gpu_dependency_mode == "offline"
+    assert config.execution.gpu_cache_dir.endswith("huggingface")
+    assert config.execution.gpu_cache_archive.endswith(".tar")
+
+
 def test_attestation_key_cannot_live_in_generated_candidate(
     tmp_path,
 ) -> None:

@@ -255,6 +255,98 @@ def test_resource_manager_mode_parses_full_policy_without_pool_config(
     )
 
 
+def test_resource_manager_projects_cache_prepare_policy(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    client = _FakeResourceClient()
+    client.allocations = [_allocation()]
+    pools = _PoolFactory()
+    brokers = _BrokerFactory()
+    manager = ResourceManagedGPUManager(
+        config.gpu,
+        client=client,
+        pool_factory=pools,
+        broker_factory=brokers,
+        monotonic=lambda: 0.0,
+        prepare_async=False,
+        cache_dir="/data/cache/autoresearch-v2/huggingface",
+        cache_archive="/root/sync/autoresearch-cache.tar",
+    )
+
+    manager.bootstrap()
+
+    pool_config = pools.pools[0].config
+    assert (
+        pool_config.prepare_cache_dir
+        == "/data/cache/autoresearch-v2/huggingface"
+    )
+    assert (
+        pool_config.prepare_cache_archive
+        == "/root/sync/autoresearch-cache.tar"
+    )
+
+
+def test_resource_manager_can_pin_exact_allocation(tmp_path: Path) -> None:
+    base = _config(tmp_path)
+    raw = {
+        "autoresearch_v2": {
+            "enabled": True,
+            "state_dir": str(tmp_path / "runs" / "elastic-test"),
+            "gpu": {
+                "enabled": True,
+                "mode": "resource_manager",
+                "shared_workspace_root": str(tmp_path / "runs"),
+                "resource_manager": {
+                    **{
+                        name: getattr(base.gpu.resource_manager, name)
+                        for name in (
+                            "owner",
+                            "cb_command",
+                            "project",
+                            "purpose",
+                            "min_gpus",
+                            "desired_gpus",
+                            "max_gpus",
+                            "duration_min",
+                            "renew_ttl_min",
+                            "renew_interval_sec",
+                            "reconcile_interval_sec",
+                            "allow_cross_cluster",
+                            "gpu_type",
+                            "priority",
+                            "release_on_shutdown",
+                            "log_root",
+                            "ray_command",
+                            "ray_python",
+                            "ray_port",
+                            "command_timeout_sec",
+                            "prepare_timeout_sec",
+                        )
+                    },
+                    "preferred_allocation_id": "alloc-preferred",
+                },
+            },
+        }
+    }
+    config = V2Config.from_mapping(raw)
+    client = _FakeResourceClient()
+    client.allocations = [
+        _allocation(allocation_id="alloc-other", gpus=32),
+        _allocation(allocation_id="alloc-preferred", gpus=16),
+    ]
+    manager, pools, _ = _manager(
+        config.gpu,
+        client=client,
+        clock=[0.0],
+    )
+
+    manager.bootstrap()
+
+    assert manager.snapshot()["allocation_id"] == "alloc-preferred"
+    assert pools.pools[0].config.expected_total_gpus == 16
+
+
 def test_resource_manager_exposes_declared_controller_api() -> None:
     assert callable(getattr(ResourceManagedGPUManager, "bootstrap", None))
     assert callable(getattr(ResourceManagedGPUManager, "reconcile", None))

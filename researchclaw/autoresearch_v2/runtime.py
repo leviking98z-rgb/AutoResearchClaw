@@ -124,15 +124,35 @@ def build_production_controller(
         key: value
         for key in config.execution.allowed_env_keys
         if (value := os.environ.get(key)) is not None
-        and not (
-            key in {
-                "HF_HUB_OFFLINE",
-                "TRANSFORMERS_OFFLINE",
-            }
-            and str(value).strip().casefold()
-            in {"1", "true", "yes", "on"}
-        )
     }
+    if config.execution.gpu_dependency_mode == "offline":
+        cache_root = config.execution.gpu_cache_dir.rstrip("/")
+        task_env.update(
+            {
+                "HF_HOME": cache_root,
+                "HF_HUB_CACHE": f"{cache_root}/hub",
+                "HUGGINGFACE_HUB_CACHE": f"{cache_root}/hub",
+                "TRANSFORMERS_CACHE": f"{cache_root}/hub",
+                "XDG_CACHE_HOME": f"{cache_root}/xdg",
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "HF_DATASETS_OFFLINE": "1",
+                "HF_HUB_DISABLE_XET": "1",
+            }
+        )
+    else:
+        for key in (
+            "HF_HUB_OFFLINE",
+            "TRANSFORMERS_OFFLINE",
+            "HF_DATASETS_OFFLINE",
+        ):
+            if str(task_env.get(key, "")).strip().casefold() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                task_env.pop(key, None)
     configured_gpu_capacity = 0
     broker = None
     gpu_manager = None
@@ -145,6 +165,8 @@ def build_production_controller(
             gpu_manager = ResourceManagedGPUManager(
                 config.gpu,
                 task_env=task_env,
+                cache_dir=config.execution.gpu_cache_dir,
+                cache_archive=config.execution.gpu_cache_archive,
             )
             gpu_manager.bootstrap()
             broker = gpu_manager.broker

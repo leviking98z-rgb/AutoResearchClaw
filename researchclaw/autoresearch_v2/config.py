@@ -82,6 +82,9 @@ class ExecutionConfig:
     attestation_key_id: str = "autoresearch-v2-controller"
     smoke_timeout_sec: float = 300.0
     smoke_environment: str = "auto"
+    gpu_dependency_mode: str = "online"
+    gpu_cache_dir: str = ""
+    gpu_cache_archive: str = ""
     allowed_env_keys: tuple[str, ...] = (
         "AUTORESEARCH_V2_ATTEMPT_ID",
         "AUTORESEARCH_V2_GPU_COUNT",
@@ -119,6 +122,7 @@ class GPUResourceManagerConfig:
     gpu_type: str = ""
     priority: str = "normal"
     release_on_shutdown: bool = False
+    preferred_allocation_id: str = ""
     log_root: str = (
         "/root/shared/.clusters/.tmp/autoresearch-v2/elastic-pools"
     )
@@ -379,6 +383,18 @@ class V2Config:
             )
             .strip()
             .casefold(),
+            gpu_dependency_mode=str(
+                execution_raw.get("gpu_dependency_mode", "online")
+                or "online"
+            )
+            .strip()
+            .casefold(),
+            gpu_cache_dir=str(
+                execution_raw.get("gpu_cache_dir", "") or ""
+            ).strip(),
+            gpu_cache_archive=str(
+                execution_raw.get("gpu_cache_archive", "") or ""
+            ).strip(),
             allowed_env_keys=(
                 allowed_env_keys or ExecutionConfig().allowed_env_keys
             ),
@@ -444,6 +460,13 @@ class V2Config:
             release_on_shutdown=bool(
                 resource_manager_raw.get("release_on_shutdown", False)
             ),
+            preferred_allocation_id=str(
+                resource_manager_raw.get(
+                    "preferred_allocation_id",
+                    "",
+                )
+                or ""
+            ).strip(),
             log_root=str(
                 resource_manager_raw.get(
                     "log_root",
@@ -864,6 +887,30 @@ class V2Config:
             raise ValueError(
                 "execution.smoke_environment must be one of "
                 "auto, local, gpu_pool"
+            )
+        if self.execution.gpu_dependency_mode not in {
+            "online",
+            "offline",
+        }:
+            raise ValueError(
+                "execution.gpu_dependency_mode must be online or offline"
+            )
+        if (
+            self.execution.gpu_dependency_mode == "offline"
+            and self.gpu.enabled
+            and not self.execution.gpu_cache_dir
+        ):
+            raise ValueError(
+                "execution.gpu_cache_dir is required for offline GPU "
+                "dependencies"
+            )
+        if (
+            self.execution.gpu_cache_archive
+            and not self.execution.gpu_cache_dir
+        ):
+            raise ValueError(
+                "execution.gpu_cache_dir is required when "
+                "gpu_cache_archive is configured"
             )
         if not self.execution.python_executable.strip():
             raise ValueError("execution.python_executable is required")

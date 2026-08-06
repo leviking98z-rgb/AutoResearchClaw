@@ -159,6 +159,8 @@ class ClusterBridgePoolConfig:
     )
     node_spin_script: str = "/root/shared/.clusters/.tools/node_spin.sh"
     task_kill_grace_sec: int = 30
+    prepare_cache_dir: str = ""
+    prepare_cache_archive: str = ""
     ray: RayPoolConfig = field(default_factory=RayPoolConfig)
 
     def __post_init__(self) -> None:
@@ -221,6 +223,11 @@ class ClusterBridgePoolConfig:
             raise ValueError("node_cleanup_script must not be empty")
         if not self.node_spin_script.strip():
             raise ValueError("node_spin_script must not be empty")
+        if self.prepare_cache_archive and not self.prepare_cache_dir:
+            raise ValueError(
+                "prepare_cache_dir is required when prepare_cache_archive "
+                "is configured"
+            )
 
         expected = (
             self.configured_gpu_count
@@ -338,6 +345,12 @@ class ClusterBridgePoolConfig:
                 )
             ),
             task_kill_grace_sec=int(raw.get("task_kill_grace_sec", 30)),
+            prepare_cache_dir=str(
+                raw.get("prepare_cache_dir", "") or ""
+            ).strip(),
+            prepare_cache_archive=str(
+                raw.get("prepare_cache_archive", "") or ""
+            ).strip(),
             ray=RayPoolConfig.from_mapping(
                 raw.get("ray") if isinstance(raw.get("ray"), Mapping) else None
             ),
@@ -373,5 +386,7 @@ class ClusterBridgePoolConfig:
             "node_cleanup_script": self.node_cleanup_script,
             "node_spin_script": self.node_spin_script,
             "task_kill_grace_sec": self.task_kill_grace_sec,
+            "prepare_cache_dir": self.prepare_cache_dir,
+            "prepare_cache_archive": self.prepare_cache_archive,
             "ray": self.ray.to_mapping(),
         }
