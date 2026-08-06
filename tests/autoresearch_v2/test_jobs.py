@@ -530,6 +530,53 @@ def test_design_repairs_compiler_error_inside_revision_budget(
     )
 
 
+def test_design_repairs_compiled_plan_validation_before_decision_gate(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="typed-design-plan-validation-repair",
+        idea_id=idea.idea_id,
+        kind=JobKind.DESIGN,
+        attempt_limit=1,
+    )
+    attempt = AttemptRecord(
+        attempt_id="typed-design-plan-validation-repair-attempt-01",
+        idea_id=idea.idea_id,
+        job_id=job.job_id,
+        number=1,
+        status=AttemptStatus.RUNNING,
+    )
+    invalid = _typed_draft()
+    invalid["gate_statistic"]["threshold"]["value"] = 0.01
+    invalid["promotion_criteria"][0]["value"] = 0.01
+    role = _CompilerRepairRole([invalid, _typed_draft()])
+    gate = _Gate()
+
+    outcome = DesignJobExecutor(
+        role,
+        decision_gate=gate,
+        max_revisions=2,
+    ).execute(
+        idea=idea,
+        job=job,
+        attempt=attempt,
+        store=store,
+    )
+
+    assert outcome.success
+    assert len(role.repairs) == 1
+    assert "below pilot sample resolution" in role.repairs[0][1][0]
+    durable = store.get_attempt(attempt.attempt_id)
+    assert durable is not None
+    assert durable.validation["design_revisions"][0]["decision"] == (
+        "plan_validation_retry"
+    )
+
+
 def test_design_continues_after_structured_role_exhausts_local_retries(
     tmp_path: Path,
 ) -> None:

@@ -35,6 +35,7 @@ from .store import V2Store
 from .validation import (
     validate_execution_argv,
     validate_experiment_artifacts,
+    validate_plan,
     validate_python_tree,
     validate_research_implementation,
     validate_runtime_against_contract,
@@ -228,6 +229,41 @@ class DesignJobExecutor:
                 }
                 attempt.status = AttemptStatus.REJECTED
                 attempt.error = f"protocol_compile_failed: {exc}"
+                store.save_attempt(attempt)
+                return JobOutcome(
+                    False,
+                    "retry",
+                    attempt.error,
+                    {"validation": attempt.validation},
+                    tokens=total_tokens,
+                    elapsed_sec=time.monotonic() - started,
+                )
+            deterministic_errors = validate_plan(plan)
+            if deterministic_errors:
+                design_revisions.append(
+                    {
+                        "revision": revision,
+                        "decision": "plan_validation_retry",
+                        "reason": "; ".join(deterministic_errors),
+                        "required_changes": deterministic_errors,
+                    }
+                )
+                if revision < self.max_revisions:
+                    pending_draft = dict(result.value)
+                    pending_errors = deterministic_errors
+                    continue
+                attempt.validation = {
+                    "ok": False,
+                    "plan_validation": {
+                        "errors": deterministic_errors,
+                    },
+                    "design_revisions": design_revisions,
+                }
+                attempt.status = AttemptStatus.REJECTED
+                attempt.error = (
+                    "plan_validation_failed: "
+                    + "; ".join(deterministic_errors)
+                )
                 store.save_attempt(attempt)
                 return JobOutcome(
                     False,

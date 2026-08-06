@@ -241,12 +241,32 @@ def test_compiler_encodes_within_episode_feedback_without_label_tuning() -> None
     screening = plan["datasets"][1]
     confirmatory = plan["datasets"][2]
 
-    assert screening["used_for_adaptation"] is True
-    assert screening["access_policy"]["within_episode_feedback"] is True
+    assert screening["used_for_adaptation"] is False
+    assert screening["access_policy"]["within_episode_feedback"] is False
     assert screening["access_policy"]["cross_example_adaptation"] is False
     assert screening["access_policy"]["hidden_labels_for_tuning"] is False
     assert confirmatory["access_policy"]["input_access"] is True
     assert confirmatory["access_policy"]["available_before_scale"] is False
+    assert validate_plan(plan) == []
+
+
+def test_compiler_owns_single_subject_model_and_bootstrap_mechanics() -> None:
+    draft = _draft()
+    draft["models"] = [
+        {"name": "Qwen-subject", "role": "subject"},
+        {"name": "Qwen-verifier", "role": "verifier"},
+    ]
+    draft["pilot"]["development_examples"] = 31
+
+    plan = compile_screening_protocol(_idea(), draft)
+
+    assert plan["models"] == [{"name": "Qwen-subject", "role": "subject"}]
+    assert plan["pilot"]["development_examples"] == 16
+    assert plan["uncertainty"]["rng_seed"] == 1729
+    assert plan["uncertainty"]["interval"] == "percentile"
+    assert plan["uncertainty"]["undefined_resample_policy"] == "drop"
+    assert plan["uncertainty"]["max_undefined_fraction"] == 0.05
+    assert plan["uncertainty"]["excess_undefined_decision"] == "reject"
     assert validate_plan(plan) == []
 
 

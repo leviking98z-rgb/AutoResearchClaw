@@ -151,9 +151,21 @@ def compile_screening_protocol(
 
     plan["protocol_template"] = protocol
     plan["study_phase"] = "screening_pilot"
-    screening_access_policy = _compile_screening_access_policy(
+    requested_screening_access_policy = _compile_screening_access_policy(
         plan.get("screening_access_policy")
     )
+    # Pilot endpoints are always evaluated on a frozen screening partition.
+    # Protocol families may adapt on the separate development partition, but
+    # screening observations can never feed state, prompts, thresholds, or
+    # selection. This removes a recurring and outcome-changing leakage choice
+    # from model-authored prose.
+    screening_access_policy = {
+        **requested_screening_access_policy,
+        "within_episode_feedback": False,
+        "cross_example_adaptation": False,
+        "hidden_labels_for_tuning": False,
+        "threshold_tuning": False,
+    }
     plan["datasets"] = _compile_datasets(
         idea,
         plan.get("dataset"),
@@ -281,11 +293,13 @@ def compile_screening_protocol(
         "mechanical_fields": [
             "datasets",
             "screening_access_policy",
+            "models",
             "pilot",
             "call_ledger",
             "sample_accounting",
             "workload_budget",
             "effect_threshold",
+            "uncertainty",
             "decision_contract",
             "decision_table",
             "promotion_rule",
@@ -575,12 +589,28 @@ def _compile_uncertainty(value: Any) -> dict[str, Any]:
         raise ValueError(
             "bootstrap uncertainty requires at least 200 resamples"
         )
-    return {
+    result = {
         "method": method,
         "cluster_unit": cluster_unit,
         "confidence_level": float(confidence_level),
         "resamples": resamples,
     }
+    if "bootstrap" in method:
+        # Bootstrap mechanics are Controller-owned so Design review does not
+        # repeatedly ask the Worker to invent equivalent prose variants.
+        result.update(
+            {
+                "rng_seed": 1729,
+                "interval": "percentile",
+                "lower_quantile": (1.0 - float(confidence_level)) / 2.0,
+                "upper_quantile": 1.0
+                - (1.0 - float(confidence_level)) / 2.0,
+                "undefined_resample_policy": "drop",
+                "max_undefined_fraction": 0.05,
+                "excess_undefined_decision": "reject",
+            }
+        )
+    return result
 
 
 def _compile_criteria(
@@ -809,14 +839,19 @@ def _compile_models(
             if name:
                 result.append({"name": name, "role": role})
     if result:
-        return result
+        subjects = [
+            item for item in result if _slug(item["role"]) == "subject"
+        ]
+        return [subjects[0] if subjects else result[0]]
     candidates = idea.candidate.get("models", [])
     if isinstance(candidates, list):
         for item in candidates:
             name = str(item or "").strip()
             if name:
                 result.append({"name": name, "role": "subject"})
-    return result or [{"name": "open-weight model", "role": "subject"}]
+    if result:
+        return [result[0]]
+    return [{"name": "open-weight model", "role": "subject"}]
 
 
 def _compile_arms(value: Any) -> list[dict[str, str]]:
@@ -869,13 +904,9 @@ def _compile_pilot(value: Any) -> dict[str, int]:
     )
     if not 16 <= examples <= 32:
         raise ValueError("pilot.max_examples must be between 16 and 32")
-    development_examples = _positive_int(
-        raw.get("development_examples"),
-        default=min(16, examples),
-        field="pilot.development_examples",
-    )
-    if development_examples > 32:
-        raise ValueError("pilot.development_examples must be at most 32")
+    # Keep adaptation/tuning on a small disjoint development partition. The
+    # exact size is mechanical and intentionally not a model degree of freedom.
+    development_examples = min(16, examples)
     seeds = _positive_int(
         raw.get("max_seeds", raw.get("seeds")),
         default=1,

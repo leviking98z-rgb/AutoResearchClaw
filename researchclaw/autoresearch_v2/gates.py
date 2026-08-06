@@ -161,6 +161,11 @@ effect. Instead require:
 
 Still fail closed on leakage, missing controls, impossible compute, ambiguous
 outcomes, manipulated metrics, or a pilot framed as confirmatory evidence.
+The Controller has already deterministically validated schema, arithmetic,
+dataset isolation, access policy, threshold resolution, exhaustive decision
+regions, bootstrap mechanics, and call budgets. Do not return retry for those
+mechanical fields, prose style, or an optional analysis that is not part of
+the compiled promotion contract.
 Do not request extra Pilot baselines, ablations, datasets, precision, or
 bibliographic coverage when the one coarse go/no-go question is already
 identified; record those as Scale follow-ups. Judge the exact compiled
