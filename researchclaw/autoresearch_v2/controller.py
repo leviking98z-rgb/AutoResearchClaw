@@ -590,6 +590,8 @@ class V2Controller:
                     if dispatch_kind is JobKind.BUILD
                     else 1
                     if dispatch_kind is JobKind.DESIGN
+                    else 1
+                    if dispatch_kind is JobKind.REPORT
                     else self.config.budgets.max_job_attempts
                 ),
                 requires_gpu=bool(requested_gpus),

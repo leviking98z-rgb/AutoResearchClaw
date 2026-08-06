@@ -363,6 +363,40 @@ def test_orphaned_reservation_expires_even_if_owner_is_still_heartbeating(
     assert registry.list_leases() == []
 
 
+def test_expired_orphan_does_not_block_reservation_when_probe_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    now = [100.0]
+    registry = _registry(
+        tmp_path / "leases.sqlite3",
+        clock=lambda: now[0],
+    )
+    assert registry.reserve(
+        owner_id="crashed",
+        task_id="missing-task",
+        idea_id="idea-a",
+        job_id="job-a",
+        min_gpus=4,
+        preferred_gpus=4,
+        max_gpus=4,
+    ).admitted
+    registry.detach("crashed", "missing-task")
+    now[0] = 111.0
+
+    reservation = registry.reserve(
+        owner_id="new",
+        task_id="task-b",
+        idea_id="idea-b",
+        job_id="job-b",
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+    )
+
+    assert reservation.admitted
+    assert reservation.allocated_gpus == 1
+
+
 def test_registry_rejects_capacity_mismatch(tmp_path: Path) -> None:
     path = tmp_path / "leases.sqlite3"
     _registry(path)

@@ -9,6 +9,8 @@ from researchclaw.autoresearch_v2.ideas import candidate_to_idea
 from researchclaw.autoresearch_v2.jobs import (
     BuildJobExecutor,
     DesignJobExecutor,
+    ReportJobExecutor,
+    _collect_report_evidence,
     resolve_experiment_lifecycle_gate,
 )
 from researchclaw.autoresearch_v2.llm import StructuredRole
@@ -74,6 +76,19 @@ class _Role:
         return SimpleNamespace(value=self.value, total_tokens=10)
 
 
+class _ReportGate:
+    def __init__(self, verdicts):
+        self.verdicts = list(verdicts)
+        self.reports: list[dict] = []
+        self.evidence: list[dict] = []
+
+    def review_report(self, idea, report, evidence):
+        del idea
+        self.reports.append(dict(report))
+        self.evidence.append(dict(evidence))
+        return self.verdicts.pop(0)
+
+
 def test_valid_promotion_reject_becomes_reportable_negative() -> None:
     gate = resolve_experiment_lifecycle_gate(
         runtime_evidence={
@@ -113,6 +128,185 @@ def test_invalid_runtime_reject_remains_terminal_reject() -> None:
     )
 
     assert gate["decision"] == "reject"
+
+
+def test_report_evidence_uses_stable_nested_paths(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    pilot = root / "pilot"
+    pilot.mkdir(parents=True)
+    (pilot / "metrics.json").write_text(
+        json.dumps(
+            {
+                "decision": "reject",
+                "result_valid": True,
+                "metrics": {
+                    "endpoint_correct_diff": 0.0,
+                    "total_model_calls": 504.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (pilot / "runtime_evidence.json").write_text(
+        json.dumps(
+            {
+                "evidence_valid": True,
+                "gate_decision": "reject",
+                "gate_statistic_defined": True,
+                "criterion_results": {
+                    "primary_effect": {"value": 0.0, "passed": False}
+                },
+                "call_counts": {"total_calls": 504},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    evidence = _collect_report_evidence(root)
+
+    assert evidence["pilot"]["metrics"]["endpoint_correct_diff"] == 0.0
+    assert evidence["pilot"]["runtime"]["call_counts"]["total_calls"] == 504
+
+
+def test_report_retries_in_place_and_commits_corrected_package(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    idea.candidate["final_outcome"] = "informative_negative"
+    store.save_idea(idea)
+    current = store.current_dir(idea.idea_id)
+    (current / "artifacts" / "pilot").mkdir(parents=True)
+    (current / "plan.json").write_text(
+        json.dumps({"workload": {"total_calls": 288}}),
+        encoding="utf-8",
+    )
+    (current / "artifacts" / "pilot" / "metrics.json").write_text(
+        json.dumps(
+            {
+                "decision": "reject",
+                "result_valid": True,
+                "metrics": {
+                    "endpoint_correct_diff": 0.0,
+                    "total_model_calls": 504.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (current / "artifacts" / "pilot" / "runtime_evidence.json").write_text(
+        json.dumps(
+            {
+                "evidence_valid": True,
+                "gate_decision": "reject",
+                "gate_statistic_defined": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    job = JobRecord(
+        job_id=f"{idea.idea_id}-report",
+        idea_id=idea.idea_id,
+        kind=JobKind.REPORT,
+    )
+    attempt = AttemptRecord(
+        attempt_id=f"{job.job_id}-attempt-01",
+        idea_id=idea.idea_id,
+        job_id=job.job_id,
+        number=1,
+        status=AttemptStatus.RUNNING,
+    )
+    first = {
+        "title": "Draft",
+        "claims": [
+            {
+                "claim": "Numeric results are unavailable.",
+                "evidence_paths": ["/evidence/pilot/metrics"],
+                "strength": "measured",
+            }
+        ],
+        "limitations": [],
+        "next_experiments": [],
+        "paper_markdown": "# Draft",
+    }
+    repaired = {
+        "title": "Corrected",
+        "claims": [
+            {
+                "claim": "The measured endpoint contrast was zero.",
+                "evidence_paths": [
+                    "/evidence/pilot/metrics/endpoint_correct_diff"
+                ],
+                "strength": "measured",
+            }
+        ],
+        "limitations": ["Pilot evidence only."],
+        "next_experiments": [],
+        "paper_markdown": "# Corrected\n\nThe endpoint contrast was 0.",
+    }
+    class _SequentialReportRole:
+        def __init__(self, values):
+            self.values = list(values)
+            self.prompts: list[str] = []
+
+        def call(self, prompt, **kwargs):
+            del kwargs
+            self.prompts.append(prompt)
+            return SimpleNamespace(
+                value=self.values.pop(0),
+                total_tokens=10,
+            )
+
+    role = _SequentialReportRole([first, repaired])
+    gate = _ReportGate(
+        [
+            GateVerdict(
+                "retry",
+                "include measured values",
+                1.0,
+                required_changes=("include measured values",),
+                raw={
+                    "decision": "retry",
+                    "reason": "include measured values",
+                    "confidence": 1.0,
+                    "risks": [],
+                    "required_changes": ["include measured values"],
+                },
+            ),
+            GateVerdict(
+                "complete",
+                "evidence complete",
+                1.0,
+                raw={
+                    "decision": "complete",
+                    "reason": "evidence complete",
+                    "confidence": 1.0,
+                    "risks": [],
+                    "required_changes": [],
+                },
+            ),
+        ]
+    )
+
+    outcome = ReportJobExecutor(role, decision_gate=gate).execute(
+        idea=idea,
+        job=job,
+        attempt=attempt,
+        store=store,
+    )
+
+    assert outcome.success
+    assert outcome.decision == "complete"
+    assert len(role.prompts) == 2
+    report = json.loads(
+        (store.current_dir(idea.idea_id) / "report.json").read_text()
+    )
+    assert report["title"] == "Corrected"
+    durable = store.get_attempt(attempt.attempt_id)
+    assert durable is not None
+    assert durable.status is AttemptStatus.ACCEPTED
+    assert len(durable.validation["report_revisions"]) == 2
 
 
 class _CompilerRepairRole(_Role):

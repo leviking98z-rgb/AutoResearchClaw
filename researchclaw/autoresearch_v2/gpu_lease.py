@@ -259,9 +259,9 @@ class SharedGPULeaseRegistry:
                 """
                 SELECT idea_id, allocated_gpus
                 FROM leases
-                WHERE pool_id=?
+                WHERE pool_id=? AND expires_at > ?
                 """,
-                (self.pool_id,),
+                (self.pool_id, now),
             ).fetchall()
             used = sum(int(row["allocated_gpus"]) for row in rows)
             used_by_idea = sum(

@@ -273,6 +273,30 @@ def test_design_job_uses_one_outer_attempt(tmp_path: Path) -> None:
     controller._pool.shutdown(wait=True)
 
 
+def test_report_job_uses_one_outer_attempt(tmp_path: Path) -> None:
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([]),
+        executors={kind: _SlowExecutor() for kind in JobKind},
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    idea = candidate_to_idea(_candidate(0))
+    idea.status = IdeaStatus.REPORTING
+    controller.store.save_idea(idea)
+    controller._ensure_jobs()
+
+    report = next(
+        job
+        for job in controller.store.list_jobs()
+        if job.kind is JobKind.REPORT
+    )
+    assert report.attempt_limit == 1
+    controller.request_stop()
+    controller._pool.shutdown(wait=True)
+
+
 def test_restart_recovers_running_job_without_spending_retry_budget(
     tmp_path: Path,
 ) -> None:

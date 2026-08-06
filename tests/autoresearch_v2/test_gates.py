@@ -9,6 +9,7 @@ from researchclaw.autoresearch_v2.gates import (
     DESIGN_BLOCKER_EVIDENCE_PREFIXES,
     LLMDecisionGate,
     _design_verdict,
+    _report_preflight,
     _validate_design,
     design_preflight,
 )
@@ -219,6 +220,67 @@ def test_design_response_cannot_choose_retry_or_cite_mechanics() -> None:
     errors = _validate_design(value)
     assert "decision is Controller-derived and must be omitted" in errors
     assert any("disallowed path" in error for error in errors)
+
+
+def test_report_preflight_rejects_missing_or_non_evidence_measured_paths() -> None:
+    report = {
+        "claims": [
+            {
+                "claim": "Measured effect.",
+                "evidence_paths": [
+                    "/idea/primary_metric",
+                    "/evidence/pilot/metrics/missing",
+                ],
+                "strength": "measured",
+            }
+        ]
+    }
+    context = {
+        "idea": {"primary_metric": "accuracy"},
+        "evidence": {
+            "pilot": {"metrics": {"endpoint_correct_diff": 0.0}}
+        },
+    }
+
+    verdict = _report_preflight(report, context)
+
+    assert verdict is not None
+    assert verdict.decision == "retry"
+    assert any(
+        "measured claim must cite /evidence/" in change
+        for change in verdict.required_changes
+    )
+    assert any(
+        "missing evidence path" in change
+        for change in verdict.required_changes
+    )
+
+
+def test_report_preflight_accepts_existing_json_pointers() -> None:
+    report = {
+        "claims": [
+            {
+                "claim": "Measured effect was zero.",
+                "evidence_paths": [
+                    "/evidence/pilot/metrics/endpoint_correct_diff"
+                ],
+                "strength": "measured",
+            },
+            {
+                "claim": "The hypothesis predicted improvement.",
+                "evidence_paths": ["/idea/falsifiable_hypothesis"],
+                "strength": "hypothesis",
+            },
+        ]
+    }
+    context = {
+        "idea": {"falsifiable_hypothesis": "improves"},
+        "evidence": {
+            "pilot": {"metrics": {"endpoint_correct_diff": 0.0}}
+        },
+    }
+
+    assert _report_preflight(report, context) is None
 
 
 class _Client:

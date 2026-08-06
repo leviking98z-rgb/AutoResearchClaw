@@ -1304,45 +1304,61 @@ class ReportJobExecutor:
     ) -> JobOutcome:
         started = time.monotonic()
         candidate = store.snapshot_current(attempt)
-        context = {
-            "idea": idea.to_dict(),
-            "plan": _read_json(candidate / "plan.json"),
-            "metrics": _collect_metrics(candidate / "artifacts"),
-        }
+        context = self._report_context(
+            idea=idea,
+            candidate=candidate,
+        )
+        previous_report, previous_review = self._previous_attempt_context(
+            job=job,
+            attempt=attempt,
+            store=store,
+        )
         result = self.role.call(
-            self._prompt(context),
+            self._prompt(
+                context,
+                previous_report=previous_report,
+                previous_review=previous_review,
+            ),
             max_tokens=18000,
-            temperature=0.20,
+            temperature=0.10 if previous_report else 0.20,
         )
-        _write_json(candidate / "report.json", result.value)
-        (candidate / "paper.md").write_text(
-            str(result.value["paper_markdown"]),
-            encoding="utf-8",
-        )
+        total_tokens = result.total_tokens
+        report = dict(result.value)
+        review_history: list[dict[str, Any]] = []
         gate_tokens = 0
-        if self.decision_gate is not None:
+        verdict = None
+        for revision in range(2):
+            _write_json(candidate / "report.json", report)
+            (candidate / "paper.md").write_text(
+                str(report["paper_markdown"]),
+                encoding="utf-8",
+            )
+            if self.decision_gate is None:
+                break
             verdict = self.decision_gate.review_report(
                 idea,
-                result.value,
-                context["metrics"],
+                report,
+                context,
             )
-            gate_tokens = verdict.tokens
-            _write_json(
-                candidate / "final_review.json",
-                verdict.raw or {
-                    "decision": verdict.decision,
-                    "reason": verdict.reason,
-                    "confidence": verdict.confidence,
-                    "risks": list(verdict.risks),
-                    "required_changes": list(verdict.required_changes),
-                },
-            )
-            if verdict.decision != "complete":
+            gate_tokens += verdict.tokens
+            review = verdict.raw or {
+                "decision": verdict.decision,
+                "reason": verdict.reason,
+                "confidence": verdict.confidence,
+                "risks": list(verdict.risks),
+                "required_changes": list(verdict.required_changes),
+            }
+            review_history.append(dict(review))
+            _write_json(candidate / "final_review.json", review)
+            if verdict.decision == "complete":
+                break
+            if verdict.decision != "retry" or revision >= 1:
                 attempt.status = AttemptStatus.REJECTED
                 attempt.error = verdict.reason
                 attempt.validation = {
                     "ok": False,
-                    "decision_gate": verdict.raw or {},
+                    "decision_gate": review,
+                    "report_revisions": review_history,
                 }
                 attempt.output_manifest = {
                     "files": [
@@ -1356,12 +1372,39 @@ class ReportJobExecutor:
                     verdict.decision == "reject",
                     verdict.decision,
                     verdict.reason,
-                    {"decision_gate": verdict.raw or {}},
-                    tokens=result.total_tokens + gate_tokens,
+                    {
+                        "decision_gate": review,
+                        "report_revisions": review_history,
+                    },
+                    tokens=total_tokens + gate_tokens,
                     elapsed_sec=time.monotonic() - started,
                 )
+            repaired = self.role.call(
+                self._repair_prompt(
+                    context=context,
+                    report=report,
+                    review=review,
+                ),
+                max_tokens=18000,
+                temperature=0.05,
+            )
+            total_tokens += repaired.total_tokens
+            report = dict(repaired.value)
         attempt.validation = {"ok": True}
-        attempt.output_manifest = {"files": ["report.json", "paper.md"]}
+        if review_history:
+            attempt.validation["decision_gate"] = review_history[-1]
+            attempt.validation["report_revisions"] = review_history
+        attempt.output_manifest = {
+            "files": [
+                "report.json",
+                "paper.md",
+                *(
+                    ["final_review.json"]
+                    if self.decision_gate is not None
+                    else []
+                ),
+            ]
+        }
         attempt.status = AttemptStatus.VALIDATING
         store.save_attempt(attempt)
         store.commit_candidate(attempt)
@@ -1370,27 +1413,150 @@ class ReportJobExecutor:
             "complete",
             "paper_package_generated",
             {"paper": str(store.current_dir(idea.idea_id) / "paper.md")},
-            tokens=result.total_tokens + gate_tokens,
+            tokens=total_tokens + gate_tokens,
             elapsed_sec=time.monotonic() - started,
         )
 
     @staticmethod
-    def _prompt(context: Mapping[str, Any]) -> str:
+    def _report_context(
+        *,
+        idea: IdeaRecord,
+        candidate: Path,
+    ) -> dict[str, Any]:
+        plan = _read_json(candidate / "plan.json")
+        evidence = _collect_report_evidence(candidate / "artifacts")
+        return {
+            "idea": {
+                "idea_id": idea.idea_id,
+                "title": idea.title,
+                "research_question": idea.research_question,
+                "falsifiable_hypothesis": idea.falsifiable_hypothesis,
+                "primary_metric": idea.primary_metric,
+                "final_outcome": idea.candidate.get("final_outcome", ""),
+                "scientific_exit_reason": idea.exit_reason,
+                "models": idea.candidate.get("models", []),
+                "datasets": idea.candidate.get("datasets", []),
+                "baselines": idea.candidate.get("baselines", []),
+                "ablations": idea.candidate.get("ablations", []),
+                "novelty_gap": idea.candidate.get("novelty_gap", ""),
+                "closest_prior_work": idea.candidate.get(
+                    "closest_prior_work",
+                    [],
+                ),
+            },
+            "plan": plan,
+            "evidence": evidence,
+        }
+
+    @staticmethod
+    def _previous_attempt_context(
+        *,
+        job: JobRecord,
+        attempt: AttemptRecord,
+        store: V2Store,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if attempt.number <= 1:
+            return {}, {}
+        previous = [
+            item
+            for item in store.list_attempts(job_id=job.job_id)
+            if item.number < attempt.number
+        ]
+        if not previous:
+            return {}, {}
+        prior = max(previous, key=lambda item: item.number)
+        candidate = store.attempt_dir(prior) / "candidate"
+        return (
+            _read_json(candidate / "report.json"),
+            _read_json(candidate / "final_review.json"),
+        )
+
+    @staticmethod
+    def _prompt(
+        context: Mapping[str, Any],
+        *,
+        previous_report: Mapping[str, Any] | None = None,
+        previous_review: Mapping[str, Any] | None = None,
+    ) -> str:
+        revision = ""
+        if previous_report:
+            revision = f"""\
+
+This is a REVISION of a report that failed evidence review. Preserve the
+research question and measured results, but correct every review finding.
+
+PREVIOUS REPORT:
+{json.dumps(dict(previous_report), ensure_ascii=False, indent=2)[:30000]}
+
+PREVIOUS FINAL REVIEW:
+{json.dumps(dict(previous_review or {}), ensure_ascii=False, indent=2)[:12000]}
+"""
         return f"""\
 Produce an evidence-bounded research report from:
-{json.dumps(context, ensure_ascii=False, indent=2)[:40000]}
+{json.dumps(context, ensure_ascii=False, indent=2)[:70000]}
+{revision}
 
 Return JSON:
 {{
   "title": "...",
   "claims": [
-    {{"claim": "...", "evidence_paths": ["..."], "strength": "measured|hypothesis"}}
+    {{
+      "claim": "...",
+      "evidence_paths": [
+        "/evidence/pilot/metrics/endpoint_correct_diff"
+      ],
+      "strength": "measured|hypothesis"
+    }}
   ],
   "limitations": ["..."],
   "next_experiments": ["..."],
   "paper_markdown": "# Title\\n..."
 }}
 Do not invent results, citations, or runs. Clearly report negative results.
+The EVIDENCE object is authoritative for measured outcomes. Every measured
+claim must cite one or more exact JSON-pointer paths beginning with
+"/evidence/"; never cite Python-style paths such as idea.*, plan.*, or
+artifacts/*. Hypotheses and design descriptions may cite exact "/plan/" or
+"/idea/" JSON pointers. Reconcile measured call counts with planned workload
+rather than silently asserting protocol adherence. Use "pre-specified", not
+"preregistered", unless the supplied evidence contains an immutable,
+time-stamped preregistration artifact.
+"""
+
+    @staticmethod
+    def _repair_prompt(
+        *,
+        context: Mapping[str, Any],
+        report: Mapping[str, Any],
+        review: Mapping[str, Any],
+    ) -> str:
+        return f"""\
+Repair the exact report below using the authoritative context and final-review
+findings. Return one complete corrected JSON report, not a patch. Preserve
+valid prose and change only claims, evidence paths, numeric results,
+limitations, and interpretations that the review identifies as wrong.
+
+AUTHORITATIVE CONTEXT:
+{json.dumps(dict(context), ensure_ascii=False, indent=2)[:70000]}
+
+REJECTED REPORT:
+{json.dumps(dict(report), ensure_ascii=False, indent=2)[:30000]}
+
+FINAL REVIEW:
+{json.dumps(dict(review), ensure_ascii=False, indent=2)[:16000]}
+
+Every measured claim must cite exact JSON-pointer paths beginning with
+"/evidence/". Never claim measured metrics are unavailable when they appear in
+the context. Reconcile planned and measured call counts explicitly. Return:
+{{
+  "title": "...",
+  "claims": [
+    {{"claim": "...", "evidence_paths": ["/evidence/..."], "strength": "measured|hypothesis"}}
+  ],
+  "limitations": ["..."],
+  "next_experiments": ["..."],
+  "paper_markdown": "# Title\\n..."
+}}
 """
 
 
@@ -1465,6 +1631,45 @@ def _collect_metrics(root: Path) -> list[dict[str, Any]]:
         }
         for path in sorted(root.rglob("metrics.json"))
     ]
+
+
+def _collect_report_evidence(root: Path) -> dict[str, Any]:
+    """Expose one deterministic, path-stable evidence object to report roles."""
+
+    evidence: dict[str, Any] = {}
+    if not root.is_dir():
+        return evidence
+    for mode_dir in sorted(
+        (path for path in root.iterdir() if path.is_dir()),
+        key=lambda path: path.name,
+    ):
+        metrics = _read_json(mode_dir / "metrics.json")
+        runtime = _read_json(mode_dir / "runtime_evidence.json")
+        if not metrics and not runtime:
+            continue
+        evidence[mode_dir.name] = {
+            "metrics": dict(metrics.get("metrics", {}) or {}),
+            "decision": str(metrics.get("decision", "") or ""),
+            "result_valid": metrics.get("result_valid"),
+            "runtime": {
+                key: runtime.get(key)
+                for key in (
+                    "evidence_valid",
+                    "gate_decision",
+                    "gate_statistic_defined",
+                    "criterion_results",
+                    "call_counts",
+                    "examples_processed",
+                    "examples_by_role",
+                    "model_loaded",
+                    "datasets_loaded",
+                    "seeds",
+                    "split_identifiers",
+                )
+                if key in runtime
+            },
+        }
+    return evidence
 
 
 class SimulatedJobExecutor:

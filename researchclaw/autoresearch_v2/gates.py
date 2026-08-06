@@ -91,7 +91,7 @@ class DecisionGate(Protocol):
         self,
         idea: IdeaRecord,
         report: Mapping[str, Any],
-        evidence: list[dict[str, Any]],
+        evidence: Mapping[str, Any],
     ) -> GateVerdict: ...
 
 
@@ -174,6 +174,95 @@ def _validate_experiment(value: Mapping[str, Any]) -> list[str]:
 
 def _validate_report(value: Mapping[str, Any]) -> list[str]:
     return _validate_common(value, {"complete", "retry", "reject"})
+
+
+def _resolve_json_pointer(document: Any, pointer: str) -> tuple[bool, Any]:
+    if not pointer.startswith("/"):
+        return False, None
+    current = document
+    for raw in pointer[1:].split("/"):
+        token = raw.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, Mapping):
+            if token not in current:
+                return False, None
+            current = current[token]
+            continue
+        if isinstance(current, list):
+            try:
+                index = int(token)
+            except (TypeError, ValueError):
+                return False, None
+            if index < 0 or index >= len(current):
+                return False, None
+            current = current[index]
+            continue
+        return False, None
+    return True, current
+
+
+def _report_preflight(
+    report: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> GateVerdict | None:
+    """Reject nonexistent claim paths before spending a review-model call."""
+
+    errors: list[str] = []
+    claims = report.get("claims")
+    if not isinstance(claims, list):
+        errors.append("claims must be a list")
+    else:
+        for index, claim in enumerate(claims):
+            if not isinstance(claim, Mapping):
+                errors.append(f"claims[{index}] must be an object")
+                continue
+            strength = str(claim.get("strength", "") or "")
+            if strength not in {"measured", "hypothesis"}:
+                errors.append(
+                    f"claims[{index}].strength must be measured|hypothesis"
+                )
+            paths = claim.get("evidence_paths")
+            if not isinstance(paths, list) or not paths:
+                errors.append(
+                    f"claims[{index}].evidence_paths must be non-empty"
+                )
+                continue
+            for path in paths:
+                if not isinstance(path, str):
+                    errors.append(
+                        f"claims[{index}].evidence_paths contains non-string"
+                    )
+                    continue
+                exists, _ = _resolve_json_pointer(context, path)
+                if not exists:
+                    errors.append(
+                        f"claims[{index}] cites missing evidence path: {path}"
+                    )
+                if strength == "measured" and not path.startswith(
+                    "/evidence/"
+                ):
+                    errors.append(
+                        f"claims[{index}] measured claim must cite /evidence/: "
+                        f"{path}"
+                    )
+    if not errors:
+        return None
+    reason = "; ".join(errors[:8])
+    raw = {
+        "decision": "retry",
+        "reason": reason,
+        "confidence": 1.0,
+        "risks": ["claim-evidence paths failed deterministic validation"],
+        "required_changes": errors,
+        "preflight": True,
+    }
+    return GateVerdict(
+        decision="retry",
+        reason=reason,
+        confidence=1.0,
+        risks=("claim-evidence paths failed deterministic validation",),
+        required_changes=tuple(errors),
+        raw=raw,
+    )
 
 
 def _validate_common(
@@ -358,23 +447,55 @@ Return:
         self,
         idea: IdeaRecord,
         report: Mapping[str, Any],
-        evidence: list[dict[str, Any]],
+        evidence: Mapping[str, Any],
     ) -> GateVerdict:
+        supplied = dict(evidence)
+        if (
+            isinstance(supplied.get("idea"), Mapping)
+            and isinstance(supplied.get("evidence"), Mapping)
+        ):
+            context = supplied
+        else:
+            context = {
+                "idea": {
+                    "idea_id": idea.idea_id,
+                    "title": idea.title,
+                    "research_question": idea.research_question,
+                    "falsifiable_hypothesis": idea.falsifiable_hypothesis,
+                    "primary_metric": idea.primary_metric,
+                    "final_outcome": idea.candidate.get("final_outcome", ""),
+                    "scientific_exit_reason": idea.exit_reason,
+                    "models": idea.candidate.get("models", []),
+                    "datasets": idea.candidate.get("datasets", []),
+                    "baselines": idea.candidate.get("baselines", []),
+                    "ablations": idea.candidate.get("ablations", []),
+                    "novelty_gap": idea.candidate.get("novelty_gap", ""),
+                    "closest_prior_work": idea.candidate.get(
+                        "closest_prior_work",
+                        [],
+                    ),
+                },
+                "evidence": supplied,
+            }
+        preflight = _report_preflight(report, context)
+        if preflight is not None:
+            return preflight
         result = self._report.call(
             f"""\
 Audit the final claim-evidence package.
 
 IDEA:
-{json.dumps(idea.candidate, ensure_ascii=False, indent=2)[:12000]}
+{json.dumps(context["idea"], ensure_ascii=False, indent=2)[:12000]}
 
 REPORT:
 {json.dumps(dict(report), ensure_ascii=False, indent=2)[:24000]}
 
 MEASURED EVIDENCE:
-{json.dumps(evidence, ensure_ascii=False, indent=2)[:24000]}
+{json.dumps(context["evidence"], ensure_ascii=False, indent=2)[:36000]}
 
 Every measured claim must name an existing evidence path and must not be
-stronger than the evidence. Hypotheses must be labelled as hypotheses.
+stronger than the evidence. Hypotheses must be labelled as hypotheses. Evidence
+paths are JSON pointers into a root object with "/idea" and "/evidence".
 
 Return:
 {{
