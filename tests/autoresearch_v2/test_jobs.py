@@ -153,6 +153,16 @@ def test_report_evidence_uses_stable_nested_paths(tmp_path: Path) -> None:
                 "evidence_valid": True,
                 "gate_decision": "reject",
                 "gate_statistic_defined": True,
+                "gpu_count": 1,
+                "dataset_roles": {
+                    "GSM8K screening": {
+                        "role": "screening",
+                        "split_id": "gsm8k-screening-v1",
+                    }
+                },
+                "example_diagnostics": {
+                    "canonical_examples_processed": 24,
+                },
                 "criterion_results": {
                     "primary_effect": {"value": 0.0, "passed": False}
                 },
@@ -166,6 +176,13 @@ def test_report_evidence_uses_stable_nested_paths(tmp_path: Path) -> None:
 
     assert evidence["pilot"]["metrics"]["endpoint_correct_diff"] == 0.0
     assert evidence["pilot"]["runtime"]["call_counts"]["total_calls"] == 504
+    assert evidence["pilot"]["runtime"]["gpu_count"] == 1
+    assert evidence["pilot"]["runtime"]["dataset_roles"][
+        "GSM8K screening"
+    ]["role"] == "screening"
+    assert evidence["pilot"]["runtime"]["example_diagnostics"][
+        "canonical_examples_processed"
+    ] == 24
 
 
 def test_report_retries_in_place_and_commits_corrected_package(
