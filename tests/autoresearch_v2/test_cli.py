@@ -23,6 +23,8 @@ def test_signal_handlers_request_cooperative_stop(monkeypatch) -> None:
         "signal",
         lambda signum, handler: calls.append((signum, handler)),
     )
+    hard_exits = []
+    monkeypatch.setattr(cli.os, "_exit", lambda code: hard_exits.append(code))
 
     previous = cli._install_stop_handlers(controller)
     installed = dict(calls)
@@ -30,7 +32,8 @@ def test_signal_handlers_request_cooperative_stop(monkeypatch) -> None:
     installed[signal.SIGINT](signal.SIGINT, None)
     cli._restore_signal_handlers(previous)
 
-    assert stops == ["SIGTERM", "SIGINT"]
+    assert hard_exits == [0]
+    assert stops == ["SIGINT"]
     assert previous == {
         signal.SIGTERM: "old-SIGTERM",
         signal.SIGINT: "old-SIGINT",

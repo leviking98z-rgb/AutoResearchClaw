@@ -352,26 +352,29 @@ prose, not as components. This pilot must use 16-50 screening examples, at most
         previous_value: Mapping[str, Any],
         errors: list[str],
     ) -> str:
-        """Keep deterministic schema repair local to the rejected draft."""
+        """Keep typed-draft repair local to model-owned scientific fields."""
 
         return f"""\
 Repair the exact prior JSON below; do not redesign the study, add arms, change
 the Idea, or expand the scientific protocol. Preserve every field not named by
 the validation errors.
 
-For arithmetic errors, recompute declarations from the already stated plan:
-- sample_accounting.total_model_calls =
-  arms * examples_per_arm * seeds * calls_per_example;
-- workload_budget.conditions = sample_accounting.arms;
-- workload_budget.models = sample_accounting.calls_per_example (this field is
-  calls per arm-example-seed unit, not distinct model identities);
-- workload_budget.examples = sample_accounting.examples_per_arm;
-- workload_budget.seeds = sample_accounting.seeds;
-- workload_budget.estimated_model_calls =
-  sample_accounting.total_model_calls.
-For effect_threshold.scale use exactly one of: "proportion",
-"percentage_points", or "absolute". Do not weaken the threshold merely to pass
-validation.
+This is a typed scientific draft, not the compiled plan. Do not add or edit
+sample_accounting, workload totals, split IDs, decision_table, or required
+runtime evidence; the Controller derives those fields.
+
+For call_ledger:
+- allowed names are adaptation, candidate_generation, verifier_scoring,
+  calibration, memory_writing, shadow_continuation, baseline_reference,
+  final_evaluation;
+- allowed scopes are per_arm_example_seed, per_example_seed, per_arm_seed,
+  per_seed, fixed;
+- scopes containing "arm" may name an exact arm subset;
+- scopes containing "example" require dataset_role development or screening;
+- every calls_per_unit must be a positive integer.
+
+For effect_threshold.scale use exactly proportion, percentage_points, or
+absolute. Do not weaken the scientific threshold merely to pass validation.
 
 PRIOR JSON TO REPAIR:
 {json.dumps(dict(previous_value), ensure_ascii=False, indent=2)[:24000]}

@@ -45,7 +45,14 @@ def _install_stop_handlers(
     ] = {}
 
     def request_stop(signum: int, _frame: FrameType | None) -> None:
-        controller.request_stop(reason=signal.Signals(signum).name)
+        reason = signal.Signals(signum).name
+        if signum == signal.SIGTERM:
+            # Do not touch SQLite or wait for non-cancellable model threads
+            # from the POSIX signal path. Jobs and attempts are persisted
+            # before dispatch; the next process audits and refunds them.
+            os._exit(0)
+            return
+        controller.request_stop(reason=reason)
 
     for signum in (signal.SIGTERM, signal.SIGINT):
         previous[signum] = signal.getsignal(signum)

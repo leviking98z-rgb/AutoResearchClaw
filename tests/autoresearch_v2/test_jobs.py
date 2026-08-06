@@ -341,7 +341,8 @@ def test_design_structured_retry_repairs_prior_json_locally() -> None:
     assert "Repair the exact prior JSON below" in client.requests[1]
     assert '"scale": "proportion_points"' in client.requests[1]
     assert "do not redesign the study" in client.requests[1]
-    assert "calls per arm-example-seed unit" in client.requests[1]
+    assert "per_arm_example_seed" in client.requests[1]
+    assert "Controller derives those fields" in client.requests[1]
 
 
 def test_build_smoke_can_defer_to_controller_managed_gpu_environment(
