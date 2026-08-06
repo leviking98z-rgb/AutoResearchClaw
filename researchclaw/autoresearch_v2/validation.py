@@ -310,6 +310,7 @@ def validate_plan(value: dict[str, Any]) -> list[str]:
         value.get("decision_table"),
         errors,
         structured=phase_aware,
+        metric_direction=value.get("metric_direction"),
     )
     return _deduplicate(errors)
 
@@ -1334,18 +1335,21 @@ def _validate_decision_table(
     errors: list[str],
     *,
     structured: bool,
+    metric_direction: Any = None,
 ) -> None:
     if not isinstance(table, list) or not table:
         errors.append("decision_table must cover every outcome region")
         return
 
     conditions: list[tuple[int, Mapping[str, Any]]] = []
+    decisions: list[tuple[int, Mapping[str, Any], str]] = []
     seen: dict[str, int] = {}
     for index, row in enumerate(table):
         if not isinstance(row, Mapping):
             errors.append(f"invalid decision_table[{index}]")
             continue
         condition = row.get("condition")
+        parsed_condition: Any = None
         if condition is None and structured:
             direct = {
                 key: child
@@ -1358,7 +1362,7 @@ def _validate_decision_table(
         ):
             errors.append(f"missing decision_table[{index}].condition")
         else:
-            parsed_condition: Any = condition
+            parsed_condition = condition
             if structured and isinstance(condition, str):
                 parsed_condition = _legacy_condition_region(condition)
             signature = _condition_signature(condition)
@@ -1378,11 +1382,59 @@ def _validate_decision_table(
                     )
                 else:
                     conditions.append((index, parsed_condition))
-        if row.get("decision") not in {"promote", "retry", "reject"}:
+        decision = row.get("decision")
+        if decision not in {"promote", "retry", "reject"}:
             errors.append(f"invalid decision_table[{index}].decision")
+        elif structured and isinstance(parsed_condition, Mapping):
+            decisions.append((index, parsed_condition, decision))
 
     if structured:
         _validate_structured_outcomes(conditions, errors)
+        _validate_directional_decisions(
+            decisions,
+            metric_direction=metric_direction,
+            errors=errors,
+        )
+
+
+def _validate_directional_decisions(
+    decisions: list[tuple[int, Mapping[str, Any], str]],
+    *,
+    metric_direction: Any,
+    errors: list[str],
+) -> None:
+    """Reject categorical decision tables that invert metric direction."""
+
+    if metric_direction not in {"maximize", "minimize"}:
+        errors.append("metric_direction must be maximize or minimize")
+        return
+
+    if metric_direction == "maximize":
+        expected = {
+            "invalid": "retry",
+            "below_effect_threshold": "reject",
+            "at_or_above_effect_threshold": "promote",
+        }
+    else:
+        expected = {
+            "invalid": "retry",
+            "below_effect_threshold": "promote",
+            "at_or_above_effect_threshold": "reject",
+        }
+
+    for index, condition, decision in decisions:
+        region, region_error = _outcome_region(condition)
+        if region_error or region is None:
+            # Numeric intervals and malformed regions are handled by the
+            # exhaustive-outcome validator.
+            continue
+        expected_decision = expected[region]
+        if decision != expected_decision:
+            errors.append(
+                f"decision_table[{index}].decision={decision!r} conflicts "
+                f"with metric_direction={metric_direction!r}: outcome "
+                f"region {region!r} must use {expected_decision!r}"
+            )
 
 
 def _legacy_condition_region(

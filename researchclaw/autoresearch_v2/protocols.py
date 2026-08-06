@@ -189,20 +189,9 @@ def compile_screening_protocol(
         "max_new_tokens": max_new_tokens,
         "estimated_model_calls": total_calls,
     }
-    plan["decision_table"] = [
-        {
-            "condition": {"region": "invalid"},
-            "decision": "retry",
-        },
-        {
-            "condition": {"region": "at_or_above_effect_threshold"},
-            "decision": "promote",
-        },
-        {
-            "condition": {"region": "below_effect_threshold"},
-            "decision": "reject",
-        },
-    ]
+    plan["decision_table"] = _compile_decision_table(
+        plan.get("metric_direction")
+    )
     plan["confirmatory_followup"] = _compile_confirmatory_followup(
         plan.get("confirmatory_followup"),
         pilot=pilot,
@@ -234,6 +223,36 @@ def compile_screening_protocol(
         ],
     }
     return plan
+
+
+def _compile_decision_table(metric_direction: Any) -> list[dict[str, Any]]:
+    """Compile exhaustive outcomes with direction-aware gate semantics."""
+
+    if metric_direction == "maximize":
+        promote_region = "at_or_above_effect_threshold"
+        reject_region = "below_effect_threshold"
+    elif metric_direction == "minimize":
+        promote_region = "below_effect_threshold"
+        reject_region = "at_or_above_effect_threshold"
+    else:
+        raise ValueError(
+            "metric_direction must be maximize or minimize before protocol "
+            "compilation"
+        )
+    return [
+        {
+            "condition": {"region": "invalid"},
+            "decision": "retry",
+        },
+        {
+            "condition": {"region": promote_region},
+            "decision": "promote",
+        },
+        {
+            "condition": {"region": reject_region},
+            "decision": "reject",
+        },
+    ]
 
 
 def validate_protocol_draft(value: Mapping[str, Any]) -> list[str]:

@@ -130,6 +130,44 @@ def test_compiler_owns_arithmetic_splits_and_decision_regions() -> None:
     assert validate_plan(plan) == []
 
 
+@pytest.mark.parametrize(
+    ("metric_direction", "expected"),
+    [
+        (
+            "maximize",
+            {
+                "invalid": "retry",
+                "below_effect_threshold": "reject",
+                "at_or_above_effect_threshold": "promote",
+            },
+        ),
+        (
+            "minimize",
+            {
+                "invalid": "retry",
+                "below_effect_threshold": "promote",
+                "at_or_above_effect_threshold": "reject",
+            },
+        ),
+    ],
+)
+def test_compiler_decision_table_respects_metric_direction(
+    metric_direction: str,
+    expected: dict[str, str],
+) -> None:
+    draft = _draft()
+    draft["metric_direction"] = metric_direction
+
+    plan = compile_screening_protocol(_idea(), draft)
+
+    actual = {
+        row["condition"]["region"]: row["decision"]
+        for row in plan["decision_table"]
+    }
+    assert actual == expected
+    assert validate_plan(plan) == []
+
+
 def test_compiler_rejects_unbounded_protocols_and_missing_control() -> None:
     draft = _draft()
     draft["protocol_template"] = "arbitrary_free_form"

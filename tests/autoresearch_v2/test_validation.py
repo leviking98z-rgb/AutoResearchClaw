@@ -409,6 +409,28 @@ def test_decision_table_numeric_intervals_must_partition_outcomes() -> None:
     assert any("overlap at their boundary" in error for error in errors)
 
 
+def test_decision_table_must_respect_metric_direction() -> None:
+    plan = _screening_plan()
+    plan["metric_direction"] = "minimize"
+
+    errors = validate_plan(plan)
+
+    assert any(
+        "region 'below_effect_threshold' must use 'promote'" in error
+        for error in errors
+    )
+    assert any(
+        "region 'at_or_above_effect_threshold' must use 'reject'" in error
+        for error in errors
+    )
+
+    table = plan["decision_table"]
+    assert isinstance(table, list)
+    table[1]["decision"] = "promote"
+    table[2]["decision"] = "reject"
+    assert validate_plan(plan) == []
+
+
 def test_heldout_dataset_must_not_participate_in_adaptation() -> None:
     plan = _screening_plan()
     plan["adaptation"] = {
