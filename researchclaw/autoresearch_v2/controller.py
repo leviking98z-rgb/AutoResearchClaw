@@ -28,7 +28,13 @@ from .attestation import (
 from .config import V2Config
 from .gpu import GPUBroker
 from .ideas import IdeaAdmission, IdeaGenerator
-from .jobs import JobExecutor, JobOutcome, SimulatedJobExecutor, _experiment_gate
+from .jobs import (
+    JobExecutor,
+    JobOutcome,
+    SimulatedJobExecutor,
+    _experiment_gate,
+    resolve_experiment_lifecycle_gate,
+)
 from .models import (
     ACTIVE_IDEA_STATUSES,
     AttemptRecord,
@@ -760,12 +766,9 @@ class V2Controller:
             idea = self.store.get_idea(job.idea_id)
             if idea is None:
                 continue
-            if (
-                self._is_remote_smoke_job(job)
-                and self._block_unchanged_remote_smoke(
-                    idea=idea,
-                    job=job,
-                )
+            if self._block_unchanged_gpu_implementation(
+                idea=idea,
+                job=job,
             ):
                 continue
             budget_reason = self._budget_block_reason(idea, job)
@@ -1175,6 +1178,32 @@ class V2Controller:
                 )
                 continue
             plan = self._read_current_json(idea.idea_id, "plan.json")
+            source_compiler = self._candidate_runtime_compiler(
+                output_dir.parent.parent
+            )
+            active_compiler = self._runtime_compiler_identity()
+            if (
+                source_compiler
+                and source_compiler != active_compiler
+            ):
+                wrapper_path = (
+                    output_dir.parent.parent
+                    / "_autoresearch_runtime.py"
+                )
+                from .runtime_wrapper import wrapper_source
+
+                wrapper_path.write_text(
+                    wrapper_source(),
+                    encoding="utf-8",
+                )
+                self.store.event(
+                    "runtime_wrapper_refreshed",
+                    idea_id=idea.idea_id,
+                    job_id=job.job_id,
+                    attempt_id=attempt.attempt_id,
+                    previous=source_compiler,
+                    current=active_compiler,
+                )
             wrapper = (
                 {"compiled": False, "simulation": True}
                 if self._simulation_mode
@@ -1249,6 +1278,45 @@ class V2Controller:
                 )
                 attempt.finished_at = utc_now()
                 self.store.save_attempt(attempt)
+                raw_artifacts_present = (
+                    (output_dir / "_raw" / "metrics.json").is_file()
+                    and (
+                        output_dir
+                        / "_raw"
+                        / "runtime_evidence.json"
+                    ).is_file()
+                )
+                deterministic_contract_failure = bool(
+                    raw_artifacts_present
+                    and (wrapper.get("error") or contract_errors)
+                )
+                if deterministic_contract_failure:
+                    diagnostics = {
+                        "failure_class": "runtime_contract_invalid",
+                        "failure_code": (
+                            f"{job.kind.value}_runtime_contract_invalid"
+                        ),
+                        "source_stage": job.kind.value,
+                        "returncode": returncode,
+                        "errors": list(validation.get("errors", [])),
+                        **self._implementation_failure_fingerprint(
+                            idea_id=idea.idea_id,
+                            errors=list(validation.get("errors", [])),
+                        ),
+                    }
+                    idea.candidate[
+                        "_autoresearch_v2_last_implementation_failure"
+                    ] = diagnostics
+                    self._queue_build_repair(
+                        idea=idea,
+                        job=job,
+                        attempt=attempt,
+                        reason=(
+                            f"{job.kind.value}_runtime_contract_invalid"
+                        ),
+                        diagnostics=diagnostics,
+                    )
+                    continue
                 outcome = JobOutcome(
                     False,
                     "retry",
@@ -1286,6 +1354,10 @@ class V2Controller:
                         ),
                     }
                     gate_tokens = verdict.tokens
+                gate = resolve_experiment_lifecycle_gate(
+                    runtime_evidence=validation["runtime_evidence"],
+                    gate=gate,
+                )
                 decision_path = attempt_dir / "decision_review.json"
                 decision_path.write_text(
                     json.dumps(
@@ -1653,14 +1725,35 @@ class V2Controller:
             return {"error": f"runtime_artifact_compile_failed: {exc}"}
         return {"compiled": True, **value}
 
+    @staticmethod
+    def _runtime_compiler_identity() -> str:
+        from .runtime_wrapper import WRAPPER_SCHEMA, WRAPPER_VERSION
+
+        return f"{WRAPPER_SCHEMA}:v{WRAPPER_VERSION}"
+
+    @staticmethod
+    def _candidate_runtime_compiler(candidate: Path) -> str:
+        build_path = candidate / "build.json"
+        try:
+            build = json.loads(build_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return ""
+        runtime = build.get("controller_runtime")
+        if not isinstance(runtime, Mapping):
+            return ""
+        schema = str(runtime.get("schema", "") or "")
+        try:
+            version = int(runtime.get("version", -1))
+        except (TypeError, ValueError):
+            return ""
+        return f"{schema}:v{version}" if schema and version >= 0 else ""
+
     def _implementation_failure_fingerprint(
         self,
         *,
         idea_id: str,
         errors: list[Any],
     ) -> dict[str, str]:
-        from .runtime_wrapper import WRAPPER_SCHEMA, WRAPPER_VERSION
-
         current = self.store.current_dir(idea_id)
         implementation = validate_research_implementation(
             current,
@@ -1675,7 +1768,7 @@ class V2Controller:
             build = self._read_current_json(idea_id, "build.json")
         except (OSError, ValueError, json.JSONDecodeError):
             build = {}
-        runtime_compiler = f"{WRAPPER_SCHEMA}:v{WRAPPER_VERSION}"
+        runtime_compiler = self._runtime_compiler_identity()
         implementation_identity = {
             "source_sha256": source_hashes,
             "build_sha256": canonical_json_sha256(build),
@@ -1697,7 +1790,7 @@ class V2Controller:
             "runtime_compiler": runtime_compiler,
         }
 
-    def _block_unchanged_remote_smoke(
+    def _block_unchanged_gpu_implementation(
         self,
         *,
         idea: IdeaRecord,
@@ -1709,6 +1802,11 @@ class V2Controller:
             "_autoresearch_v2_last_implementation_failure"
         )
         if not isinstance(prior, Mapping):
+            return False
+        if not (
+            self._is_remote_smoke_job(job)
+            or job.kind in {JobKind.PILOT, JobKind.SCALE}
+        ):
             return False
         prior_source = str(prior.get("source_sha256", "") or "")
         prior_errors = prior.get("errors")
@@ -1735,7 +1833,17 @@ class V2Controller:
             "blocked_before_gpu_submit": True,
         }
         idea.status = IdeaStatus.QUARANTINED
-        idea.exit_reason = "remote_smoke_no_progress"
+        reason = (
+            "remote_smoke_no_progress"
+            if self._is_remote_smoke_job(job)
+            else "gpu_implementation_no_progress"
+        )
+        event_type = (
+            "remote_smoke_blocked_no_progress"
+            if self._is_remote_smoke_job(job)
+            else "gpu_implementation_blocked_no_progress"
+        )
+        idea.exit_reason = reason
         idea.current_job_id = ""
         idea.last_progress_at = utc_now()
         job.status = JobStatus.FAILED
@@ -1743,14 +1851,14 @@ class V2Controller:
         job.result = {
             **job.result,
             "decision": "quarantine",
-            "reason": "remote_smoke_no_progress",
+            "reason": reason,
             "failure_class": "implementation_invalid",
             "diagnostics": diagnostics,
         }
         self.store.save_job(job)
         self.store.save_idea(idea)
         self.store.event(
-            "remote_smoke_blocked_no_progress",
+            event_type,
             idea_id=idea.idea_id,
             job_id=job.job_id,
             fingerprint=current.get("fingerprint", ""),
@@ -1827,7 +1935,7 @@ class V2Controller:
             idea=idea,
             job=job,
             attempt=attempt,
-            event_type="remote_smoke_returned_to_build",
+            event_type="gpu_implementation_returned_to_build",
             payload={
                 "reason": reason,
                 "repair_count": repair_count,
@@ -2183,7 +2291,23 @@ class V2Controller:
                 job.status = JobStatus.SUCCEEDED
                 job.retry_not_before = ""
                 idea.current_job_id = ""
-                if self._is_remote_smoke_job(job):
+                durable_gate = accepted.validation.get(
+                    "decision_gate",
+                    {},
+                )
+                durable_decision = str(
+                    durable_gate.get("decision", "")
+                    if isinstance(durable_gate, Mapping)
+                    else ""
+                ).casefold()
+                if durable_decision == "complete_negative":
+                    idea.status = IdeaStatus.REPORTING
+                    idea.candidate[
+                        "final_outcome"
+                    ] = "informative_negative"
+                elif durable_decision == "reject":
+                    idea.status = IdeaStatus.REJECTED
+                elif self._is_remote_smoke_job(job):
                     idea.status = IdeaStatus.PILOTING
                 else:
                     idea.status = {

@@ -427,6 +427,31 @@ def _validate_generated_runtime_schema(
                     "call_counts missing compiled components: "
                     + ", ".join(missing)
                 )
+        example_roles = resolved_keys(values.get("examples_by_role"))
+        if example_roles is not None and "screening" in example_roles:
+            processed_nodes = [
+                values.get("examples_processed"),
+                *subscript_assignments.get(
+                    "runtime_evidence",
+                    {},
+                ).get("examples_processed", []),
+            ]
+            for processed_node in processed_nodes:
+                candidates = (
+                    assignments.get(processed_node.id, [])
+                    if isinstance(processed_node, ast.Name)
+                    else [processed_node]
+                )
+                if any(
+                    isinstance(candidate, ast.BinOp)
+                    and isinstance(candidate.op, ast.Add)
+                    for candidate in candidates
+                ):
+                    errors.append(
+                        "examples_processed must count endpoint evaluation "
+                        "examples only, not add development examples"
+                    )
+                    break
 
     expected_criteria = {
         str(item.get("id", "") or "")
@@ -3079,6 +3104,19 @@ def validate_runtime_against_contract(
                         errors.append(
                             f"examples_by_role[{role}]={actual} exceeds "
                             f"pilot {maximum_field}={maximum}"
+                        )
+                try:
+                    processed = int(
+                        runtime_evidence.get("examples_processed", -1)
+                    )
+                    screening = int(examples_by_role.get("screening", -1))
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if processed != screening:
+                        errors.append(
+                            "examples_processed must equal "
+                            "examples_by_role[screening]"
                         )
     if mode in {"pilot", "scale"}:
         _validate_runtime_decision_contract(

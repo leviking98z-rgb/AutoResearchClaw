@@ -25,7 +25,7 @@ from typing import Any
 
 WRAPPER_FILENAME = "_autoresearch_runtime.py"
 WRAPPER_SCHEMA = "autoresearch_v2.controller_runtime"
-WRAPPER_VERSION = 1
+WRAPPER_VERSION = 2
 RAW_DIRNAME = "_raw"
 
 
@@ -167,13 +167,18 @@ def normalize_runtime_artifacts(
         raise RuntimeArtifactError(
             "runtime_evidence.datasets_loaded must be a non-empty list"
         )
-    examples_processed = _nonnegative_int(
+    reported_examples_processed = _nonnegative_int(
         raw_runtime.get("examples_processed"),
         "runtime_evidence.examples_processed",
     )
     seeds = _normalize_seeds(raw_runtime)
     examples_by_role = _normalize_examples_by_role(
         raw_runtime.get("examples_by_role")
+    )
+    examples_processed, example_diagnostics = _normalize_examples_processed(
+        mode=mode,
+        reported=reported_examples_processed,
+        examples_by_role=examples_by_role,
     )
     call_counts = _normalize_call_counts(raw_runtime.get("call_counts"))
     _validate_call_counts(
@@ -207,6 +212,8 @@ def normalize_runtime_artifacts(
         runtime["split_identifiers"] = split_identifiers
     if metric_diagnostics:
         runtime["metric_diagnostics"] = metric_diagnostics
+    if example_diagnostics:
+        runtime["example_diagnostics"] = example_diagnostics
 
     if mode == "smoke":
         evidence_valid = (
@@ -516,6 +523,42 @@ def _normalize_examples_by_role(value: Any) -> dict[str, int]:
             f"examples_by_role[{raw_role!r}]",
         )
     return normalized
+
+
+def _normalize_examples_processed(
+    *,
+    mode: str,
+    reported: int,
+    examples_by_role: Mapping[str, int],
+) -> tuple[int, dict[str, Any]]:
+    """Canonicalize the evaluated-example count without guessing a split.
+
+    ``pilot.max_examples`` and ``confirmatory_followup.examples`` describe
+    endpoint evaluation units. Development examples have a separate budget in
+    the compiled protocol, so they must not be added to
+    ``examples_processed``. Older generated workers reported the sum of every
+    role. We can migrate that representation only when the worker also
+    provided an explicit role accounting whose exact sum matches the scalar.
+    """
+
+    endpoint_role = "screening" if mode in {"smoke", "pilot"} else "confirmatory"
+    endpoint_count = examples_by_role.get(endpoint_role)
+    if endpoint_count is None:
+        return reported, {}
+    if reported == endpoint_count:
+        return reported, {}
+    role_total = sum(examples_by_role.values())
+    if reported == role_total:
+        return endpoint_count, {
+            "reported_examples_processed": reported,
+            "canonical_examples_processed": endpoint_count,
+            "normalization": "legacy_all_roles_total_to_endpoint_count",
+        }
+    raise RuntimeArtifactError(
+        "runtime_evidence.examples_processed must equal "
+        f"examples_by_role[{endpoint_role!r}]={endpoint_count}; "
+        f"reported {reported}"
+    )
 
 
 def _normalize_call_counts(value: Any) -> dict[str, int]:

@@ -1286,3 +1286,59 @@ model = AutoModelForCausalLM.from_pretrained(
     )
 
     assert result["ok"]
+
+
+def test_controller_runtime_rejects_adding_development_to_processed_count(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "main.py").write_text(
+        """
+import json
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM
+
+dataset = load_dataset("openai/gsm8k", "main", split="test")
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-1.5B-Instruct"
+)
+dev_items = list(range(16))
+endpoint_items = list(range(24))
+examples_by_role = {
+    "development": len(dev_items),
+    "screening": len(endpoint_items),
+}
+examples_processed = len(dev_items) + len(endpoint_items)
+runtime_evidence = {
+    "model_loaded": "Qwen/Qwen2.5-1.5B-Instruct",
+    "datasets_loaded": ["openai/gsm8k"],
+    "examples_processed": examples_processed,
+    "examples_by_role": examples_by_role,
+    "seeds": [0],
+    "gpu_count": 1,
+    "gate_decision": "reject",
+    "metrics": {"gain": 0.0},
+    "call_counts": {"final_evaluation": 24},
+}
+with open("runtime_evidence.json", "w") as f:
+    json.dump(runtime_evidence, f)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = validate_research_implementation(
+        tmp_path,
+        plan={
+            "required_runtime_evidence": [],
+            "call_ledger": {
+                "components": [
+                    {"name": "final_evaluation"},
+                ]
+            },
+        },
+    )
+
+    assert not result["ok"]
+    assert any(
+        "endpoint evaluation examples only" in error
+        for error in result["errors"]
+    )

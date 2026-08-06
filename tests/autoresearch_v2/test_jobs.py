@@ -9,6 +9,7 @@ from researchclaw.autoresearch_v2.ideas import candidate_to_idea
 from researchclaw.autoresearch_v2.jobs import (
     BuildJobExecutor,
     DesignJobExecutor,
+    resolve_experiment_lifecycle_gate,
 )
 from researchclaw.autoresearch_v2.llm import StructuredRole
 from researchclaw.autoresearch_v2.models import (
@@ -71,6 +72,47 @@ class _Role:
         del kwargs
         self.prompts.append(prompt)
         return SimpleNamespace(value=self.value, total_tokens=10)
+
+
+def test_valid_promotion_reject_becomes_reportable_negative() -> None:
+    gate = resolve_experiment_lifecycle_gate(
+        runtime_evidence={
+            "evidence_valid": True,
+            "gate_statistic_defined": True,
+            "gate_decision": "reject",
+            "criterion_results": {
+                "minimum_completed": {"value": 24.0, "passed": True},
+                "primary_effect": {"value": 0.0, "passed": False},
+            },
+        },
+        gate={
+            "decision": "reject",
+            "reason": "preregistered effect threshold not met",
+            "confidence": 0.99,
+            "risks": [],
+            "required_changes": [],
+        },
+    )
+
+    assert gate["decision"] == "complete_negative"
+    assert gate["scientific_decision"] == "reject"
+    assert gate["report_disposition"] == "reportable_negative"
+
+
+def test_invalid_runtime_reject_remains_terminal_reject() -> None:
+    gate = resolve_experiment_lifecycle_gate(
+        runtime_evidence={
+            "evidence_valid": False,
+            "gate_statistic_defined": True,
+            "gate_decision": "reject",
+            "criterion_results": {
+                "minimum_completed": {"value": 0.0, "passed": False},
+            },
+        },
+        gate={"decision": "reject", "reason": "invalid evidence"},
+    )
+
+    assert gate["decision"] == "reject"
 
 
 class _CompilerRepairRole(_Role):

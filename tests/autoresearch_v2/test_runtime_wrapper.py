@@ -185,6 +185,84 @@ def test_runtime_wrapper_rejects_missing_call_ledger_component(
         )
 
 
+def test_runtime_wrapper_normalizes_legacy_all_role_example_total(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "artifacts" / "pilot"
+    _write_raw(
+        output_dir,
+        runtime={
+            "model_loaded": "Qwen/Qwen2.5-1.5B-Instruct",
+            "datasets_loaded": ["GSM8K"],
+            "examples_processed": 6,
+            "seeds": [7],
+            "examples_by_role": {
+                "development": 2,
+                "screening": 4,
+            },
+            "call_counts": {
+                "adaptation": 8,
+                "final_evaluation": 16,
+            },
+        },
+    )
+
+    value = normalize_runtime_artifacts(
+        output_dir=output_dir,
+        plan=_plan(),
+        mode="pilot",
+        allocated_gpus=1,
+        cwd=tmp_path,
+    )
+
+    runtime = value["runtime_evidence"]
+    assert runtime["examples_processed"] == 4
+    assert runtime["examples_by_role"] == {
+        "development": 2,
+        "screening": 4,
+    }
+    assert runtime["example_diagnostics"] == {
+        "reported_examples_processed": 6,
+        "canonical_examples_processed": 4,
+        "normalization": "legacy_all_roles_total_to_endpoint_count",
+    }
+
+
+def test_runtime_wrapper_rejects_inconsistent_example_accounting(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "artifacts" / "pilot"
+    _write_raw(
+        output_dir,
+        runtime={
+            "model_loaded": "Qwen/Qwen2.5-1.5B-Instruct",
+            "datasets_loaded": ["GSM8K"],
+            "examples_processed": 5,
+            "seeds": [7],
+            "examples_by_role": {
+                "development": 2,
+                "screening": 4,
+            },
+            "call_counts": {
+                "adaptation": 8,
+                "final_evaluation": 16,
+            },
+        },
+    )
+
+    with pytest.raises(
+        RuntimeArtifactError,
+        match="examples_processed must equal",
+    ):
+        normalize_runtime_artifacts(
+            output_dir=output_dir,
+            plan=_plan(),
+            mode="pilot",
+            allocated_gpus=1,
+            cwd=tmp_path,
+        )
+
+
 def test_runtime_wrapper_rejects_partial_canonical_markers(
     tmp_path: Path,
 ) -> None:

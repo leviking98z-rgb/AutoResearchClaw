@@ -619,6 +619,96 @@ def test_unchanged_remote_smoke_repair_is_blocked_before_gpu_submit(
     controller.close()
 
 
+def test_unchanged_pilot_contract_failure_is_blocked_before_gpu_submit(
+    tmp_path: Path,
+) -> None:
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
+                },
+            }
+        }
+    )
+    store = V2Store(tmp_path)
+    pool = _Pool()
+    controller = V2Controller(
+        config=config,
+        store=store,
+        generator=_NoopGenerator(),
+        gpu_broker=GPUBroker(
+            pool=pool,
+            scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        ),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    idea = candidate_to_idea(_candidate(0))
+    idea.status = IdeaStatus.PILOTING
+    current = store.current_dir(idea.idea_id)
+    current.mkdir(parents=True, exist_ok=True)
+    (current / "plan.json").write_text(
+        json.dumps({"required_runtime_evidence": []}),
+        encoding="utf-8",
+    )
+    (current / "main.py").write_text("print('same pilot source')\n")
+    (current / "build.json").write_text(
+        json.dumps(
+            {
+                "files": {"main.py": "print('same pilot source')\n"},
+                "commands": {
+                    "smoke": ["python", "main.py"],
+                    "pilot": ["python", "main.py"],
+                    "scale": ["python", "main.py"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    prior = controller._implementation_failure_fingerprint(
+        idea_id=idea.idea_id,
+        errors=["same pilot runtime contract failure"],
+    )
+    idea.candidate["_autoresearch_v2_last_implementation_failure"] = {
+        **prior,
+        "errors": ["same pilot runtime contract failure"],
+    }
+    job = JobRecord(
+        job_id=f"{idea.idea_id}-pilot",
+        idea_id=idea.idea_id,
+        kind=JobKind.PILOT,
+        status=JobStatus.READY,
+        requires_gpu=True,
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+    )
+    idea.current_job_id = job.job_id
+    store.save_idea(idea)
+    store.save_job(job)
+
+    controller._dispatch()
+
+    durable_idea = store.get_idea(idea.idea_id)
+    durable_job = store.get_job(job.job_id)
+    assert durable_idea is not None
+    assert durable_job is not None
+    assert durable_idea.status is IdeaStatus.QUARANTINED
+    assert durable_idea.exit_reason == "gpu_implementation_no_progress"
+    assert durable_job.status is JobStatus.FAILED
+    assert durable_job.result["diagnostics"][
+        "blocked_before_gpu_submit"
+    ] is True
+    assert store.list_attempts(job_id=job.job_id) == []
+    assert pool.requests == {}
+    controller.close()
+
+
 def test_attestation_key_creation_is_race_safe(
     tmp_path: Path,
 ) -> None:

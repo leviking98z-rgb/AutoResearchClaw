@@ -955,6 +955,13 @@ Requirements:
   criterion_results schema, dataset/split declarations, GPU count, and gate
   decision. Your raw runtime_evidence must still report the measured model id,
   datasets, examples, seeds, call counts, and scalar scientific metrics.
+- In runtime_evidence, examples_processed is the number of endpoint
+  screening/confirmatory evaluation units, not development plus endpoint
+  examples. Report development and endpoint counts separately in
+  examples_by_role.
+- call_counts keys must exactly match the names in plan.call_ledger.components.
+  Increment each component at the actual call site. Never collapse multiple
+  components into generic generation_calls/verifier_calls totals.
 - Smoke mode is a real integration test, not a dry run: load the declared
   pretrained LLM through the actual transformers/model loader, load at least
   one real example from a declared benchmark, move the model and tensors to
@@ -1177,6 +1184,10 @@ class ExperimentJobExecutor:
             gate_tokens = verdict.tokens
         else:
             gate = _experiment_gate(metrics)
+        gate = resolve_experiment_lifecycle_gate(
+            runtime_evidence=validation["runtime_evidence"],
+            gate=gate,
+        )
         decision_path = store.attempt_dir(attempt) / "decision_review.json"
         _write_json(decision_path, gate)
         attempt.output_manifest["decision_review_path"] = str(decision_path)
@@ -1226,6 +1237,51 @@ def _experiment_gate(metrics: Mapping[str, Any]) -> dict[str, Any]:
     if decision in {"promote", "continue"} or success_probability >= 0.95:
         return {"decision": "promote", "reason": "primary_signal_valid"}
     return {"decision": "reject", "reason": "insufficient_information_gain"}
+
+
+def resolve_experiment_lifecycle_gate(
+    *,
+    runtime_evidence: Mapping[str, Any],
+    gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Separate scientific promotion rejection from lifecycle rejection.
+
+    A controller-compiled runtime ``reject`` means the evidence was valid but
+    failed one or more preregistered promotion criteria. That is a reportable
+    negative result, not an instruction to discard the Idea. Strong-model
+    review may enrich the reason and risks, but it cannot silently skip the
+    Report stage for valid measured evidence.
+    """
+
+    resolved = dict(gate)
+    runtime_decision = str(
+        runtime_evidence.get("gate_decision", "") or ""
+    ).casefold()
+    if (
+        runtime_decision == "reject"
+        and runtime_evidence.get("evidence_valid") is True
+        and runtime_evidence.get("gate_statistic_defined") is True
+    ):
+        criterion_results = runtime_evidence.get("criterion_results")
+        measured_criteria = (
+            isinstance(criterion_results, Mapping)
+            and bool(criterion_results)
+            and all(
+                isinstance(row, Mapping)
+                and isinstance(row.get("passed"), bool)
+                and not isinstance(row.get("value"), bool)
+                and isinstance(row.get("value"), (int, float))
+                for row in criterion_results.values()
+            )
+        )
+        if measured_criteria:
+            resolved["decision"] = "complete_negative"
+            resolved["reason"] = str(
+                resolved.get("reason", "") or "informative_negative"
+            )
+            resolved["report_disposition"] = "reportable_negative"
+            resolved["scientific_decision"] = "reject"
+    return resolved
 
 
 class ReportJobExecutor:

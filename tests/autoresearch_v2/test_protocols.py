@@ -528,3 +528,40 @@ def test_runtime_call_counts_aggregate_repeated_component_names() -> None:
         in error
         for error in errors
     )
+
+
+def test_pilot_examples_processed_is_endpoint_count_not_all_roles() -> None:
+    plan = compile_screening_protocol(_idea(), _draft())
+    runtime = {
+        "gpu_count": 1,
+        "examples_processed": 48,
+        "examples_by_role": {
+            "development": 16,
+            "screening": 32,
+        },
+        "seeds": [0],
+        "call_counts": {
+            "candidate_generation": 32,
+            "verifier_scoring": 128,
+        },
+        "evidence_valid": True,
+        "gate_statistic_defined": True,
+        "criterion_results": {
+            "completed_tasks": {"value": 32, "passed": True},
+            "primary_effect": {"value": 0.20, "passed": True},
+            "positive_ci": {"value": 0.01, "passed": True},
+        },
+        "gate_decision": "promote",
+        "metrics": {
+            "paired_pass_rate_difference": 0.20,
+        },
+    }
+
+    errors = validate_runtime_against_contract(
+        plan=plan,
+        runtime_evidence=runtime,
+        allocated_gpus=1,
+        mode="pilot",
+    )
+
+    assert "examples_processed must equal examples_by_role[screening]" in errors
