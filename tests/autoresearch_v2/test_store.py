@@ -283,6 +283,75 @@ def test_explicit_recovery_requires_writer_lock(tmp_path: Path) -> None:
     store.release_writer_lock()
 
 
+def test_writer_recovery_quarantines_candidate_without_attempt_row(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="idea-test-pilot",
+        idea_id=idea.idea_id,
+        kind=JobKind.PILOT,
+    )
+    store.save_job(job)
+    attempt = store.create_attempt(job)
+    candidate = store.prepare_candidate(attempt)
+    (candidate / "partial.json").write_text("{}", encoding="utf-8")
+    assert store.get_attempt(attempt.attempt_id) is None
+
+    store.acquire_writer_lock()
+    try:
+        store.recover_filesystem_commits()
+    finally:
+        store.release_writer_lock()
+
+    assert not candidate.exists()
+    quarantined = (
+        store.attempt_dir(attempt) / "candidate.interrupted-orphan"
+    )
+    assert (quarantined / "partial.json").read_text(encoding="utf-8") == "{}"
+    assert store.snapshot_current(attempt).is_dir()
+    events = store.list_events(limit=10)
+    assert any(
+        event["event_type"]
+        == "orphan_attempt_candidate_quarantined"
+        and event["attempt_id"] == attempt.attempt_id
+        for event in events
+    )
+
+
+def test_writer_recovery_keeps_durable_attempt_candidate(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="idea-test-build",
+        idea_id=idea.idea_id,
+        kind=JobKind.BUILD,
+    )
+    store.save_job(job)
+    attempt = store.create_attempt(job)
+    candidate = store.prepare_candidate(attempt)
+    (candidate / "partial.json").write_text("{}", encoding="utf-8")
+    store.save_attempt(attempt)
+
+    store.acquire_writer_lock()
+    try:
+        store.recover_filesystem_commits()
+    finally:
+        store.release_writer_lock()
+
+    assert (candidate / "partial.json").read_text(encoding="utf-8") == "{}"
+    assert not list(
+        store.attempt_dir(attempt).glob("candidate.interrupted-orphan*")
+    )
+
+
 def test_maintenance_rotates_logs_and_prunes_old_failed_candidates(
     tmp_path: Path,
 ) -> None:

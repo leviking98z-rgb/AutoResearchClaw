@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+#
+# Idempotently clean and release one explicitly configured ClusterBridge
+# allocation after a bounded AutoResearch v2 canary exits.
+#
+# Required environment:
+#   AUTORESEARCH_V2_CLEANUP_ALLOCATION
+#   AUTORESEARCH_V2_CLEANUP_OWNER
+#
+# Optional environment:
+#   AUTORESEARCH_V2_CLEANUP_CB
+#   AUTORESEARCH_V2_CLEANUP_LOG
+
+set -uo pipefail
+
+allocation="${AUTORESEARCH_V2_CLEANUP_ALLOCATION:-}"
+owner="${AUTORESEARCH_V2_CLEANUP_OWNER:-}"
+cb="${AUTORESEARCH_V2_CLEANUP_CB:-/root/shared/.clusters/.tools/clusterbridge.sh}"
+log="${AUTORESEARCH_V2_CLEANUP_LOG:-/root/.local/state/autoresearch-v2/canary-cleanup.log}"
+
+mkdir -p "$(dirname "$log")"
+exec >>"$log" 2>&1
+
+stamp() {
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+echo "$(stamp) cleanup-start allocation=$allocation"
+if [[ ! "$allocation" =~ ^alloc_[[:alnum:]]+$ ]]; then
+  echo "$(stamp) cleanup-refused invalid-allocation-id"
+  exit 2
+fi
+if [[ ! "$owner" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+  echo "$(stamp) cleanup-refused invalid-owner"
+  exit 2
+fi
+if [[ ! -x "$cb" ]]; then
+  echo "$(stamp) cleanup-refused missing-cb"
+  exit 2
+fi
+
+export CB_SID="$owner"
+
+status="$("$cb" resource-status "$allocation" --json 2>&1)"
+status_rc=$?
+if (( status_rc != 0 )); then
+  if grep -Eqi 'not found|unknown|released|expired' <<<"$status"; then
+    echo "$(stamp) cleanup-already-released allocation=$allocation"
+    exit 0
+  fi
+  echo "$(stamp) cleanup-status-failed rc=$status_rc"
+  printf '%s\n' "$status"
+  exit "$status_rc"
+fi
+
+read -r allocation_owner allocation_status < <(
+  python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+if isinstance(value.get("allocation"), dict):
+    value = value["allocation"]
+print(value.get("owner", ""), value.get("status", ""))
+' <<<"$status"
+)
+if [[ "$allocation_owner" != "$owner" ]]; then
+  echo "$(stamp) cleanup-refused owner-mismatch"
+  exit 3
+fi
+if [[ "$allocation_status" != "active" ]]; then
+  echo "$(stamp) cleanup-already-terminal status=$allocation_status"
+  exit 0
+fi
+
+remote_cleanup='
+set +e
+bash /root/shared/.clusters/.tools/node_cleanup.sh
+cleanup_rc=$?
+bash /root/shared/.clusters/.tools/node_spin.sh spin
+spin_rc=$?
+if [ "$cleanup_rc" -ne 0 ]; then exit "$cleanup_rc"; fi
+exit "$spin_rc"
+'
+if "$cb" alloc "$allocation" run-all "$remote_cleanup"; then
+  echo "$(stamp) cleanup-nodes-succeeded allocation=$allocation"
+else
+  echo "$(stamp) cleanup-nodes-failed allocation=$allocation; release-continues"
+fi
+
+if "$cb" alloc-release "$allocation"; then
+  echo "$(stamp) cleanup-release-succeeded allocation=$allocation"
+  exit 0
+fi
+
+# The release response may race expiry or a prior invocation. Recheck before
+# surfacing a failure so ExecStopPost remains safely idempotent.
+status="$("$cb" resource-status "$allocation" --json 2>&1)"
+status_rc=$?
+if (( status_rc != 0 )) || grep -Eqi '"status"[[:space:]]*:[[:space:]]*"(released|expired)"|not found|unknown' <<<"$status"; then
+  echo "$(stamp) cleanup-release-confirmed-terminal allocation=$allocation"
+  exit 0
+fi
+echo "$(stamp) cleanup-release-failed allocation=$allocation"
+printf '%s\n' "$status"
+exit 1

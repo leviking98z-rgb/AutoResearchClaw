@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
 import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -351,6 +353,87 @@ class V2Store:
                 "filesystem recovery requires the controller writer lock"
             )
         self._recover_filesystem_commits()
+        self._recover_orphan_attempt_candidates()
+
+    def _recover_orphan_attempt_candidates(self) -> None:
+        """Quarantine candidate workspaces that have no durable attempt row.
+
+        An executor creates ``candidate/`` before its attempt is saved. If the
+        controller is killed in that small window, the next dispatch reuses
+        the same scientific attempt number and would otherwise fail forever
+        with ``FileExistsError``. The writer lock makes it safe to move only
+        workspaces whose attempt IDs are absent from SQLite. Keeping the
+        orphan under an audit name preserves partial output for diagnosis
+        without letting it block recovery.
+        """
+
+        if not self.ideas_root.is_dir():
+            return
+        import subprocess
+
+        try:
+            completed = subprocess.run(
+                [
+                    "find",
+                    str(self.ideas_root),
+                    "-mindepth",
+                    "5",
+                    "-maxdepth",
+                    "5",
+                    "-type",
+                    "d",
+                    "-name",
+                    "candidate",
+                    "-print0",
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        if completed.returncode != 0:
+            return
+        candidate_paths = [
+            Path(value.decode("utf-8", errors="surrogateescape"))
+            for value in completed.stdout.split(b"\0")
+            if value
+        ]
+        if not candidate_paths:
+            return
+        with self.connect() as conn:
+            durable_attempt_ids = {
+                str(row[0])
+                for row in conn.execute("SELECT attempt_id FROM attempts")
+            }
+        for candidate in candidate_paths:
+            attempt_dir = candidate.parent
+            job_dir = attempt_dir.parent
+            match = re.fullmatch(r"attempt-(\d+)", attempt_dir.name)
+            if match is None:
+                continue
+            attempt_id = (
+                f"{job_dir.name}-attempt-{int(match.group(1)):02d}"
+            )
+            if attempt_id in durable_attempt_ids:
+                continue
+            orphan = attempt_dir / "candidate.interrupted-orphan"
+            if orphan.exists():
+                orphan = attempt_dir / (
+                    "candidate.interrupted-orphan."
+                    + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+                )
+            try:
+                os.replace(candidate, orphan)
+            except FileNotFoundError:
+                continue
+            self.event(
+                "orphan_attempt_candidate_quarantined",
+                attempt_id=attempt_id,
+                job_id=job_dir.name,
+                candidate=str(candidate),
+                quarantine_path=str(orphan),
+            )
 
     def acquire_writer_lock(self) -> None:
         if self._writer_lock_stream is not None:

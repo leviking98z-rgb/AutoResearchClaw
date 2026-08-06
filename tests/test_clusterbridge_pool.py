@@ -739,6 +739,15 @@ def test_async_task_uses_ray_resource_reservation(tmp_path: Path) -> None:
     assert "nvidia-smi" in script
     assert "CUDA_VISIBLE_DEVICES" in script
     assert "ray_task_id" in script
+    launch = next(
+        call[2]
+        for call in client.calls
+        if call[0] == "run" and "nohup setsid bash" in call[2]
+    )
+    assert "/tmp/researchclaw-autoresearch-v2/test-pool/tasks/ray-reserved" in launch
+    assert "RESEARCHCLAW_RAY_TASK_PY" in launch
+    assert "RESEARCHCLAW_RAY_TASK_JSON" in launch
+    assert str(task_dir / "ray_task.py") not in launch
 
 
 def test_async_task_resource_change_conflicts_with_existing_task(

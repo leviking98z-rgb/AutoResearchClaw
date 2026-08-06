@@ -1024,7 +1024,6 @@ class ClusterBridgePool:
             "def run(command, env):\n"
             "    child_env=os.environ.copy(); child_env.update(env)\n"
             "    task_context=ray.get_runtime_context()\n"
-            "    evidence_path=pathlib.Path(payload['evidence_path'])\n"
             "    visible=child_env.get('CUDA_VISIBLE_DEVICES', '')\n"
             "    samples=[]; stop=threading.Event()\n"
             "    query=['nvidia-smi','--query-gpu=index,uuid,name,memory.used,"
@@ -1103,17 +1102,26 @@ class ClusterBridgePool:
             "for row in rows] or [0.0]), "
             "'peak_gpu_utilization_percent': max(["
             "row['utilization_gpu_percent'] for row in rows] or [0.0])}\n"
-            "    evidence_path.parent.mkdir(parents=True, exist_ok=True)\n"
-            "    temporary=evidence_path.with_name(evidence_path.name+'.tmp')\n"
-            "    temporary.write_text(json.dumps(evidence, sort_keys=True), "
-            "encoding='utf-8')\n"
-            "    os.replace(temporary, evidence_path)\n"
-            "    return returncode\n"
-            "sys.exit(int(ray.get(run.remote(payload['command'], "
-            "payload['env']))))\n"
+            "    return {'returncode': returncode, 'evidence': evidence}\n"
+            "result=ray.get(run.remote(payload['command'], payload['env']))\n"
+            "evidence_path=pathlib.Path(payload['evidence_path'])\n"
+            "evidence_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "temporary=evidence_path.with_name(evidence_path.name+'.tmp')\n"
+            "temporary.write_text(json.dumps(result['evidence'], "
+            "sort_keys=True), encoding='utf-8')\n"
+            "os.replace(temporary, evidence_path)\n"
+            "sys.exit(int(result['returncode']))\n"
         )
         if num_gpus or num_cpus != 1:
             trusted_gpu_evidence_path = task_dir / "trusted_gpu_evidence.json"
+            remote_task_dir = Path(
+                "/tmp/researchclaw-autoresearch-v2"
+            ) / self.config.pool_id / "tasks" / task_id
+            remote_payload_path = remote_task_dir / "ray_task.json"
+            remote_task_script = remote_task_dir / "ray_task.py"
+            remote_trusted_gpu_evidence_path = (
+                remote_task_dir / "trusted_gpu_evidence.json"
+            )
             _atomic_json_write(
                 payload_path,
                 {
@@ -1122,14 +1130,38 @@ class ClusterBridgePool:
                     "env": dict(sorted(env_values.items())),
                     "num_gpus": int(num_gpus),
                     "num_cpus": int(num_cpus),
-                    "evidence_path": str(trusted_gpu_evidence_path),
+                    "evidence_path": str(
+                        remote_trusted_gpu_evidence_path
+                    ),
                 },
             )
             task_script.write_text(ray_wrapper, encoding="utf-8")
+            # ``state_dir`` may be controller-local for low-latency pool
+            # bookkeeping. Stage the tiny Ray launcher and JSON payload into
+            # the head node's local task directory before starting it; do not
+            # assume the controller's absolute path is shared with workers.
+            staged_files = (
+                "mkdir -p "
+                f"{shlex.quote(str(remote_task_dir))}; "
+                f"cat > {shlex.quote(str(remote_task_script))} <<"
+                "'RESEARCHCLAW_RAY_TASK_PY'\n"
+                f"{ray_wrapper}"
+                "RESEARCHCLAW_RAY_TASK_PY\n"
+                f"cat > {shlex.quote(str(remote_payload_path))} <<"
+                "'RESEARCHCLAW_RAY_TASK_JSON'\n"
+                f"{payload_path.read_text(encoding='utf-8').rstrip()}\n"
+                "RESEARCHCLAW_RAY_TASK_JSON\n"
+            )
             execution = (
+                f"{staged_files}"
                 f"{shlex.quote(self.config.ray.python)} "
-                f"{shlex.quote(str(task_script))} "
-                f"{shlex.quote(str(payload_path))}"
+                f"{shlex.quote(str(remote_task_script))} "
+                f"{shlex.quote(str(remote_payload_path))}; "
+                "rc=$?; "
+                f"if [ -f {shlex.quote(str(remote_trusted_gpu_evidence_path))} ]; "
+                f"then cat {shlex.quote(str(remote_trusted_gpu_evidence_path))} "
+                f"> {shlex.quote(str(trusted_gpu_evidence_path))}; fi; "
+                "exit \"$rc\""
             )
             execution_env = ""
         else:
