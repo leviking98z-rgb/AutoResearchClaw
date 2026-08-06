@@ -74,9 +74,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = V2Config.from_file(args.config)
     store = V2Store(config.root)
-    store.initialize(
-        recover_filesystem=args.command not in {"status", "ideas"}
-    )
+    # The controller performs recovery only after it has acquired the writer
+    # lock. Read-only commands never mutate attempt workspaces.
+    store.initialize(recover_filesystem=False)
     if args.command == "status":
         controller = V2Controller(
             config=config,

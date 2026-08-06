@@ -198,6 +198,22 @@ def test_read_only_initialize_does_not_remove_live_staging(
     assert (staged / "main.py").read_text(encoding="utf-8") == "in progress\n"
 
 
+def test_explicit_recovery_requires_writer_lock(tmp_path: Path) -> None:
+    store = V2Store(tmp_path)
+    store.initialize(recover_filesystem=False)
+
+    try:
+        store.recover_filesystem_commits()
+    except RuntimeError as exc:
+        assert "writer lock" in str(exc)
+    else:
+        raise AssertionError("recovery unexpectedly ran without writer lock")
+
+    store.acquire_writer_lock()
+    store.recover_filesystem_commits()
+    store.release_writer_lock()
+
+
 def test_maintenance_rotates_logs_and_prunes_old_failed_candidates(
     tmp_path: Path,
 ) -> None:

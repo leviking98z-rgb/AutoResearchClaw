@@ -184,8 +184,9 @@ class V2Controller:
     def initialize(self) -> None:
         if self._initialized:
             return
-        self.store.initialize()
+        self.store.initialize(recover_filesystem=False)
         self.store.acquire_writer_lock()
+        self.store.recover_filesystem_commits()
         self._restore_budget_pause_state()
         self._sync_gpu_budget_pause_state()
         self._recover_interrupted_jobs()

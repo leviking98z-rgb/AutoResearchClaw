@@ -132,6 +132,15 @@ class V2Store:
             for path in staged:
                 shutil.rmtree(path, ignore_errors=True)
 
+    def recover_filesystem_commits(self) -> None:
+        """Run attempt-workspace recovery while holding the writer lock."""
+
+        if self._writer_lock_stream is None:
+            raise RuntimeError(
+                "filesystem recovery requires the controller writer lock"
+            )
+        self._recover_filesystem_commits()
+
     def acquire_writer_lock(self) -> None:
         if self._writer_lock_stream is not None:
             return

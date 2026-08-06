@@ -181,7 +181,7 @@ def build_production_controller(
         research_memory=research_memory,
     )
     if gpu_broker_error:
-        controller.store.initialize()
+        controller.store.initialize(recover_filesystem=False)
         controller.store.event(
             "gpu_broker_unavailable",
             error=gpu_broker_error,
