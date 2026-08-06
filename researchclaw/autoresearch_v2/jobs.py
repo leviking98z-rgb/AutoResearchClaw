@@ -1412,6 +1412,11 @@ class ReportJobExecutor:
         }
         attempt.status = AttemptStatus.VALIDATING
         store.save_attempt(attempt)
+        # Startup recovery may remove an interrupted candidate while its
+        # detached worker is still alive. Such a worker can later recreate
+        # only report.json, paper.md, and final_review.json. Merge the latest
+        # committed snapshot without overwriting those accepted report files.
+        store.merge_current_into_candidate(attempt)
         store.commit_candidate(attempt)
         return JobOutcome(
             True,

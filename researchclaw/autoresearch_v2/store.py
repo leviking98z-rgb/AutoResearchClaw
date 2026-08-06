@@ -723,6 +723,32 @@ class V2Store:
                     shutil.copy2(child, target)
         return candidate
 
+    def merge_current_into_candidate(self, attempt: AttemptRecord) -> Path:
+        """Backfill files missing from an existing immutable candidate.
+
+        A controller restart can refund a running attempt after its candidate
+        directory has been removed. A detached worker from the interrupted
+        process may still finish later and recreate only the files it writes.
+        Before accepting that candidate, merge the latest committed snapshot
+        into it without overwriting outputs produced by the attempt.
+        """
+
+        candidate = self.attempt_dir(attempt) / "candidate"
+        if not candidate.is_dir():
+            raise FileNotFoundError(candidate)
+        current = self.current_dir(attempt.idea_id)
+        if not current.is_dir():
+            return candidate
+        for child in current.iterdir():
+            target = candidate / child.name
+            if target.exists() or target.is_symlink():
+                continue
+            if child.is_dir():
+                shutil.copytree(child, target)
+            else:
+                shutil.copy2(child, target)
+        return candidate
+
     @staticmethod
     def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

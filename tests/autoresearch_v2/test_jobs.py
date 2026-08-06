@@ -328,6 +328,83 @@ def test_report_retries_in_place_and_commits_corrected_package(
     assert len(durable.validation["report_revisions"]) == 2
 
 
+def test_report_recovers_full_snapshot_after_interrupted_candidate_loss(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    current = store.current_dir(idea.idea_id)
+    pilot = current / "artifacts" / "pilot"
+    pilot.mkdir(parents=True)
+    (current / "plan.json").write_text(
+        json.dumps({"workload": {"total_calls": 1}}),
+        encoding="utf-8",
+    )
+    (current / "main.py").write_text(
+        "print('evidence')\n",
+        encoding="utf-8",
+    )
+    (pilot / "metrics.json").write_text(
+        json.dumps(
+            {
+                "decision": "reject",
+                "result_valid": True,
+                "metrics": {"endpoint_correct_diff": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    job = JobRecord(
+        job_id=f"{idea.idea_id}-report",
+        idea_id=idea.idea_id,
+        kind=JobKind.REPORT,
+    )
+    attempt = AttemptRecord(
+        attempt_id=f"{job.job_id}-attempt-01",
+        idea_id=idea.idea_id,
+        job_id=job.job_id,
+        number=1,
+        status=AttemptStatus.RUNNING,
+    )
+    original_snapshot = store.snapshot_current
+
+    def interrupted_snapshot(record):
+        candidate = original_snapshot(record)
+        for child in list(candidate.iterdir()):
+            if child.is_dir():
+                import shutil
+
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        return candidate
+
+    store.snapshot_current = interrupted_snapshot  # type: ignore[method-assign]
+    report = {
+        "title": "Recovered report",
+        "claims": [],
+        "limitations": ["Pilot only."],
+        "next_experiments": [],
+        "paper_markdown": "# Recovered report",
+    }
+
+    outcome = ReportJobExecutor(_Role(report)).execute(
+        idea=idea,
+        job=job,
+        attempt=attempt,
+        store=store,
+    )
+
+    assert outcome.success
+    committed = store.current_dir(idea.idea_id)
+    assert (committed / "paper.md").read_text() == "# Recovered report"
+    assert (committed / "plan.json").exists()
+    assert (committed / "main.py").exists()
+    assert (committed / "artifacts" / "pilot" / "metrics.json").exists()
+
+
 def test_report_uses_full_targeted_revision_budget(tmp_path: Path) -> None:
     store = V2Store(tmp_path)
     store.initialize()
