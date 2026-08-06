@@ -253,6 +253,58 @@ def test_runtime_wrapper_normalizes_legacy_all_role_example_total(
     }
 
 
+def test_runtime_wrapper_normalizes_structured_resource_evidence(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "artifacts" / "pilot"
+    _write_raw(
+        output_dir,
+        runtime={
+            "model_loaded": {
+                "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+                "device": "cuda",
+                "num_parameters": 1_543_714_304,
+            },
+            "datasets_loaded": [
+                {
+                    "resource_id": "openai/gsm8k",
+                    "split": "train",
+                },
+                {
+                    "resource_id": "openai/gsm8k",
+                    "split": "test",
+                },
+            ],
+            "examples_processed": 4,
+            "seeds": [7],
+            "examples_by_role": {
+                "development": 2,
+                "screening": 4,
+            },
+            "call_counts": {
+                "adaptation": 8,
+                "final_evaluation": 16,
+            },
+        },
+    )
+
+    value = normalize_runtime_artifacts(
+        output_dir=output_dir,
+        plan=_plan(),
+        mode="pilot",
+        allocated_gpus=1,
+        cwd=tmp_path,
+    )
+
+    runtime = value["runtime_evidence"]
+    assert runtime["model_loaded"] == "Qwen/Qwen2.5-1.5B-Instruct"
+    assert runtime["model_metadata"] == {
+        "device": "cuda",
+        "num_parameters": 1_543_714_304,
+    }
+    assert runtime["datasets_loaded"] == ["openai/gsm8k"]
+
+
 def test_runtime_wrapper_rejects_inconsistent_example_accounting(
     tmp_path: Path,
 ) -> None:

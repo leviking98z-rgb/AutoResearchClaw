@@ -25,7 +25,7 @@ from typing import Any
 
 WRAPPER_FILENAME = "_autoresearch_runtime.py"
 WRAPPER_SCHEMA = "autoresearch_v2.controller_runtime"
-WRAPPER_VERSION = 4
+WRAPPER_VERSION = 5
 RAW_DIRNAME = "_raw"
 
 
@@ -159,17 +159,17 @@ def normalize_runtime_artifacts(
         mode=mode,
     )
 
-    model_loaded = raw_runtime.get("model_loaded")
-    if not isinstance(model_loaded, str) or not model_loaded.strip():
+    model_loaded, model_metadata = _normalize_model_loaded(
+        raw_runtime.get("model_loaded")
+    )
+    if not model_loaded:
         raise RuntimeArtifactError(
             "runtime_evidence.model_loaded must be a non-empty model id"
         )
-    datasets_loaded = raw_runtime.get("datasets_loaded")
-    if (
-        not isinstance(datasets_loaded, list)
-        or not datasets_loaded
-        or any(not str(item).strip() for item in datasets_loaded)
-    ):
+    datasets_loaded = _normalize_datasets_loaded(
+        raw_runtime.get("datasets_loaded")
+    )
+    if not datasets_loaded:
         raise RuntimeArtifactError(
             "runtime_evidence.datasets_loaded must be a non-empty list"
         )
@@ -201,8 +201,8 @@ def normalize_runtime_artifacts(
         "wrapper_schema": WRAPPER_SCHEMA,
         "wrapper_version": WRAPPER_VERSION,
         "mode": mode,
-        "model_loaded": model_loaded.strip(),
-        "datasets_loaded": [str(item) for item in datasets_loaded],
+        "model_loaded": model_loaded,
+        "datasets_loaded": datasets_loaded,
         "examples_processed": examples_processed,
         "seeds": seeds,
         "gpu_count": max(0, int(allocated_gpus)),
@@ -210,6 +210,8 @@ def normalize_runtime_artifacts(
     }
     if examples_by_role:
         runtime["examples_by_role"] = examples_by_role
+    if model_metadata:
+        runtime["model_metadata"] = model_metadata
     if call_counts:
         runtime["call_counts"] = call_counts
     if dataset_roles:
@@ -683,6 +685,50 @@ def _normalize_seeds(runtime: Mapping[str, Any]) -> list[Any]:
     if len(identities) != len(raw):
         raise RuntimeArtifactError("runtime seeds must be unique")
     return list(raw)
+
+
+def _normalize_model_loaded(value: Any) -> tuple[str, dict[str, Any]]:
+    if isinstance(value, str):
+        return value.strip(), {}
+    if not isinstance(value, Mapping):
+        return "", {}
+    model_id = str(
+        value.get("model_id")
+        or value.get("id")
+        or value.get("name")
+        or value.get("resource_id")
+        or ""
+    ).strip()
+    if not model_id:
+        return "", {}
+    metadata = {
+        str(key): item
+        for key, item in value.items()
+        if str(key) not in {"model_id", "id", "name", "resource_id"}
+    }
+    return model_id, metadata
+
+
+def _normalize_datasets_loaded(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    datasets: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            identifier = item.strip()
+        elif isinstance(item, Mapping):
+            identifier = str(
+                item.get("resource_id")
+                or item.get("dataset_id")
+                or item.get("id")
+                or item.get("name")
+                or ""
+            ).strip()
+        else:
+            identifier = ""
+        if identifier and identifier not in datasets:
+            datasets.append(identifier)
+    return datasets
 
 
 def _locate_artifact(

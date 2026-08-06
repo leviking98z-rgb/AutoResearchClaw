@@ -605,7 +605,7 @@ def test_background_task_collects_logs_and_result(tmp_path: Path) -> None:
                 '{"state":"finished","returncode":0,'
                 '"stdout.log":"trained\\n","stderr.log":""}\n'
             )
-        if "nohup setsid bash" in command:
+        if "nohup setsid --wait bash" in command:
             return _result("4242\n")
         return _result()
 
@@ -641,7 +641,7 @@ def test_async_submit_probe_collect_and_idempotent_adoption(
 
     def handler(node: ClusterNode, command: str) -> BridgeResult:
         del node
-        if "nohup setsid bash" in command:
+        if "nohup setsid --wait bash" in command:
             return _result("4242\n")
         if "__RESEARCHCLAW_POOL_RESULT__" in command:
             state = "finished" if probes["finished"] else "running"
@@ -673,7 +673,7 @@ def test_async_submit_probe_collect_and_idempotent_adoption(
     )
     assert adopted == handle
     assert sum(
-        "nohup setsid bash" in call[2]
+        "nohup setsid --wait bash" in call[2]
         for call in client.calls
         if call[0] == "run"
     ) == 1
@@ -697,7 +697,7 @@ def test_async_task_id_conflict_fails_closed(tmp_path: Path) -> None:
     pool.claim(start_keepalive=False)
     pool._prepared = True
     client.run_handler = lambda node, command: (
-        _result("55\n") if "nohup setsid bash" in command else _result()
+        _result("55\n") if "nohup setsid --wait bash" in command else _result()
     )
     pool.submit_task("echo first", timeout_sec=10, task_id="same-id")
     with pytest.raises(PoolTaskConflict):
@@ -713,7 +713,7 @@ def test_async_task_uses_ray_resource_reservation(tmp_path: Path) -> None:
     pool.claim(start_keepalive=False)
     pool._prepared = True
     client.run_handler = lambda node, command: (
-        _result("77\n") if "nohup setsid bash" in command else _result()
+        _result("77\n") if "nohup setsid --wait bash" in command else _result()
     )
 
     pool.submit_task(
@@ -742,8 +742,9 @@ def test_async_task_uses_ray_resource_reservation(tmp_path: Path) -> None:
     launch = next(
         call[2]
         for call in client.calls
-        if call[0] == "run" and "nohup setsid bash" in call[2]
+        if call[0] == "run" and "nohup setsid --wait bash" in call[2]
     )
+    assert "nohup setsid --wait bash" in launch
     assert "/tmp/researchclaw-autoresearch-v2/test-pool/tasks/ray-reserved" in launch
     assert "RESEARCHCLAW_RAY_TASK_PY" in launch
     assert "RESEARCHCLAW_RAY_TASK_JSON" in launch
@@ -778,7 +779,7 @@ def test_async_ray_task_returns_remote_trusted_gpu_evidence(
 
     def handler(node: ClusterNode, command: str) -> BridgeResult:
         del node
-        if "nohup setsid bash" in command:
+        if "nohup setsid --wait bash" in command:
             return _result("77\n")
         if "__RESEARCHCLAW_POOL_RESULT__" in command:
             assert (
@@ -837,7 +838,7 @@ def test_async_task_resource_change_conflicts_with_existing_task(
     pool.claim(start_keepalive=False)
     pool._prepared = True
     client.run_handler = lambda node, command: (
-        _result("77\n") if "nohup setsid bash" in command else _result()
+        _result("77\n") if "nohup setsid --wait bash" in command else _result()
     )
 
     pool.submit_task(
@@ -867,7 +868,7 @@ def test_task_probe_uses_short_transport_timeout(tmp_path: Path) -> None:
     pool.claim(start_keepalive=False)
     pool._prepared = True
     client.run_handler = lambda node, command: (
-        _result("77\n") if "nohup setsid bash" in command else _result(
+        _result("77\n") if "nohup setsid --wait bash" in command else _result(
             "__RESEARCHCLAW_POOL_RESULT__="
             '{"state":"running","pid":77,"stdout.log":"","stderr.log":""}\n'
         )
@@ -893,7 +894,7 @@ def test_background_task_timeout_sends_term_and_kill(tmp_path: Path) -> None:
 
     def handler(node: ClusterNode, command: str) -> BridgeResult:
         del node
-        if "nohup setsid bash" in command:
+        if "nohup setsid --wait bash" in command:
             return _result("55\n")
         if "__RESEARCHCLAW_POOL_RESULT__" in command:
             return _result(

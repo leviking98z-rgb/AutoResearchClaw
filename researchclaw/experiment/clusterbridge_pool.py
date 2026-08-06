@@ -932,8 +932,6 @@ class ClusterBridgePool:
                 "task_id must contain only letters, digits, '.', '_' or '-'"
             )
         task_dir = self._state_dir / "tasks" / task_id
-        stdout_path = task_dir / "stdout.log"
-        stderr_path = task_dir / "stderr.log"
         result_path = task_dir / "result.json"
         pid_path = task_dir / "pid"
 
@@ -1199,7 +1197,11 @@ class ClusterBridgePool:
             f"{execution_root_setup}"
             f"rm -f {shlex.quote(str(result_path))} "
             f"{shlex.quote(str(pid_path))}; "
-            f"nohup setsid bash -lc {shlex.quote(inner)} </dev/null "
+            # GNU setsid exits as soon as the launched program forks unless
+            # --wait is requested. Ray's Python client may daemonize after it
+            # connects, so tracking plain `setsid` can make a healthy GPU task
+            # look lost before the remote result/evidence files are written.
+            f"nohup setsid --wait bash -lc {shlex.quote(inner)} </dev/null "
             f"> {shlex.quote(str(task_dir / 'launcher.log'))} 2>&1 & "
             "pid=$!; "
             f"printf '%s\\n' \"$pid\" > {shlex.quote(str(pid_path))}; "
