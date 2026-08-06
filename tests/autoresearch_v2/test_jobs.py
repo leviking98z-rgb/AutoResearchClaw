@@ -309,6 +309,92 @@ def test_report_retries_in_place_and_commits_corrected_package(
     assert len(durable.validation["report_revisions"]) == 2
 
 
+def test_report_uses_full_targeted_revision_budget(tmp_path: Path) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    current = store.current_dir(idea.idea_id)
+    (current / "artifacts" / "pilot").mkdir(parents=True)
+    (current / "plan.json").write_text("{}", encoding="utf-8")
+    (current / "artifacts" / "pilot" / "metrics.json").write_text(
+        json.dumps(
+            {
+                "decision": "reject",
+                "result_valid": True,
+                "metrics": {"endpoint_correct_diff": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    job = JobRecord(
+        job_id=f"{idea.idea_id}-report",
+        idea_id=idea.idea_id,
+        kind=JobKind.REPORT,
+    )
+    attempt = AttemptRecord(
+        attempt_id=f"{job.job_id}-attempt-01",
+        idea_id=idea.idea_id,
+        job_id=job.job_id,
+        number=1,
+        status=AttemptStatus.RUNNING,
+    )
+    reports = [
+        {
+            "title": f"Draft {index}",
+            "claims": [
+                {
+                    "claim": "The measured endpoint contrast was zero.",
+                    "evidence_paths": [
+                        "/evidence/pilot/metrics/endpoint_correct_diff"
+                    ],
+                    "strength": "measured",
+                }
+            ],
+            "limitations": [],
+            "next_experiments": [],
+            "paper_markdown": f"# Draft {index}",
+        }
+        for index in range(4)
+    ]
+
+    class _SequentialReportRole:
+        def __init__(self, values):
+            self.values = list(values)
+
+        def call(self, prompt, **kwargs):
+            del prompt, kwargs
+            return SimpleNamespace(
+                value=self.values.pop(0),
+                total_tokens=10,
+            )
+
+    gate = _ReportGate(
+        [
+            GateVerdict("retry", "repair one", 1.0),
+            GateVerdict("retry", "repair two", 1.0),
+            GateVerdict("retry", "repair three", 1.0),
+            GateVerdict("complete", "evidence complete", 1.0),
+        ]
+    )
+    outcome = ReportJobExecutor(
+        _SequentialReportRole(reports),
+        decision_gate=gate,
+        max_revisions=3,
+    ).execute(
+        idea=idea,
+        job=job,
+        attempt=attempt,
+        store=store,
+    )
+
+    assert outcome.success
+    assert outcome.decision == "complete"
+    durable = store.get_attempt(attempt.attempt_id)
+    assert durable is not None
+    assert len(durable.validation["report_revisions"]) == 4
+
+
 class _CompilerRepairRole(_Role):
     def __init__(self, values):
         self.values = list(values)

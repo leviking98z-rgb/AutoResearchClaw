@@ -247,7 +247,7 @@ def test_report_preflight_rejects_missing_or_non_evidence_measured_paths() -> No
     assert verdict is not None
     assert verdict.decision == "retry"
     assert any(
-        "measured claim must cite /evidence/" in change
+        "measured claim must cite at least one /evidence/" in change
         for change in verdict.required_changes
     )
     assert any(
@@ -275,6 +275,32 @@ def test_report_preflight_accepts_existing_json_pointers() -> None:
     }
     context = {
         "idea": {"falsifiable_hypothesis": "improves"},
+        "evidence": {
+            "pilot": {"metrics": {"endpoint_correct_diff": 0.0}}
+        },
+    }
+
+    assert _report_preflight(report, context) is None
+
+
+def test_report_preflight_allows_plan_context_alongside_measured_evidence() -> None:
+    report = {
+        "claims": [
+            {
+                "claim": (
+                    "The measured effect was zero against the "
+                    "pre-specified threshold."
+                ),
+                "evidence_paths": [
+                    "/evidence/pilot/metrics/endpoint_correct_diff",
+                    "/plan/promotion_criteria/0/value",
+                ],
+                "strength": "measured",
+            }
+        ]
+    }
+    context = {
+        "plan": {"promotion_criteria": [{"value": 3.0}]},
         "evidence": {
             "pilot": {"metrics": {"endpoint_correct_diff": 0.0}}
         },

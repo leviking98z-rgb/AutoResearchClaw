@@ -1290,9 +1290,11 @@ class ReportJobExecutor:
         role: StructuredRole,
         *,
         decision_gate: DecisionGate | None = None,
+        max_revisions: int = 3,
     ) -> None:
         self.role = role
         self.decision_gate = decision_gate
+        self.max_revisions = max(0, int(max_revisions))
 
     def execute(
         self,
@@ -1327,7 +1329,7 @@ class ReportJobExecutor:
         review_history: list[dict[str, Any]] = []
         gate_tokens = 0
         verdict = None
-        for revision in range(2):
+        for revision in range(self.max_revisions + 1):
             _write_json(candidate / "report.json", report)
             (candidate / "paper.md").write_text(
                 str(report["paper_markdown"]),
@@ -1352,7 +1354,10 @@ class ReportJobExecutor:
             _write_json(candidate / "final_review.json", review)
             if verdict.decision == "complete":
                 break
-            if verdict.decision != "retry" or revision >= 1:
+            if (
+                verdict.decision != "retry"
+                or revision >= self.max_revisions
+            ):
                 attempt.status = AttemptStatus.REJECTED
                 attempt.error = verdict.reason
                 attempt.validation = {
@@ -1514,13 +1519,19 @@ Return JSON:
 }}
 Do not invent results, citations, or runs. Clearly report negative results.
 The EVIDENCE object is authoritative for measured outcomes. Every measured
-claim must cite one or more exact JSON-pointer paths beginning with
-"/evidence/"; never cite Python-style paths such as idea.*, plan.*, or
-artifacts/*. Hypotheses and design descriptions may cite exact "/plan/" or
-"/idea/" JSON pointers. Reconcile measured call counts with planned workload
-rather than silently asserting protocol adherence. Use "pre-specified", not
-"preregistered", unless the supplied evidence contains an immutable,
-time-stamped preregistration artifact.
+claim must cite at least one exact JSON-pointer path beginning with
+"/evidence/"; it may additionally cite exact "/plan/" or "/idea/" paths for
+pre-specified thresholds, denominators, decision contracts, or design
+provenance. Never cite Python-style paths such as idea.*, plan.*, or
+artifacts/*. Reconcile measured call counts with the supplied plan rather than
+silently asserting protocol adherence. Report disagreement, tie, and
+abstention rates as separate observables; aggregate rates do not prove that
+one outcome converted into another. Do not call ties abstentions unless the
+supplied protocol explicitly defines that equivalence. Recommend future work
+as a recommendation, not as an already pre-specified or untouched study,
+unless those properties are directly supported by exact context paths. Use
+"pre-specified", not "preregistered", unless the supplied evidence contains
+an immutable, time-stamped preregistration artifact.
 """
 
     @staticmethod
@@ -1545,9 +1556,14 @@ REJECTED REPORT:
 FINAL REVIEW:
 {json.dumps(dict(review), ensure_ascii=False, indent=2)[:16000]}
 
-Every measured claim must cite exact JSON-pointer paths beginning with
-"/evidence/". Never claim measured metrics are unavailable when they appear in
-the context. Reconcile planned and measured call counts explicitly. Return:
+Every measured claim must cite at least one exact JSON-pointer path beginning
+with "/evidence/"; it may additionally cite exact "/plan/" or "/idea/" paths
+for pre-specified thresholds, denominators, decision contracts, or design
+provenance. Never claim measured metrics are unavailable when they appear in
+the context. Reconcile planned and measured call counts explicitly. Keep tie,
+abstention, and disagreement statements separate. Do not infer that aggregate
+rates represent transition-level conversions. Remove unsupported provenance
+claims instead of preserving them. Return:
 {{
   "title": "...",
   "claims": [

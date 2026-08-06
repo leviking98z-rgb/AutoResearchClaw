@@ -226,6 +226,7 @@ def _report_preflight(
                     f"claims[{index}].evidence_paths must be non-empty"
                 )
                 continue
+            evidence_path_present = False
             for path in paths:
                 if not isinstance(path, str):
                     errors.append(
@@ -237,13 +238,13 @@ def _report_preflight(
                     errors.append(
                         f"claims[{index}] cites missing evidence path: {path}"
                     )
-                if strength == "measured" and not path.startswith(
-                    "/evidence/"
-                ):
-                    errors.append(
-                        f"claims[{index}] measured claim must cite /evidence/: "
-                        f"{path}"
-                    )
+                if exists and path.startswith("/evidence/"):
+                    evidence_path_present = True
+            if strength == "measured" and not evidence_path_present:
+                errors.append(
+                    f"claims[{index}] measured claim must cite at least one "
+                    "/evidence/ path"
+                )
     if not errors:
         return None
     reason = "; ".join(errors[:8])
@@ -493,9 +494,15 @@ REPORT:
 MEASURED EVIDENCE:
 {json.dumps(context["evidence"], ensure_ascii=False, indent=2)[:36000]}
 
-Every measured claim must name an existing evidence path and must not be
-stronger than the evidence. Hypotheses must be labelled as hypotheses. Evidence
-paths are JSON pointers into a root object with "/idea" and "/evidence".
+Every measured claim must name at least one existing "/evidence/" path and
+must not be stronger than the evidence. A measured claim may additionally cite
+exact "/plan/" or "/idea/" paths for pre-specified thresholds, denominators,
+decision contracts, or design provenance. Hypotheses must be labelled as
+hypotheses. Review only claims actually made in REPORT. Do not require the
+writer to add unsupported assertions merely because they appeared in an
+earlier draft or possible follow-up. Aggregate disagreement, tie, and
+abstention rates describe separate observables and do not establish
+transition-level conversions.
 
 Return:
 {{
