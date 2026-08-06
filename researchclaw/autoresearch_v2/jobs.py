@@ -18,7 +18,7 @@ from typing import Any, Protocol
 
 from .attestation import sha256_file
 from .gates import DecisionGate, design_preflight
-from .llm import StructuredRole
+from .llm import StructuredRole, StructuredValidationError
 from .models import (
     AttemptRecord,
     AttemptStatus,
@@ -151,6 +151,39 @@ class DesignJobExecutor:
                         max_tokens=10000,
                         temperature=0.10,
                     )
+            except StructuredValidationError as exc:
+                total_tokens += exc.total_tokens
+                if (
+                    exc.previous_value is not None
+                    and revision < self.max_revisions
+                ):
+                    design_revisions.append(
+                        {
+                            "revision": revision,
+                            "decision": "draft_validation_retry",
+                            "reason": str(exc),
+                            "required_changes": list(exc.errors),
+                        }
+                    )
+                    pending_draft = exc.previous_value
+                    pending_errors = list(exc.errors)
+                    continue
+                attempt.validation = {
+                    "ok": False,
+                    "protocol_compiler": {"error": str(exc)},
+                    "design_revisions": design_revisions,
+                }
+                attempt.status = AttemptStatus.REJECTED
+                attempt.error = f"protocol_draft_failed: {exc}"
+                store.save_attempt(attempt)
+                return JobOutcome(
+                    False,
+                    "retry",
+                    attempt.error,
+                    {"validation": attempt.validation},
+                    tokens=total_tokens,
+                    elapsed_sec=time.monotonic() - started,
+                )
             except ValueError as exc:
                 attempt.validation = {
                     "ok": False,

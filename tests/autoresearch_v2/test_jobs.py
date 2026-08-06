@@ -17,6 +17,7 @@ from researchclaw.autoresearch_v2.models import (
     JobKind,
     JobRecord,
 )
+from researchclaw.autoresearch_v2.protocols import validate_protocol_draft
 from researchclaw.autoresearch_v2.store import V2Store
 from researchclaw.autoresearch_v2.validation import validate_plan
 
@@ -526,6 +527,57 @@ def test_design_repairs_compiler_error_inside_revision_budget(
     assert durable is not None
     assert durable.validation["design_revisions"][0]["decision"] == (
         "compiler_retry"
+    )
+
+
+def test_design_continues_after_structured_role_exhausts_local_retries(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="typed-design-validation-repair",
+        idea_id=idea.idea_id,
+        kind=JobKind.DESIGN,
+        attempt_limit=1,
+    )
+    attempt = AttemptRecord(
+        attempt_id="typed-design-validation-repair-attempt-01",
+        idea_id=idea.idea_id,
+        job_id=job.job_id,
+        number=1,
+        status=AttemptStatus.RUNNING,
+    )
+    invalid = _typed_draft()
+    invalid["pilot"]["max_examples"] = 50
+    client = _RetryClient([invalid, invalid, _typed_draft()])
+    role = StructuredRole(
+        client=client,
+        system="return json",
+        validator=validate_protocol_draft,
+        max_attempts=2,
+    )
+
+    outcome = DesignJobExecutor(
+        role,
+        decision_gate=_Gate(),
+        max_revisions=2,
+    ).execute(
+        idea=idea,
+        job=job,
+        attempt=attempt,
+        store=store,
+    )
+
+    assert outcome.success
+    assert outcome.decision == "promote"
+    assert len(client.requests) == 3
+    durable = store.get_attempt(attempt.attempt_id)
+    assert durable is not None
+    assert durable.validation["design_revisions"][0]["decision"] == (
+        "draft_validation_retry"
     )
 
 

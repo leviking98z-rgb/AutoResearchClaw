@@ -33,6 +33,35 @@ class StructuredResult:
     attempts: int
 
 
+class StructuredValidationError(ValueError):
+    """Bounded structured generation failed but produced repairable JSON."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        previous_value: Mapping[str, Any] | None,
+        errors: list[str],
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        attempts: int,
+    ) -> None:
+        super().__init__(message)
+        self.previous_value = (
+            dict(previous_value)
+            if previous_value is not None
+            else None
+        )
+        self.errors = tuple(str(item) for item in errors)
+        self.model = str(model)
+        self.prompt_tokens = max(0, int(prompt_tokens))
+        self.completion_tokens = max(0, int(completion_tokens))
+        self.total_tokens = max(0, int(total_tokens))
+        self.attempts = max(0, int(attempts))
+
+
 class StructuredRole:
     def __init__(
         self,
@@ -119,7 +148,21 @@ class StructuredRole:
                 total_tokens=total_tokens,
                 attempts=attempt,
             )
-        raise ValueError(f"structured role failed validation: {error}")
+        errors = [
+            item.strip()
+            for item in error.split(";")
+            if item.strip()
+        ]
+        raise StructuredValidationError(
+            f"structured role failed validation: {error}",
+            previous_value=previous_value,
+            errors=errors or [error],
+            model=last_model,
+            prompt_tokens=total_prompt,
+            completion_tokens=total_completion,
+            total_tokens=total_tokens,
+            attempts=self.max_attempts,
+        )
 
     def repair(
         self,
