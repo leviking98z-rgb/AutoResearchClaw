@@ -1188,9 +1188,15 @@ class ClusterBridgePool:
             "PY\n"
             "exit \"$rc\""
         )
+        execution_root_setup = (
+            f"mkdir -p {shlex.quote(str(execution_root))}; "
+            if execution_root != task_dir
+            else ""
+        )
         start_command = (
             "set -euo pipefail; "
             f"mkdir -p {shlex.quote(str(task_dir))}; "
+            f"{execution_root_setup}"
             f"rm -f {shlex.quote(str(result_path))} "
             f"{shlex.quote(str(pid_path))}; "
             f"nohup setsid bash -lc {shlex.quote(inner)} </dev/null "

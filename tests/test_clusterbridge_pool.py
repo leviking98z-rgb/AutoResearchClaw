@@ -752,6 +752,7 @@ def test_async_task_uses_ray_resource_reservation(tmp_path: Path) -> None:
     remote_task_dir = (
         "/tmp/researchclaw-autoresearch-v2/test-pool/tasks/ray-reserved"
     )
+    assert f"mkdir -p {remote_task_dir}" in launch
     stdout_redirect = launch.index(f"{remote_task_dir}/stdout.log")
     assert command_group < stdout_redirect
     assert f"{remote_task_dir}/result.json" in launch
