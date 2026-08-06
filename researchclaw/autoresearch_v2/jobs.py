@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -719,19 +720,38 @@ class BuildJobExecutor:
             max_tokens=12000,
             temperature=0.20,
         )
-        output = result.value
-        for filename, content in output["files"].items():
-            target = (candidate / filename).resolve()
-            if not target.is_relative_to(candidate.resolve()):
-                raise ValueError(f"path traversal: {filename}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-        _write_json(candidate / "build.json", output)
-        validation = validate_python_tree(candidate)
-        implementation = validate_research_implementation(
-            candidate,
+        result, output, validation, implementation = self._materialize_and_validate(
+            result=result,
+            candidate=candidate,
             plan=plan,
         )
+        if not validation["ok"]:
+            repair_errors = [
+                str(error)
+                for error in implementation.get("errors", [])
+            ]
+            repair_errors.extend(
+                str(issue.get("message", "") or "")
+                for issue in validation.get("errors", [])
+                if str(issue.get("message", "") or "")
+            )
+            if repair_errors:
+                shutil.rmtree(candidate, ignore_errors=True)
+                candidate = store.snapshot_current(attempt)
+                result = self.role.repair(
+                    output,
+                    repair_errors,
+                    retry_context=self._validation_repair_context,
+                    max_tokens=12000,
+                    temperature=0.10,
+                )
+                result, output, validation, implementation = (
+                    self._materialize_and_validate(
+                        result=result,
+                        candidate=candidate,
+                        plan=plan,
+                    )
+                )
         validation["research_contract"] = implementation
         validation["ok"] = bool(
             validation.get("ok") and implementation.get("ok")
@@ -785,6 +805,57 @@ class BuildJobExecutor:
             tokens=result.total_tokens,
             elapsed_sec=time.monotonic() - started,
         )
+
+    @staticmethod
+    def _materialize_and_validate(
+        *,
+        result: Any,
+        candidate: Path,
+        plan: dict[str, Any],
+    ) -> tuple[Any, dict[str, Any], dict[str, Any], dict[str, Any]]:
+        output = result.value
+        for filename, content in output["files"].items():
+            target = (candidate / filename).resolve()
+            if not target.is_relative_to(candidate.resolve()):
+                raise ValueError(f"path traversal: {filename}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        _write_json(candidate / "build.json", output)
+        validation = validate_python_tree(candidate)
+        implementation = validate_research_implementation(
+            candidate,
+            plan=plan,
+        )
+        validation["ok"] = bool(
+            validation.get("ok") and implementation.get("ok")
+        )
+        return result, output, validation, implementation
+
+    @staticmethod
+    def _validation_repair_context(
+        previous_value: Mapping[str, Any],
+        errors: list[str],
+    ) -> str:
+        return f"""\
+Repair the exact compact project snapshot below. Preserve the experiment's
+scientific design, commands, model, benchmark, budgets, and overall file
+structure. Change only what is necessary to satisfy the deterministic
+Build-to-Runtime validation errors.
+
+The runtime artifacts must follow these exact Controller contracts:
+- metrics.json root: {{"result_valid": boolean, "metrics": finite-number object}}
+- runtime_evidence.model_loaded: the exact non-empty model identifier string
+- runtime_evidence.seeds: a non-empty list of scalar seed identifiers
+- criterion_results entries: {{"value": finite number, "passed": boolean}}
+- examples_by_role keys: development, screening, confirmatory
+- call_counts keys: the exact compiled call_ledger component names
+
+PREVIOUS PROJECT JSON:
+{json.dumps(dict(previous_value), ensure_ascii=False, indent=2)[:24000]}
+
+DETERMINISTIC ERRORS:
+{json.dumps(errors, ensure_ascii=False, indent=2)[:8000]}
+"""
 
     @staticmethod
     def _prompt(
