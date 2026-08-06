@@ -28,6 +28,8 @@ def test_config_accepts_parallel_defaults() -> None:
     assert config.budgets.max_design_revisions == 2
     assert config.research_memory.enabled is True
     assert config.research_memory.reconcile_interval_ticks == 15
+    assert config.usage_monitoring.enabled is True
+    assert config.usage_monitoring.history_hours == 168
 
 
 def test_config_rejects_impossible_target() -> None:
@@ -110,6 +112,47 @@ def test_research_memory_interval_must_be_positive() -> None:
                 "autoresearch_v2": {
                     "research_memory": {
                         "reconcile_interval_ticks": 0,
+                    }
+                }
+            }
+        )
+
+
+def test_usage_monitoring_accepts_rates_and_validates_thresholds() -> None:
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "usage_monitoring": {
+                    "warning_threshold": 0.4,
+                    "critical_threshold": 0.9,
+                    "single_call_token_warning": 123_456,
+                    "monthly_token_budget": 10_000,
+                    "model_prices": {
+                        "claude-sonnet-5": {
+                            "input_per_million_usd": 3,
+                            "output_per_million_usd": 15,
+                        }
+                    },
+                }
+            }
+        }
+    )
+    assert config.usage_monitoring.monthly_token_budget == 10_000
+    assert config.usage_monitoring.single_call_token_warning == 123_456
+    assert (
+        config.usage_monitoring.model_prices["claude-sonnet-5"][
+            "output_per_million_usd"
+        ]
+        == 15
+    )
+
+    with pytest.raises(ValueError, match="thresholds"):
+        V2Config.from_mapping(
+            {
+                "autoresearch_v2": {
+                    "usage_monitoring": {
+                        "warning_threshold": 0.9,
+                        "critical_threshold": 0.8,
                     }
                 }
             }

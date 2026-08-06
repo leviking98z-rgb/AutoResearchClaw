@@ -23,6 +23,72 @@
     </header>
     <main>
       <section id="metrics" class="metrics"></section>
+      <section class="usage-shell">
+        <div class="section-head">
+          <div>
+            <small>ACCOUNTING · BUDGETS · ALERTS</small>
+            <h2>Usage Monitor</h2>
+          </div>
+          <div class="actions">
+            <label>
+              Window
+              <select id="usage-window">
+                <option value="24">24h</option>
+                <option value="168" selected>7d</option>
+                <option value="720">30d</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <section id="usage-summary" class="usage-summary"></section>
+        <section class="usage-grid">
+          <article>
+            <div class="panel-head">
+              <h3>Token Trend</h3>
+              <span id="burn-rate" class="muted"></span>
+            </div>
+            <div id="token-trend" class="chart"></div>
+          </article>
+          <article>
+            <div class="panel-head">
+              <h3>By Role / Model</h3>
+              <span id="pricing-coverage" class="muted"></span>
+            </div>
+            <div id="usage-breakdown"></div>
+          </article>
+          <article>
+            <div class="panel-head">
+              <h3>GPU Utilization</h3>
+              <span id="gpu-usage-meta" class="muted"></span>
+            </div>
+            <div id="gpu-trend" class="chart"></div>
+            <div id="gpu-states" class="gpu-states"></div>
+          </article>
+          <article>
+            <div class="panel-head">
+              <h3>Budget Pressure</h3>
+              <span id="monthly-budget-meta" class="muted"></span>
+            </div>
+            <div id="budget-pressure"></div>
+          </article>
+        </section>
+        <section class="usage-grid bottom">
+          <article>
+            <div class="panel-head">
+              <h3>Alerts</h3>
+              <span id="alert-count" class="muted"></span>
+            </div>
+            <div id="usage-alerts"></div>
+          </article>
+          <article>
+            <div class="panel-head">
+              <h3>Top Ideas by Usage</h3>
+              <span class="muted">click to inspect</span>
+            </div>
+            <div id="usage-ideas"></div>
+          </article>
+        </section>
+      </section>
       <section id="board" class="board"></section>
       <section class="lower">
         <article>

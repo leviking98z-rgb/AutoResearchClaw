@@ -97,6 +97,8 @@ class V2Store:
                     attempt_id TEXT,
                     payload_json TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_events_type_timestamp
+                    ON events(event_type, timestamp);
                 """
             )
 
@@ -615,6 +617,39 @@ class V2Store:
                 }
             )
         return result
+
+    def list_events_between(
+        self,
+        *,
+        event_type: str,
+        started_at: str,
+        ended_at: str,
+    ) -> list[dict[str, Any]]:
+        """Read one event stream directly from SQLite for a time window."""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT seq,timestamp,event_type,idea_id,job_id,attempt_id,
+                       payload_json
+                FROM events
+                WHERE event_type=? AND timestamp>=? AND timestamp<=?
+                ORDER BY timestamp, seq
+                """,
+                (event_type, started_at, ended_at),
+            ).fetchall()
+        return [
+            {
+                "seq": int(row["seq"]),
+                "timestamp": str(row["timestamp"]),
+                "event_type": str(row["event_type"]),
+                "idea_id": row["idea_id"],
+                "job_id": row["job_id"],
+                "attempt_id": row["attempt_id"],
+                **json.loads(row["payload_json"]),
+            }
+            for row in rows
+        ]
 
     def set_control(self, name: str, reason: str = "") -> Path:
         if name not in {"pause", "stop"}:

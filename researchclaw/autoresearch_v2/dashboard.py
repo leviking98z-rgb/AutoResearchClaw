@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from pydantic import BaseModel, Field
 from .config import V2Config
 from .models import IdeaStatus
 from .store import V2Store
+from .usage import UsageMonitor
 
 
 class ControlRequest(BaseModel):
@@ -30,11 +32,23 @@ class V2Dashboard:
         gpu_total: int = 0,
         target_utilization: float = 0.9,
         control_enabled: bool = True,
+        usage_monitor: UsageMonitor | None = None,
+        usage_cache_ttl_sec: float = 10.0,
     ) -> None:
         self.store = store
         self.gpu_total = max(0, int(gpu_total))
         self.target_utilization = float(target_utilization)
         self.control_enabled = control_enabled
+        self.usage_monitor = usage_monitor
+        self.usage_cache_ttl_sec = max(
+            0.0,
+            float(usage_cache_ttl_sec),
+        )
+        self._usage_cache: dict[
+            tuple[int | None, int | None],
+            tuple[datetime, dict[str, Any]],
+        ] = {}
+        self._usage_lock = threading.Lock()
 
     def collect(self) -> dict[str, Any]:
         ideas = self.store.list_ideas()
@@ -159,6 +173,39 @@ class V2Dashboard:
             },
         }
 
+    def usage(
+        self,
+        *,
+        hours: int | None = None,
+        bucket_minutes: int | None = None,
+    ) -> dict[str, Any]:
+        if self.usage_monitor is None:
+            return {
+                "enabled": False,
+                "generated_at": datetime.now(UTC).isoformat(
+                    timespec="milliseconds"
+                ),
+            }
+        key = (hours, bucket_minutes)
+        now = datetime.now(UTC)
+        with self._usage_lock:
+            cached = self._usage_cache.get(key)
+            if (
+                cached is not None
+                and (now - cached[0]).total_seconds()
+                < self.usage_cache_ttl_sec
+            ):
+                return cached[1]
+            payload = {
+                "enabled": True,
+                **self.usage_monitor.collect(
+                    hours=hours,
+                    bucket_minutes=bucket_minutes,
+                ),
+            }
+            self._usage_cache[key] = (now, payload)
+            return payload
+
     def health(self, stale_after_sec: float = 120.0) -> dict[str, Any]:
         events = self.store.list_events(limit=500)
         ticks = [
@@ -237,11 +284,22 @@ def create_dashboard_app(
             ).expected_total_gpus
         except Exception:  # noqa: BLE001
             gpu_total = 0
+    usage_monitor = (
+        UsageMonitor(
+            store=store,
+            budgets=config.budgets,
+            config=config.usage_monitoring,
+            gpu_total=gpu_total,
+        )
+        if config.usage_monitoring.enabled
+        else None
+    )
     dashboard = V2Dashboard(
         store,
         gpu_total=gpu_total,
         target_utilization=config.gpu.target_utilization,
         control_enabled=control_enabled,
+        usage_monitor=usage_monitor,
     )
     app = FastAPI(title="AutoResearch v2")
     static_dir = Path(__file__).with_name("static")
@@ -260,6 +318,16 @@ def create_dashboard_app(
     @app.get("/api/dashboard")
     def status() -> dict[str, Any]:
         return dashboard.collect()
+
+    @app.get("/api/usage")
+    def usage(
+        hours: int | None = None,
+        bucket_minutes: int | None = None,
+    ) -> dict[str, Any]:
+        return dashboard.usage(
+            hours=hours,
+            bucket_minutes=bucket_minutes,
+        )
 
     @app.get("/api/events")
     def events(

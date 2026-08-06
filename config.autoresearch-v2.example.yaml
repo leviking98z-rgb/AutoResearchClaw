@@ -94,3 +94,26 @@ autoresearch_v2:
     url: http://127.0.0.1:8077
     timeout_sec: 10
     reconcile_interval_ticks: 15
+
+  # Audit accounting is exact for recorded CLI calls. Dollar values are only
+  # estimates when explicit provider/contract rates are configured below.
+  usage_monitoring:
+    enabled: true
+    history_hours: 168
+    bucket_minutes: 60
+    warning_threshold: 0.50
+    critical_threshold: 0.80
+    token_burn_warning_per_hour: 1000000
+    single_call_token_warning: 100000
+    gpu_idle_warning_minutes: 30
+    # Zero means unset, so no monthly pressure alert is emitted.
+    monthly_token_budget: 0
+    monthly_gpu_hours_budget: 0
+    monthly_cost_budget_usd: 0
+    gpu_hour_cost_usd: 0
+    # Populate only with known billing rates, for example:
+    # model_prices:
+    #   provider/model:
+    #     input_per_million_usd: 0
+    #     output_per_million_usd: 0
+    model_prices: {}

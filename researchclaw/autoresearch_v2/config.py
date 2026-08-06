@@ -122,6 +122,25 @@ class ResearchMemoryConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class UsageMonitoringConfig:
+    """Usage accounting, alerting, and optional estimated pricing."""
+
+    enabled: bool = True
+    history_hours: int = 168
+    bucket_minutes: int = 60
+    warning_threshold: float = 0.50
+    critical_threshold: float = 0.80
+    token_burn_warning_per_hour: int = 1_000_000
+    single_call_token_warning: int = 100_000
+    gpu_idle_warning_minutes: int = 30
+    monthly_token_budget: int = 0
+    monthly_gpu_hours_budget: float = 0.0
+    monthly_cost_budget_usd: float = 0.0
+    gpu_hour_cost_usd: float = 0.0
+    model_prices: dict[str, dict[str, float]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class ModelConfig:
     researchclaw_config: str = "config.rsi.yaml"
     decision_role: str = "research_director"
@@ -146,6 +165,9 @@ class V2Config:
     literature: LiteratureConfig = field(default_factory=LiteratureConfig)
     research_memory: ResearchMemoryConfig = field(
         default_factory=ResearchMemoryConfig
+    )
+    usage_monitoring: UsageMonitoringConfig = field(
+        default_factory=UsageMonitoringConfig
     )
 
     @property
@@ -379,6 +401,64 @@ class V2Config:
                 )
             ),
         )
+        usage_raw = _mapping(
+            data.get("usage_monitoring"),
+            "usage_monitoring",
+        )
+        prices_raw = _mapping(
+            usage_raw.get("model_prices"),
+            "usage_monitoring.model_prices",
+        )
+        model_prices: dict[str, dict[str, float]] = {}
+        for raw_model, raw_price in prices_raw.items():
+            price = _mapping(
+                raw_price,
+                f"usage_monitoring.model_prices[{raw_model!r}]",
+            )
+            model_prices[str(raw_model)] = {
+                "input_per_million_usd": float(
+                    price.get("input_per_million_usd", 0.0)
+                ),
+                "output_per_million_usd": float(
+                    price.get("output_per_million_usd", 0.0)
+                ),
+            }
+        usage_monitoring = UsageMonitoringConfig(
+            enabled=bool(usage_raw.get("enabled", True)),
+            history_hours=int(usage_raw.get("history_hours", 168)),
+            bucket_minutes=int(usage_raw.get("bucket_minutes", 60)),
+            warning_threshold=float(
+                usage_raw.get("warning_threshold", 0.50)
+            ),
+            critical_threshold=float(
+                usage_raw.get("critical_threshold", 0.80)
+            ),
+            token_burn_warning_per_hour=int(
+                usage_raw.get(
+                    "token_burn_warning_per_hour",
+                    1_000_000,
+                )
+            ),
+            single_call_token_warning=int(
+                usage_raw.get("single_call_token_warning", 100_000)
+            ),
+            gpu_idle_warning_minutes=int(
+                usage_raw.get("gpu_idle_warning_minutes", 30)
+            ),
+            monthly_token_budget=int(
+                usage_raw.get("monthly_token_budget", 0)
+            ),
+            monthly_gpu_hours_budget=float(
+                usage_raw.get("monthly_gpu_hours_budget", 0.0)
+            ),
+            monthly_cost_budget_usd=float(
+                usage_raw.get("monthly_cost_budget_usd", 0.0)
+            ),
+            gpu_hour_cost_usd=float(
+                usage_raw.get("gpu_hour_cost_usd", 0.0)
+            ),
+            model_prices=model_prices,
+        )
         config = cls(
             enabled=bool(data.get("enabled", False)),
             system_id=str(data.get("system_id", "autoresearch-v2")),
@@ -396,6 +476,7 @@ class V2Config:
             models=models,
             literature=literature,
             research_memory=research_memory,
+            usage_monitoring=usage_monitoring,
         )
         config.validate()
         return config
@@ -490,6 +571,42 @@ class V2Config:
             raise ValueError(
                 "research_memory.url is required when enabled"
             )
+        usage = self.usage_monitoring
+        if usage.history_hours < 1 or usage.bucket_minutes < 1:
+            raise ValueError(
+                "usage_monitoring history and bucket sizes must be positive"
+            )
+        if not 0 < usage.warning_threshold < usage.critical_threshold <= 1:
+            raise ValueError(
+                "usage_monitoring thresholds must satisfy "
+                "0 < warning < critical <= 1"
+            )
+        if min(
+            usage.token_burn_warning_per_hour,
+            usage.single_call_token_warning,
+        ) < 0:
+            raise ValueError(
+                "usage_monitoring token thresholds must be non-negative"
+            )
+        if usage.gpu_idle_warning_minutes < 0:
+            raise ValueError(
+                "usage_monitoring GPU idle threshold must be non-negative"
+            )
+        if min(
+            usage.monthly_token_budget,
+            usage.monthly_gpu_hours_budget,
+            usage.monthly_cost_budget_usd,
+            usage.gpu_hour_cost_usd,
+        ) < 0:
+            raise ValueError(
+                "usage_monitoring budgets and prices must be non-negative"
+            )
+        for model, prices in usage.model_prices.items():
+            if not str(model).strip() or min(prices.values()) < 0:
+                raise ValueError(
+                    "usage_monitoring model prices must use non-empty "
+                    "models and non-negative values"
+                )
         if self.execution.smoke_environment not in {
             "auto",
             "local",
