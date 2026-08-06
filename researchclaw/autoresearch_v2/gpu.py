@@ -406,6 +406,11 @@ class GPUBroker:
                     "timed_out": bool(
                         _value(result, "timed_out", False)
                     ),
+                    "trusted_gpu_evidence": _value(
+                        result,
+                        "trusted_gpu_evidence",
+                        None,
+                    ),
                 }
             payload["task_id"] = lease.task_id
             payload["allocated_gpus"] = lease.allocated_gpus

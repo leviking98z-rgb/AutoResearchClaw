@@ -232,11 +232,54 @@ def test_controller_runs_build_smoke_on_gpu_pool_before_pilot(
             output_dir.mkdir(parents=True, exist_ok=True)
             if output_dir.name != "smoke":
                 return super().collect_task(task_id)
+            (output_dir / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "result_valid": True,
+                        "metrics": {"smoke_forward_pass": 1.0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "runtime_evidence.json").write_text(
+                json.dumps(
+                    {
+                        "model_loaded": "Qwen-test",
+                        "datasets_loaded": ["GSM8K"],
+                        "examples_processed": 1,
+                        "seeds": [0],
+                        "gpu_count": 1,
+                        "gate_decision": "promote",
+                        "metrics": {"smoke_forward_pass": 1.0},
+                        "cuda_executed": True,
+                        "gpu_uuid": "GPU-test-uuid",
+                        "peak_gpu_memory_mb": 128.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
             return {
                 "returncode": 0,
                 "elapsed_sec": 1.0,
                 "stdout": "smoke-ok\n",
                 "stderr": "",
+                "trusted_gpu_evidence": {
+                    "schema": "autoresearch_v2.trusted_gpu_evidence",
+                    "version": 1,
+                    "task_id": task_id,
+                    "ray_task_id": "ray-task-test",
+                    "ray_node_id": "ray-node-test",
+                    "ray_actor_id": "",
+                    "hostname": "gpu-node",
+                    "cuda_visible_devices": "0",
+                    "allocated_gpus": 1,
+                    "returncode": 0,
+                    "gpu_uuids": ["GPU-test-uuid"],
+                    "gpu_names": ["Test GPU"],
+                    "peak_gpu_memory_mb": 128.0,
+                    "peak_gpu_utilization_percent": 50.0,
+                    "samples": [],
+                },
             }
 
     store = V2Store(tmp_path)
@@ -307,14 +350,26 @@ def test_controller_runs_build_smoke_on_gpu_pool_before_pilot(
     ]
     assert len(builds) == 1
     assert builds[0].status.value == "succeeded"
-    current_build = json.loads(
-        (
-            store.current_dir(store.list_ideas()[0].idea_id)
-            / "build.json"
-        ).read_text(encoding="utf-8")
+    smoke_attempts = [
+        attempt
+        for job in builds
+        for attempt in store.list_attempts(job_id=job.job_id)
+        if attempt.status.value == "accepted"
+    ]
+    assert len(smoke_attempts) == 1
+    assert smoke_attempts[0].validation["remote_smoke"]["verified"] is True
+    assert smoke_attempts[0].validation["remote_smoke"][
+        "attestation_sha256"
+    ]
+    trusted_path = Path(
+        smoke_attempts[0].validation["remote_smoke"][
+            "trusted_gpu_evidence_path"
+        ]
     )
-    assert current_build["remote_smoke"]["ok"] is True
-    assert current_build["remote_smoke"]["attestation_sha256"]
+    assert trusted_path.is_file()
+    assert json.loads(trusted_path.read_text())["gpu_uuids"] == [
+        "GPU-test-uuid"
+    ]
     smoke_contracts = []
     for path in tmp_path.rglob("execution_contract.json"):
         contract = json.loads(path.read_text(encoding="utf-8"))
@@ -322,6 +377,154 @@ def test_controller_runs_build_smoke_on_gpu_pool_before_pilot(
             smoke_contracts.append(contract)
     assert len(smoke_contracts) == 1
     assert smoke_contracts[0]["resource_limits"]["min_gpus"] == 1
+    controller._pool.shutdown(wait=True)
+
+
+def test_remote_smoke_rejects_missing_trusted_gpu_telemetry(
+    tmp_path: Path,
+) -> None:
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "population": {
+                    "reservoir_low_watermark": 1,
+                    "reservoir_target": 1,
+                    "generation_batch_size": 1,
+                    "active_idea_target": 1,
+                    "max_active_ideas": 1,
+                    "max_same_family": 2,
+                },
+                "concurrency": {
+                    "max_llm_jobs": 1,
+                    "max_cpu_jobs": 1,
+                    "max_gpu_jobs": 1,
+                    "poll_interval_sec": 0.001,
+                },
+                "execution": {
+                    "python_executable": sys.executable,
+                    "smoke_environment": "gpu_pool",
+                },
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
+                    "pilot_max_gpus": 1,
+                    "scale_max_gpus": 1,
+                },
+            }
+        }
+    )
+
+    class UntrustedOnlyPool(_Pool):
+        def collect_task(self, task_id: str):
+            request = self.requests[task_id]
+            output_dir = Path(
+                str(
+                    request.get("env", {}).get(
+                        "AUTORESEARCH_V2_OUTPUT_DIR",
+                        "",
+                    )
+                )
+            )
+            if output_dir.name != "smoke":
+                return super().collect_task(task_id)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "result_valid": True,
+                        "metrics": {"smoke_forward_pass": 1.0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # Generated code can claim perfect GPU evidence; without the
+            # trusted Ray wrapper telemetry the Controller must reject it.
+            (output_dir / "runtime_evidence.json").write_text(
+                json.dumps(
+                    {
+                        "model_loaded": "Qwen-test",
+                        "datasets_loaded": ["GSM8K"],
+                        "examples_processed": 1,
+                        "seeds": [0],
+                        "gpu_count": 1,
+                        "gate_decision": "promote",
+                        "metrics": {"smoke_forward_pass": 1.0},
+                        "cuda_executed": True,
+                        "gpu_uuid": "GPU-forged",
+                        "peak_gpu_memory_mb": 9999.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "returncode": 0,
+                "elapsed_sec": 1.0,
+                "stdout": "claimed-ok\n",
+                "stderr": "",
+            }
+
+    store = V2Store(tmp_path)
+    pool = UntrustedOnlyPool()
+    controller = V2Controller(
+        config=config,
+        store=store,
+        generator=StaticIdeaGenerator([_candidate(0)]),
+        executors={
+            JobKind.DESIGN: SimulatedJobExecutor(),
+            JobKind.BUILD: SimulatedJobExecutor(),
+            JobKind.REPORT: SimulatedJobExecutor(),
+        },
+        gpu_broker=GPUBroker(
+            pool=pool,
+            scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        ),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+
+    import time
+
+    for _ in range(120):
+        controller.tick()
+        time.sleep(0.002)
+        smoke_jobs = [
+            job
+            for job in store.list_jobs()
+            if job.kind is JobKind.BUILD
+            and job.result.get("remote_smoke")
+        ]
+        if smoke_jobs and smoke_jobs[0].status is JobStatus.FAILED:
+            break
+
+    smoke_jobs = [
+        job
+        for job in store.list_jobs()
+        if job.kind is JobKind.BUILD and job.result.get("remote_smoke")
+    ]
+    assert len(smoke_jobs) == 1
+    assert smoke_jobs[0].status is JobStatus.FAILED
+    attempts = store.list_attempts(job_id=smoke_jobs[0].job_id)
+    assert attempts
+    assert any(
+        "trusted GPU evidence" in error
+        for attempt in attempts
+        for error in attempt.validation["errors"]
+    )
+    assert not any(
+        Path(
+            str(
+                request.get("env", {}).get(
+                    "AUTORESEARCH_V2_OUTPUT_DIR",
+                    "",
+                )
+            )
+        ).name
+        == "pilot"
+        for request in pool.requests.values()
+    )
     controller._pool.shutdown(wait=True)
 
 

@@ -470,15 +470,19 @@ class V2Config:
         key_file = self.execution.attestation_key_file.strip()
         if key_file:
             key_path = Path(key_file).expanduser().resolve()
-            if key_path == state_root or key_path.is_relative_to(state_root):
-                for ancestor in (key_path, *key_path.parents):
-                    if ancestor.name in {"candidate", "current"}:
-                        raise ValueError(
-                            "execution.attestation_key_file must be outside "
-                            "Idea candidate/current directories"
-                        )
-                    if ancestor == state_root:
-                        break
+            shared_root = Path(
+                self.gpu.shared_workspace_root
+            ).expanduser().resolve()
+            if (
+                key_path == state_root
+                or key_path.is_relative_to(state_root)
+                or key_path == shared_root
+                or key_path.is_relative_to(shared_root)
+            ):
+                raise ValueError(
+                    "execution.attestation_key_file must be outside the "
+                    "Controller state and GPU-visible shared workspace"
+                )
 
     @classmethod
     def from_file(cls, path: str | Path) -> V2Config:

@@ -17,8 +17,11 @@ from pathlib import Path
 from typing import Any
 
 from .attestation import (
+    canonical_json_sha256,
     create_execution_attestation,
     create_execution_contract,
+    verify_execution_attestation,
+    verify_execution_contract,
     write_execution_attestation,
     write_execution_contract,
 )
@@ -538,13 +541,12 @@ class V2Controller:
             kind = _KIND_FOR_STATUS.get(idea.status)
             if kind is None:
                 continue
-            build = self._read_current_json(idea.idea_id, "build.json")
             remote_smoke = bool(
                 kind is JobKind.PILOT
                 and self.config.gpu.enabled
                 and self.config.execution.smoke_environment
                 in {"auto", "gpu_pool"}
-                and not self._build_has_successful_remote_smoke(build)
+                and not self._has_verified_remote_smoke(idea.idea_id)
             )
             dispatch_kind = JobKind.BUILD if remote_smoke else kind
             base = f"{idea.idea_id}-{kind.value}"
@@ -637,16 +639,31 @@ class V2Controller:
     def _is_remote_smoke_job(job: JobRecord) -> bool:
         return bool(job.result.get("remote_smoke"))
 
-    @staticmethod
-    def _build_has_successful_remote_smoke(
-        build: Mapping[str, Any],
-    ) -> bool:
-        remote_smoke = build.get("remote_smoke")
-        return bool(
-            isinstance(remote_smoke, Mapping)
-            and remote_smoke.get("ok") is True
-            and str(remote_smoke.get("attestation_sha256", "")).strip()
-        )
+    def _has_verified_remote_smoke(self, idea_id: str) -> bool:
+        for job in self.store.list_jobs():
+            if (
+                job.idea_id != idea_id
+                or not self._is_remote_smoke_job(job)
+                or job.status is not JobStatus.SUCCEEDED
+                or not job.attempt_id
+            ):
+                continue
+            attempt = self.store.get_attempt(job.attempt_id)
+            if (
+                attempt is None
+                or attempt.status is not AttemptStatus.ACCEPTED
+                or attempt.validation.get("ok") is not True
+            ):
+                continue
+            remote = attempt.validation.get("remote_smoke", {})
+            if not isinstance(remote, Mapping):
+                continue
+            if remote.get("verified") is not True:
+                continue
+            if not str(remote.get("attestation_sha256", "")).strip():
+                continue
+            return True
+        return False
 
     def _dispatch(self) -> None:
         running_llm = self._running_llm_count()
@@ -987,6 +1004,14 @@ class V2Controller:
             "execution_contract.json"
         )
         write_execution_contract(contract_path, contract)
+        contract_hash = canonical_json_sha256(contract)
+        job.result = {
+            **job.result,
+            "execution_contract_path": str(contract_path),
+            "execution_contract_sha256": contract_hash,
+            "execution_mode": mode,
+        }
+        self.store.save_job(job)
         runner = (
             "import json, os, subprocess, sys\n"
             "contract=json.load(open(sys.argv[1], encoding='utf-8'))\n"
@@ -994,8 +1019,17 @@ class V2Controller:
             "allowed=set(contract['allowed_env_keys'])\n"
             "env={k:v for k,v in os.environ.items() if k in allowed}\n"
             "for key in ('PATH','HOME','LANG','LC_ALL','LD_LIBRARY_PATH',"
-            "'PYTHONPATH','HF_HOME','TORCH_HOME','CUDA_HOME'):\n"
+            "'PYTHONPATH','HF_HOME','TORCH_HOME','CUDA_HOME',"
+            "'CUDA_VISIBLE_DEVICES','CUDA_DEVICE_ORDER',"
+            "'NVIDIA_VISIBLE_DEVICES','ROCR_VISIBLE_DEVICES'):\n"
             "    if key in os.environ: env[key]=os.environ[key]\n"
+            "expected=int(env.get('AUTORESEARCH_V2_GPU_COUNT','0'))\n"
+            "visible=env.get('CUDA_VISIBLE_DEVICES','')\n"
+            "if expected > 0:\n"
+            "    devices=[x for x in visible.split(',') if x.strip()]\n"
+            "    if len(devices) != expected:\n"
+            "        raise SystemExit('trusted GPU visibility mismatch: "
+            "expected=%d visible=%r' % (expected, visible))\n"
             "env['PYTHONUNBUFFERED']='1'\n"
             "env['TOKENIZERS_PARALLELISM']='false'\n"
             "raise SystemExit(subprocess.run("
@@ -1254,6 +1288,27 @@ class V2Controller:
         allocated_gpus: int,
         elapsed_sec: float,
     ) -> None:
+        smoke_artifacts = validate_experiment_artifacts(output_dir)
+        trusted_evidence = result.get("trusted_gpu_evidence")
+        if not isinstance(trusted_evidence, Mapping):
+            trusted_evidence = {}
+        trusted_evidence_path = (
+            self.store.attempt_dir(attempt)
+            / "trusted"
+            / "remote_smoke"
+            / "trusted_gpu_evidence.json"
+        )
+        trusted_evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        trusted_evidence_path.write_text(
+            json.dumps(
+                dict(trusted_evidence),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         attestation = self._attest_gpu_execution(
             idea=idea,
             job=job,
@@ -1265,16 +1320,97 @@ class V2Controller:
             allocated_gpus=allocated_gpus,
             elapsed_sec=elapsed_sec,
         )
+        evidence = smoke_artifacts.get("runtime_evidence", {})
+        smoke_errors = list(smoke_artifacts.get("errors", []))
+        if not isinstance(evidence, Mapping):
+            evidence = {}
+        if int(evidence.get("examples_processed", 0) or 0) <= 0:
+            smoke_errors.append(
+                "remote smoke must process at least one real benchmark example"
+            )
+        if int(evidence.get("gpu_count", 0) or 0) != allocated_gpus:
+            smoke_errors.append(
+                "remote smoke runtime gpu_count must match allocated_gpus"
+            )
+        try:
+            trusted_allocated = int(
+                trusted_evidence.get("allocated_gpus", -1)
+            )
+        except (TypeError, ValueError):
+            trusted_allocated = -1
+        visible = str(
+            trusted_evidence.get("cuda_visible_devices", "") or ""
+        )
+        visible_devices = [
+            item.strip() for item in visible.split(",") if item.strip()
+        ]
+        gpu_uuids = trusted_evidence.get("gpu_uuids")
+        if trusted_allocated != allocated_gpus:
+            smoke_errors.append(
+                "trusted GPU evidence allocation must match allocated_gpus"
+            )
+        if len(visible_devices) != allocated_gpus:
+            smoke_errors.append(
+                "trusted GPU evidence CUDA visibility must match allocation"
+            )
+        if (
+            not isinstance(gpu_uuids, list)
+            or len(gpu_uuids) != allocated_gpus
+            or any(not str(item).strip() for item in gpu_uuids)
+        ):
+            smoke_errors.append(
+                "trusted GPU evidence must identify every allocated GPU UUID"
+            )
+        if not str(
+            trusted_evidence.get("ray_task_id", "") or ""
+        ).strip() or not str(
+            trusted_evidence.get("ray_node_id", "") or ""
+        ).strip():
+            smoke_errors.append(
+                "trusted GPU evidence must record Ray task and node identity"
+            )
+        try:
+            trusted_returncode = int(
+                trusted_evidence.get("returncode", -1)
+            )
+        except (TypeError, ValueError):
+            trusted_returncode = -1
+        if trusted_returncode != returncode:
+            smoke_errors.append(
+                "trusted GPU evidence returncode disagrees with pool result"
+            )
+        if float(
+            trusted_evidence.get("peak_gpu_memory_mb", 0.0) or 0.0
+        ) <= 0:
+            smoke_errors.append(
+                "trusted GPU evidence must record non-zero GPU memory usage"
+            )
+        if float(
+            trusted_evidence.get(
+                "peak_gpu_utilization_percent",
+                0.0,
+            )
+            or 0.0
+        ) <= 0:
+            smoke_errors.append(
+                "trusted GPU evidence must record non-zero GPU utilization"
+            )
+        smoke_errors.extend(attestation.get("errors", []))
         validation: dict[str, Any] = {
-            "ok": returncode == 0 and not attestation.get("errors"),
+            "ok": returncode == 0 and not smoke_errors,
             "remote_smoke": {
                 "executed": True,
                 "environment": "gpu_pool",
                 "returncode": returncode,
                 "allocated_gpus": allocated_gpus,
+                "runtime_evidence": dict(evidence),
+                "trusted_gpu_evidence": dict(trusted_evidence),
+                "trusted_gpu_evidence_path": str(trusted_evidence_path),
                 "execution_attestation": attestation,
             },
-            "errors": list(attestation.get("errors", [])),
+            "metrics": smoke_artifacts.get("metrics", {}),
+            "runtime_evidence": dict(evidence),
+            "errors": smoke_errors,
         }
         attempt.output_manifest = {
             **dict(result),
@@ -1282,27 +1418,18 @@ class V2Controller:
         }
         attempt.validation = validation
         if validation["ok"]:
-            build_path = (
-                self.store.attempt_dir(attempt) / "candidate" / "build.json"
-            )
-            build = json.loads(build_path.read_text(encoding="utf-8"))
-            build["remote_smoke"] = {
+            remote_smoke = {
                 "ok": True,
+                "verified": True,
                 "attempt_id": attempt.attempt_id,
                 "contract_path": attestation.get("contract_path", ""),
                 "attestation_path": attestation.get("path", ""),
                 "attestation_sha256": attestation.get("sha256", ""),
+                "runtime_evidence": dict(evidence),
+                "trusted_gpu_evidence": dict(trusted_evidence),
+                "trusted_gpu_evidence_path": str(trusted_evidence_path),
             }
-            build_path.write_text(
-                json.dumps(
-                    build,
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+            attempt.validation["remote_smoke"].update(remote_smoke)
             attempt.status = AttemptStatus.VALIDATING
             attempt.finished_at = utc_now()
             self.store.save_attempt(attempt)
@@ -1312,7 +1439,7 @@ class V2Controller:
                 "promote",
                 "remote_smoke_accepted",
                 {
-                    "remote_smoke": build["remote_smoke"],
+                    "remote_smoke": remote_smoke,
                     "pool_result": dict(result),
                 },
                 elapsed_sec=elapsed_sec,
@@ -1369,6 +1496,38 @@ class V2Controller:
         )
         try:
             contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            expected_hash = str(
+                job.result.get("execution_contract_sha256", "") or ""
+            )
+            actual_hash = canonical_json_sha256(contract)
+            if not expected_hash or actual_hash != expected_hash:
+                raise ValueError(
+                    "execution contract hash differs from durable pre-run hash"
+                )
+            candidate = self.store.attempt_dir(attempt) / "candidate"
+            build_path = candidate / "build.json"
+            if contract.get("mode") == "smoke":
+                build_path = (
+                    candidate
+                    / "trusted"
+                    / "remote_smoke"
+                    / "executed_build.json"
+                )
+            verify_execution_contract(
+                contract,
+                idea_id=idea.idea_id,
+                job_id=job.job_id,
+                attempt_id=attempt.attempt_id,
+                mode=str(contract["mode"]),
+                argv=list(contract["argv"]),
+                cwd=candidate,
+                entrypoint=str(contract["entrypoint"]),
+                output_dir=str(contract["output_dir"]),
+                resource_limits=dict(contract["resource_limits"]),
+                plan_path=candidate / "plan.json",
+                build_path=build_path,
+                allowed_env_keys=self.config.execution.allowed_env_keys,
+            )
             key = self._attestation_key()
             ended = datetime.now(UTC)
             started = ended - timedelta(
@@ -1394,12 +1553,31 @@ class V2Controller:
                 attestation_path,
                 attestation_value,
             )
+            verification_errors = verify_execution_attestation(
+                contract_path,
+                attestation_path,
+                candidate,
+                signing_key=key,
+                key_id=self.config.execution.attestation_key_id,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                artifact_dir=output_dir,
+                returncode=returncode,
+                allocated_gpus=allocated_gpus,
+            )
+            if verification_errors:
+                raise ValueError(
+                    "execution attestation verification failed: "
+                    + "; ".join(verification_errors)
+                )
         except Exception as exc:  # noqa: BLE001
             return {"errors": [f"{type(exc).__name__}: {exc}"]}
         return {
             "path": str(attestation_path),
             "sha256": attestation_hash,
             "contract_path": str(contract_path),
+            "contract_sha256": expected_hash,
+            "verified": True,
             "key_id": self.config.execution.attestation_key_id,
             "idea_id": idea.idea_id,
             "job_id": job.job_id,

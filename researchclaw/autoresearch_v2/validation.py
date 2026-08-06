@@ -2262,6 +2262,20 @@ def _deduplicate(errors: list[str]) -> list[str]:
 
 
 def validate_build_output(value: dict[str, Any]) -> list[str]:
+    reserved = sorted(
+        {
+            "remote_smoke",
+            "execution_attestation",
+            "execution_contract",
+            "attestation_sha256",
+            "contract_sha256",
+        }.intersection(value)
+    )
+    if reserved:
+        return [
+            "Controller-owned build fields are forbidden: "
+            + ", ".join(reserved)
+        ]
     files = value.get("files")
     if not isinstance(files, dict) or not files:
         return ["files must be a non-empty object"]

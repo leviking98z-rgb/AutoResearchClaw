@@ -824,6 +824,13 @@ Requirements:
 - The runtime must write runtime_evidence.json with exact model, datasets,
   examples, seeds, GPU count, call counts, dataset/split declarations,
   evidence_valid, criterion_results, and the compiled gate decision.
+- Smoke mode is a real integration test, not a dry run: load the declared
+  pretrained LLM through the actual transformers/model loader, load at least
+  one real example from a declared benchmark, move the model and tensors to
+  CUDA, execute at least one model forward/generation, synchronize CUDA, and
+  write the measured artifacts. Never fake CUDA, GPU UUID, utilization, memory,
+  model, dataset, or benchmark evidence; Controller-owned trusted telemetry
+  independently verifies the physical execution.
 - Implement the compiled decision_contract mechanically. Every
   validity_criteria and promotion_criteria id must appear in
   runtime_evidence.json criterion_results with its measured value and pass
@@ -1236,6 +1243,8 @@ def _execution_env(
         key: value
         for key in (
             "CUDA_HOME",
+            "CUDA_DEVICE_ORDER",
+            "CUDA_VISIBLE_DEVICES",
             "HF_HOME",
             "HOME",
             "LANG",
@@ -1244,6 +1253,8 @@ def _execution_env(
             "PATH",
             "PYTHONPATH",
             "TORCH_HOME",
+            "NVIDIA_VISIBLE_DEVICES",
+            "ROCR_VISIBLE_DEVICES",
         )
         if (value := os.environ.get(key))
     }

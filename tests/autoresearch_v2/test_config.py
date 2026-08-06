@@ -69,7 +69,7 @@ def test_execution_smoke_environment_is_validated() -> None:
 def test_attestation_key_cannot_live_in_generated_candidate(
     tmp_path,
 ) -> None:
-    with pytest.raises(ValueError, match="outside Idea candidate"):
+    with pytest.raises(ValueError, match="outside the Controller state"):
         V2Config.from_mapping(
             {
                 "autoresearch_v2": {

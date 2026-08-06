@@ -103,6 +103,7 @@ class PoolTaskResult:
     stderr_path: str
     result_path: str
     pid: int | None = None
+    trusted_gpu_evidence: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -924,7 +925,7 @@ class ClusterBridgePool:
         payload_path = task_dir / "ray_task.json"
         task_script = task_dir / "ray_task.py"
         ray_wrapper = (
-            "import json, os, subprocess, sys\n"
+            "import json, os, pathlib, subprocess, sys, threading, time\n"
             "import ray\n"
             "payload=json.load(open(sys.argv[1], encoding='utf-8'))\n"
             "ray.init(address=os.environ.get('RAY_ADDRESS', 'auto'))\n"
@@ -932,19 +933,106 @@ class ClusterBridgePool:
             "num_cpus=payload['num_cpus'])\n"
             "def run(command, env):\n"
             "    child_env=os.environ.copy(); child_env.update(env)\n"
-            "    return subprocess.run(command, shell=True, executable='/bin/bash', "
-            "env=child_env).returncode\n"
+            "    task_context=ray.get_runtime_context()\n"
+            "    evidence_path=pathlib.Path(payload['evidence_path'])\n"
+            "    visible=child_env.get('CUDA_VISIBLE_DEVICES', '')\n"
+            "    samples=[]; stop=threading.Event()\n"
+            "    query=['nvidia-smi','--query-gpu=index,uuid,name,memory.used,"
+            "utilization.gpu','--format=csv,noheader,nounits']\n"
+            "    def sample():\n"
+            "        while not stop.is_set():\n"
+            "            try:\n"
+            "                result=subprocess.run(query, text=True, "
+            "capture_output=True, timeout=5, check=False)\n"
+            "                rows=[]\n"
+            "                if result.returncode == 0:\n"
+            "                    for line in result.stdout.splitlines():\n"
+            "                        parts=[part.strip() for part in "
+            "line.split(',', 4)]\n"
+            "                        if len(parts) == 5:\n"
+            "                            index,uuid,name,memory,utilization=parts\n"
+            "                            if visible and index not in "
+            "visible.split(',') and uuid not in visible.split(','):\n"
+            "                                continue\n"
+            "                            rows.append({'index': index, "
+            "'uuid': uuid, 'name': name, "
+            "'memory_used_mb': float(memory), "
+            "'utilization_gpu_percent': float(utilization)})\n"
+            "                samples.append({'timestamp_unix': time.time(), "
+            "'gpus': rows})\n"
+            "            except Exception as exc:\n"
+            "                samples.append({'timestamp_unix': time.time(), "
+            "'error': f'{type(exc).__name__}: {exc}', 'gpus': []})\n"
+            "            stop.wait(0.25)\n"
+            "    sampler=threading.Thread(target=sample, daemon=True)\n"
+            "    sampler.start()\n"
+            "    started=time.time()\n"
+            "    try:\n"
+            "        completed=subprocess.run(command, shell=True, "
+            "executable='/bin/bash', env=child_env)\n"
+            "        returncode=int(completed.returncode)\n"
+            "    finally:\n"
+            "        stop.set(); sampler.join(timeout=6)\n"
+            "    if not samples:\n"
+            "        try:\n"
+            "            result=subprocess.run(query, text=True, "
+            "capture_output=True, timeout=5, check=False)\n"
+            "            rows=[]\n"
+            "            if result.returncode == 0:\n"
+            "                for line in result.stdout.splitlines():\n"
+            "                    parts=[part.strip() for part in "
+            "line.split(',', 4)]\n"
+            "                    if len(parts) == 5:\n"
+            "                        index,uuid,name,memory,utilization=parts\n"
+            "                        if visible and index not in "
+            "visible.split(',') and uuid not in visible.split(','):\n"
+            "                            continue\n"
+            "                        rows.append({'index': index, "
+            "'uuid': uuid, 'name': name, "
+            "'memory_used_mb': float(memory), "
+            "'utilization_gpu_percent': float(utilization)})\n"
+            "            samples.append({'timestamp_unix': time.time(), "
+            "'gpus': rows})\n"
+            "        except Exception as exc:\n"
+            "            samples.append({'timestamp_unix': time.time(), "
+            "'error': f'{type(exc).__name__}: {exc}', 'gpus': []})\n"
+            "    rows=[gpu for item in samples for gpu in item.get('gpus', [])]\n"
+            "    evidence={'schema': 'autoresearch_v2.trusted_gpu_evidence', "
+            "'version': 1, 'task_id': payload['task_id'], "
+            "'ray_task_id': str(task_context.get_task_id()), "
+            "'ray_node_id': str(task_context.get_node_id()), "
+            "'ray_actor_id': str(task_context.get_actor_id()), "
+            "'hostname': __import__('socket').gethostname(), "
+            "'cuda_visible_devices': visible, "
+            "'allocated_gpus': int(payload['num_gpus']), "
+            "'started_at_unix': started, 'ended_at_unix': time.time(), "
+            "'returncode': returncode, 'samples': samples, "
+            "'gpu_uuids': sorted({row['uuid'] for row in rows}), "
+            "'gpu_names': sorted({row['name'] for row in rows}), "
+            "'peak_gpu_memory_mb': max([row['memory_used_mb'] "
+            "for row in rows] or [0.0]), "
+            "'peak_gpu_utilization_percent': max(["
+            "row['utilization_gpu_percent'] for row in rows] or [0.0])}\n"
+            "    evidence_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    temporary=evidence_path.with_name(evidence_path.name+'.tmp')\n"
+            "    temporary.write_text(json.dumps(evidence, sort_keys=True), "
+            "encoding='utf-8')\n"
+            "    os.replace(temporary, evidence_path)\n"
+            "    return returncode\n"
             "sys.exit(int(ray.get(run.remote(payload['command'], "
             "payload['env']))))\n"
         )
         if num_gpus or num_cpus != 1:
+            trusted_gpu_evidence_path = task_dir / "trusted_gpu_evidence.json"
             _atomic_json_write(
                 payload_path,
                 {
+                    "task_id": task_id,
                     "command": command,
                     "env": dict(sorted(env_values.items())),
                     "num_gpus": int(num_gpus),
                     "num_cpus": int(num_cpus),
+                    "evidence_path": str(trusted_gpu_evidence_path),
                 },
             )
             task_script.write_text(ray_wrapper, encoding="utf-8")
@@ -1395,6 +1483,10 @@ class ClusterBridgePool:
             stderr_path=str(task_dir / "stderr.log"),
             result_path=str(task_dir / "result.json"),
             pid=pid,
+            trusted_gpu_evidence=_read_json_mapping(
+                task_dir / "trusted_gpu_evidence.json"
+            )
+            or None,
         )
         summary_path = task_dir / "summary.json"
         _atomic_json_write(summary_path, asdict(result))

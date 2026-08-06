@@ -693,8 +693,13 @@ def test_async_task_uses_ray_resource_reservation(tmp_path: Path) -> None:
     assert request["num_gpus"] == 2
     assert request["num_cpus"] == 4
     assert payload["env"]["EXAMPLE"] == "value"
+    assert payload["task_id"] == "ray-reserved"
+    assert payload["evidence_path"].endswith("trusted_gpu_evidence.json")
     assert "@ray.remote(num_gpus=payload['num_gpus']" in script
     assert "ray.get(run.remote" in script
+    assert "nvidia-smi" in script
+    assert "CUDA_VISIBLE_DEVICES" in script
+    assert "ray_task_id" in script
 
 
 def test_async_task_resource_change_conflicts_with_existing_task(
