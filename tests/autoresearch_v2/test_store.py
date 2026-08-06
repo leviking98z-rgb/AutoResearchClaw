@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -38,6 +39,74 @@ def test_sqlite_roundtrip_and_wal(tmp_path: Path) -> None:
     assert store.get_idea(idea.idea_id) == idea
     assert store.get_job(job.job_id) == job
     assert list(tmp_path.glob("autoresearch.db-wal")) or store.db_path.exists()
+
+
+def test_database_can_live_outside_shared_artifact_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "shared"
+    database = tmp_path / "local" / "autoresearch.db"
+    store = V2Store(root, db_path=database)
+    store.initialize()
+    store.save_idea(_idea())
+
+    assert database.is_file()
+    assert not (root / "autoresearch.db").exists()
+    assert (root / "ideas" / "idea-test" / "idea.json").is_file()
+
+
+def test_database_backup_and_restore_roundtrip(tmp_path: Path) -> None:
+    root = tmp_path / "shared"
+    database = tmp_path / "local" / "autoresearch.db"
+    backup = root / "autoresearch.db.backup"
+    store = V2Store(
+        root,
+        db_path=database,
+        db_backup_path=backup,
+    )
+    store.initialize()
+    store.save_idea(_idea())
+
+    assert store.backup_database() == backup
+    assert backup.is_file()
+    database.unlink()
+
+    restored = V2Store(
+        root,
+        db_path=database,
+        db_backup_path=backup,
+    )
+    restored.initialize(recover_filesystem=False)
+
+    restored_idea = restored.get_idea("idea-test")
+    assert restored_idea is not None
+    assert restored_idea.idea_id == "idea-test"
+    assert restored_idea.title == "Test idea"
+
+
+def test_database_backup_loop_runs_without_controller_tick(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "shared"
+    database = tmp_path / "local" / "autoresearch.db"
+    backup = root / "autoresearch.db.backup"
+    store = V2Store(
+        root,
+        db_path=database,
+        db_backup_path=backup,
+        backup_interval_sec=0.01,
+    )
+    store.initialize()
+    store.save_idea(_idea())
+    store.start_database_backup_loop()
+    try:
+        deadline = time.monotonic() + 2.0
+        while not backup.is_file() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert backup.is_file()
+        assert store.database_backup_status()["running"] is True
+    finally:
+        store.stop_database_backup_loop()
 
 
 def test_failed_candidate_never_mutates_current(tmp_path: Path) -> None:

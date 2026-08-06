@@ -27,15 +27,42 @@ from .models import (
 class V2Store:
     """Single-database durable store with content-addressed attempt commits."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        db_path: str | Path | None = None,
+        db_backup_path: str | Path | None = None,
+        backup_interval_sec: float = 60.0,
+    ) -> None:
         self.root = Path(root).expanduser().resolve()
-        self.db_path = self.root / "autoresearch.db"
+        self.db_path = (
+            Path(db_path).expanduser().resolve()
+            if db_path is not None and str(db_path).strip()
+            else self.root / "autoresearch.db"
+        )
+        self.db_backup_path = (
+            Path(db_backup_path).expanduser().resolve()
+            if db_backup_path is not None and str(db_backup_path).strip()
+            else None
+        )
+        if self.db_backup_path == self.db_path:
+            raise ValueError("database backup path must differ from database")
+        self.backup_interval_sec = max(
+            0.001,
+            float(backup_interval_sec),
+        )
         self.ideas_root = self.root / "ideas"
         self.events_path = self.root / "events.jsonl"
         self.writer_lock_path = self.root / "controller.lock"
         self.control_dir = self.root / "control"
         self._writer_lock_stream: Any | None = None
         self._event_lock = threading.Lock()
+        self._backup_lock = threading.Lock()
+        self._backup_thread: threading.Thread | None = None
+        self._backup_stop = threading.Event()
+        self._last_backup_error = ""
+        self._last_backup_at = ""
         # Job executors commit accepted snapshots from a shared thread pool.
         # Serialize filesystem swaps in-process so dashboard/status
         # initialization cannot treat an active ``.current.*.tmp`` directory
@@ -46,6 +73,8 @@ class V2Store:
         self.root.mkdir(parents=True, exist_ok=True)
         self.ideas_root.mkdir(parents=True, exist_ok=True)
         self.control_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._restore_database_backup_if_needed()
         if recover_filesystem:
             self._recover_filesystem_commits()
         # The controller may already be doing a large WAL transaction while a
@@ -107,6 +136,142 @@ class V2Store:
                     ON events(event_type, timestamp);
                 """
             )
+
+    def _restore_database_backup_if_needed(self) -> bool:
+        """Restore a missing hot database from its durable backup."""
+
+        backup = self.db_backup_path
+        if self.db_path.exists() or backup is None or not backup.is_file():
+            return False
+        temporary = self.db_path.with_name(
+            f".{self.db_path.name}.{os.getpid()}.restore.tmp"
+        )
+        temporary.unlink(missing_ok=True)
+        try:
+            shutil.copy2(backup, temporary)
+            self._validate_database_file(temporary)
+            os.replace(temporary, self.db_path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        return True
+
+    @staticmethod
+    def _validate_database_file(path: Path) -> None:
+        uri = f"{path.as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=30.0)
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+            if row is None or str(row[0]).casefold() != "ok":
+                raise RuntimeError(
+                    f"SQLite backup failed quick_check: {row!r}"
+                )
+        finally:
+            conn.close()
+
+    def backup_database(self) -> Path | None:
+        """Snapshot the hot SQLite database to an atomic durable file."""
+
+        destination = self.db_backup_path
+        if destination is None:
+            return None
+        if destination == self.db_path:
+            raise ValueError("database backup path must differ from database")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(
+            f".{destination.name}.backup.tmp"
+        )
+        with self._backup_lock:
+            try:
+                temporary.unlink(missing_ok=True)
+                source = sqlite3.connect(
+                    self.db_path,
+                    timeout=30.0,
+                )
+                target = sqlite3.connect(
+                    temporary,
+                    timeout=30.0,
+                )
+                try:
+                    source.backup(target)
+                finally:
+                    target.close()
+                    source.close()
+                self._validate_database_file(temporary)
+                os.replace(temporary, destination)
+                self._last_backup_at = utc_now()
+                self._last_backup_error = ""
+            except BaseException as exc:
+                temporary.unlink(missing_ok=True)
+                self._last_backup_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                raise
+        return destination
+
+    def start_database_backup_loop(self) -> None:
+        if self.db_backup_path is None:
+            return
+        thread = self._backup_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._backup_stop.clear()
+        self._backup_thread = threading.Thread(
+            target=self._database_backup_loop,
+            name="autoresearch-v2-db-backup",
+            daemon=True,
+        )
+        self._backup_thread.start()
+
+    def _database_backup_loop(self) -> None:
+        while not self._backup_stop.is_set():
+            try:
+                self.backup_database()
+            except (
+                OSError,
+                RuntimeError,
+                sqlite3.Error,
+            ):
+                # Backups are an availability layer. The local SQLite database
+                # remains authoritative while the process is alive, and the
+                # next interval retries without blocking controller ticks.
+                if self._backup_stop.wait(self.backup_interval_sec):
+                    break
+                continue
+            if self._backup_stop.wait(self.backup_interval_sec):
+                break
+
+    def stop_database_backup_loop(
+        self,
+        *,
+        final_backup: bool = False,
+    ) -> None:
+        self._backup_stop.set()
+        thread = self._backup_thread
+        self._backup_thread = None
+        if (
+            thread is not None
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=min(30.0, self.backup_interval_sec + 1.0))
+        if final_backup and self.db_backup_path is not None:
+            self.backup_database()
+
+    def database_backup_status(self) -> dict[str, Any]:
+        thread = self._backup_thread
+        return {
+            "enabled": self.db_backup_path is not None,
+            "database_path": str(self.db_path),
+            "backup_path": (
+                str(self.db_backup_path)
+                if self.db_backup_path is not None
+                else ""
+            ),
+            "interval_sec": self.backup_interval_sec,
+            "running": bool(thread is not None and thread.is_alive()),
+            "last_backup_at": self._last_backup_at,
+            "last_error": self._last_backup_error,
+        }
 
     def _recover_filesystem_commits(self) -> None:
         """Repair interrupted current-directory swaps before DB recovery."""

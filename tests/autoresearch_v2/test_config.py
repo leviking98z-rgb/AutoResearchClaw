@@ -30,6 +30,53 @@ def test_config_accepts_parallel_defaults() -> None:
     assert config.research_memory.reconcile_interval_ticks == 15
     assert config.usage_monitoring.enabled is True
     assert config.usage_monitoring.history_hours == 168
+    assert config.database_path == config.root / "autoresearch.db"
+    assert config.database_backup_path is None
+
+
+def test_config_accepts_local_database_and_shared_backup(tmp_path) -> None:
+    state = tmp_path / "shared-state"
+    local_database = tmp_path / "local" / "autoresearch.db"
+    backup = state / "autoresearch.db.backup"
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "state_dir": str(state),
+                "storage": {
+                    "database_path": str(local_database),
+                    "database_backup_path": str(backup),
+                    "backup_interval_sec": 12.5,
+                },
+            }
+        }
+    )
+
+    assert config.database_path == local_database.resolve()
+    assert config.database_backup_path == backup.resolve()
+    assert config.storage.backup_interval_sec == 12.5
+
+
+def test_config_defaults_backup_beside_shared_state_for_local_database(
+    tmp_path,
+) -> None:
+    state = tmp_path / "shared-state"
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "state_dir": str(state),
+                "storage": {
+                    "database_path": str(
+                        tmp_path / "local" / "autoresearch.db"
+                    ),
+                },
+            }
+        }
+    )
+
+    assert (
+        config.database_backup_path
+        == (state / "autoresearch.db.backup").resolve()
+    )
 
 
 def test_config_rejects_impossible_target() -> None:
@@ -112,6 +159,33 @@ def test_research_memory_interval_must_be_positive() -> None:
                 "autoresearch_v2": {
                     "research_memory": {
                         "reconcile_interval_ticks": 0,
+                    }
+                }
+            }
+        )
+
+
+def test_storage_rejects_invalid_backup_policy(tmp_path) -> None:
+    database = tmp_path / "autoresearch.db"
+    with pytest.raises(ValueError, match="backup_interval_sec"):
+        V2Config.from_mapping(
+            {
+                "autoresearch_v2": {
+                    "storage": {
+                        "database_path": str(database),
+                        "backup_interval_sec": 0,
+                    }
+                }
+            }
+        )
+
+    with pytest.raises(ValueError, match="must differ"):
+        V2Config.from_mapping(
+            {
+                "autoresearch_v2": {
+                    "storage": {
+                        "database_path": str(database),
+                        "database_backup_path": str(database),
                     }
                 }
             }

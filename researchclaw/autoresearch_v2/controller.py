@@ -191,6 +191,7 @@ class V2Controller:
         self._sync_gpu_budget_pause_state()
         self._recover_interrupted_jobs()
         self._initialized = True
+        self.store.start_database_backup_loop()
         self.store.event(
             "controller_initialized",
             max_cpu_jobs=self.config.concurrency.max_cpu_jobs,
@@ -210,6 +211,7 @@ class V2Controller:
             self.gpu_broker = None
         elif self.gpu_broker is not None:
             self.gpu_broker.close()
+        self.store.stop_database_backup_loop(final_backup=True)
         self.store.release_writer_lock()
         self._initialized = False
 
@@ -265,6 +267,7 @@ class V2Controller:
                 # POSIX-signal path. Any submitted GPU tasks remain durable and
                 # are adopted by startup recovery; the process exiting stops
                 # its daemon heartbeat/keepalive threads.
+                self.store.stop_database_backup_loop(final_backup=False)
                 self.store.release_writer_lock()
                 self._initialized = False
             else:
@@ -2931,6 +2934,7 @@ class V2Controller:
                 if self._budget_pause_started_at is not None
                 else ""
             ),
+            "storage": self.store.database_backup_status(),
             "gpu": gpu,
         }
 

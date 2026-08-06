@@ -28,6 +28,17 @@ from .store import V2Store
 from .validation import validate_build_output
 
 
+def build_store(config: V2Config) -> V2Store:
+    """Build the canonical store shared by controller, CLI, and dashboard."""
+
+    return V2Store(
+        config.root,
+        db_path=config.database_path,
+        db_backup_path=config.database_backup_path,
+        backup_interval_sec=config.storage.backup_interval_sec,
+    )
+
+
 def _validate_report(value: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if not str(value.get("title", "") or "").strip():
@@ -46,7 +57,7 @@ def build_production_controller(
     *,
     generator: IdeaGenerator | None = None,
 ) -> V2Controller:
-    store = V2Store(config.root)
+    store = build_store(config)
     router = RoleRouter(
         config.models.researchclaw_config,
         audit_root=config.root / "llm-audit",

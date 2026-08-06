@@ -20,9 +20,11 @@ the old framework. The reusable adapters can be extracted into standalone
 packages later; replacing or deleting the legacy `pipeline` and `rsi`
 directories does not change the v2 lifecycle or durable state machine.
 
-The durable source of truth is one SQLite database. Every generated or repaired
-project is written to a new immutable attempt directory and is copied to
-`current/` only after deterministic validation succeeds.
+The durable source of truth is one SQLite database. In production the hot
+database should live on controller-local NVMe, while an atomic SQLite backup is
+periodically projected into the shared state directory. Every generated or
+repaired project is written to a new immutable attempt directory and is copied
+to `current/` only after deterministic validation succeeds.
 
 ## Lifecycle
 
@@ -47,8 +49,7 @@ paper never stops the system.
 
 ```text
 <state_dir>/
-├── autoresearch.db
-├── autoresearch.db-wal
+├── autoresearch.db.backup       # atomic shared recovery snapshot (optional)
 ├── controller.lock
 ├── control/
 ├── events.jsonl
@@ -68,6 +69,23 @@ paper never stops the system.
 
 Failed, truncated, or partial model output never mutates `current/`.
 
+The hot SQLite path is configurable independently:
+
+```yaml
+storage:
+  database_path: /root/.local/state/autoresearch-v2/my-run/autoresearch.db
+  database_backup_path: /root/shared/.clusters/.workdir/autoresearch-v2/runs/my-run/autoresearch.db.backup
+  backup_interval_sec: 60
+```
+
+Controller, CLI, and Dashboard use the same `database_path`. The Controller
+uses SQLite's online backup API on a background thread, writes a temporary
+database beside `database_backup_path`, verifies it, and atomically replaces
+the previous backup. If the local database is absent at startup, it is restored
+from that shared backup before schema initialization. Leaving `storage`
+unconfigured preserves the single-file `<state_dir>/autoresearch.db` behavior
+used by local development and tests.
+
 ## InfoHub Research Memory
 
 AutoResearch projects every Idea into one idempotently updated InfoHub
@@ -84,10 +102,11 @@ results, and in-progress decisions searchable and reusable across later Idea
 cycles.
 
 InfoHub is intentionally a **projection**, not the scientific source of truth.
-`autoresearch.db`, immutable attempt directories, signed execution evidence,
-and `current/` remain canonical. The Controller periodically reconciles all
-Ideas, uses an idempotent HTTP upsert, and records sync success/failure as
-events. InfoHub downtime never blocks Design, Build, GPU execution, or Report.
+The configured hot database, immutable attempt directories, signed execution
+evidence, and `current/` remain canonical. The shared database backup is the
+restart/recovery copy. The Controller periodically reconciles all Ideas, uses
+an idempotent HTTP upsert, and records sync success/failure as events. InfoHub
+downtime never blocks Design, Build, GPU execution, or Report.
 
 ```yaml
 research_memory:

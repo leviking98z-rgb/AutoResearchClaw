@@ -65,6 +65,15 @@ class RetentionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class StorageConfig:
+    """Hot database placement and durable shared backup policy."""
+
+    database_path: str = ""
+    database_backup_path: str = ""
+    backup_interval_sec: float = 60.0
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionConfig:
     """Controller-owned policy for executing generated experiment projects."""
 
@@ -201,6 +210,7 @@ class V2Config:
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
     budgets: BudgetConfig = field(default_factory=BudgetConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     gpu: GPUConfig = field(default_factory=GPUConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
@@ -215,6 +225,22 @@ class V2Config:
     @property
     def root(self) -> Path:
         return Path(self.state_dir).expanduser().resolve()
+
+    @property
+    def database_path(self) -> Path:
+        configured = self.storage.database_path.strip()
+        if configured:
+            return Path(configured).expanduser().resolve()
+        return self.root / "autoresearch.db"
+
+    @property
+    def database_backup_path(self) -> Path | None:
+        configured = self.storage.database_backup_path.strip()
+        if configured:
+            return Path(configured).expanduser().resolve()
+        if self.database_path != self.root / "autoresearch.db":
+            return self.root / "autoresearch.db.backup"
+        return None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> V2Config:
@@ -299,6 +325,18 @@ class V2Config:
             ),
             maintenance_interval_ticks=int(
                 retention_raw.get("maintenance_interval_ticks", 300)
+            ),
+        )
+        storage_raw = _mapping(data.get("storage"), "storage")
+        storage = StorageConfig(
+            database_path=str(
+                storage_raw.get("database_path", "") or ""
+            ),
+            database_backup_path=str(
+                storage_raw.get("database_backup_path", "") or ""
+            ),
+            backup_interval_sec=float(
+                storage_raw.get("backup_interval_sec", 60.0)
             ),
         )
         execution_raw = _mapping(data.get("execution"), "execution")
@@ -607,6 +645,7 @@ class V2Config:
             concurrency=concurrency,
             budgets=budgets,
             retention=retention,
+            storage=storage,
             execution=execution,
             gpu=gpu,
             models=models,
@@ -751,6 +790,19 @@ class V2Config:
             self.retention.maintenance_interval_ticks,
         ) < 1:
             raise ValueError("retention limits must be positive")
+        if self.storage.backup_interval_sec <= 0:
+            raise ValueError(
+                "storage.backup_interval_sec must be positive"
+            )
+        backup_path = self.database_backup_path
+        if (
+            backup_path is not None
+            and backup_path == self.database_path
+        ):
+            raise ValueError(
+                "storage.database_backup_path must differ from "
+                "storage.database_path"
+            )
         if self.execution.smoke_timeout_sec <= 0:
             raise ValueError("execution.smoke_timeout_sec must be positive")
         if self.research_memory.timeout_sec <= 0:

@@ -15,8 +15,7 @@ from .controller import V2Controller
 from .ideas import StaticIdeaGenerator
 from .jobs import SimulatedJobExecutor
 from .models import JobKind
-from .runtime import build_production_controller
-from .store import V2Store
+from .runtime import build_production_controller, build_store
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -73,7 +72,7 @@ def _restore_signal_handlers(
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = V2Config.from_file(args.config)
-    store = V2Store(config.root)
+    store = build_store(config)
     # The controller performs recovery only after it has acquired the writer
     # lock. Read-only commands never mutate attempt workspaces.
     store.initialize(recover_filesystem=False)
