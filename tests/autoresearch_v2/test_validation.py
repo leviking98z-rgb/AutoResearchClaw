@@ -1232,3 +1232,57 @@ def test_legacy_scale_keeps_optional_dataset_metadata_compatibility() -> None:
         )
         == []
     )
+
+
+def test_controller_runtime_rejects_legacy_unnamespaced_dataset_ids(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "main.py").write_text(
+        """
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM
+
+dataset = load_dataset("gsm8k", "main", split="test")
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-1.5B-Instruct"
+)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = validate_research_implementation(
+        tmp_path,
+        plan={"models": [], "datasets": []},
+        controller_runtime=True,
+    )
+
+    assert not result["ok"]
+    assert any(
+        "canonical namespaced Hugging Face id" in error
+        for error in result["errors"]
+    )
+
+
+def test_controller_runtime_accepts_namespaced_dataset_ids(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "main.py").write_text(
+        """
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM
+
+dataset = load_dataset("openai/gsm8k", "main", split="test")
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-1.5B-Instruct"
+)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = validate_research_implementation(
+        tmp_path,
+        plan={"models": [], "datasets": []},
+        controller_runtime=True,
+    )
+
+    assert result["ok"]

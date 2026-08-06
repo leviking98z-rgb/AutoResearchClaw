@@ -734,7 +734,7 @@ parser.add_argument("--output")
 args = parser.parse_args()
 output = Path(os.environ["AUTORESEARCH_V2_OUTPUT_DIR"])
 output.mkdir(parents=True, exist_ok=True)
-dataset = load_dataset("gsm8k", split="test")
+dataset = load_dataset("openai/gsm8k", split="test")
 model = AutoModelForCausalLM.from_pretrained("Qwen/test-model")
 Path("metrics.json").write_text(json.dumps({"result_valid": True}))
 Path("runtime_evidence.json").write_text(
@@ -861,7 +861,7 @@ Path(os.environ["AUTORESEARCH_V2_OUTPUT_DIR"]).mkdir(
     exist_ok=True,
 )
 output = Path(os.environ["AUTORESEARCH_V2_OUTPUT_DIR"])
-dataset = load_dataset("gsm8k", split="test")
+dataset = load_dataset("openai/gsm8k", split="test")
 model = AutoModelForCausalLM.from_pretrained("Qwen/test-model")
 Path("metrics.json").write_text(
     '{"result_valid": true}',

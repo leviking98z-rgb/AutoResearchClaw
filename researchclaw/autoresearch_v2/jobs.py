@@ -946,6 +946,10 @@ Requirements:
   package boilerplate, notebooks, documentation, vendored code, or tests.
 - Reuse transformers/datasets/torch directly instead of reimplementing model,
   dataset, statistics, or orchestration libraries.
+- Use canonical namespaced Hugging Face dataset ids. In particular, use
+  "openai/gsm8k" instead of "gsm8k" and
+  "google-research-datasets/mbpp" instead of "mbpp"; current datasets/hub
+  clients reject those legacy unnamespaced aliases.
 - The runtime must write raw metrics.json and runtime_evidence.json. The
   Controller wraps your commands and owns the final artifact envelope,
   criterion_results schema, dataset/split declarations, GPU count, and gate

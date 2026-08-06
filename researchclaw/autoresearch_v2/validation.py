@@ -77,6 +77,7 @@ def validate_research_implementation(
     evidence: dict[str, Any] = {
         "model_loader_calls": [],
         "dataset_loader_calls": [],
+        "dataset_loader_ids": [],
         "artifact_writes": [],
         "source_sha256": {},
         "runtime_schema": {},
@@ -114,9 +115,23 @@ def validate_research_implementation(
                 "evaluate.load",
                 "load",
             }:
-                evidence["dataset_loader_calls"].append(
-                    {"file": relative, "line": node.lineno, "call": name}
+                dataset_id = (
+                    str(node.args[0].value).strip()
+                    if node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                    else ""
                 )
+                evidence["dataset_loader_calls"].append(
+                    {
+                        "file": relative,
+                        "line": node.lineno,
+                        "call": name,
+                        "dataset_id": dataset_id,
+                    }
+                )
+                if dataset_id:
+                    evidence["dataset_loader_ids"].append(dataset_id)
             for arg in node.args:
                 if (
                     isinstance(arg, ast.Constant)
@@ -136,6 +151,12 @@ def validate_research_implementation(
         errors.append("no real model loader call found")
     if not evidence["dataset_loader_calls"]:
         errors.append("no real dataset/benchmark loader call found")
+    for dataset_id in evidence["dataset_loader_ids"]:
+        if dataset_id.casefold() in {"gsm8k", "mbpp"}:
+            errors.append(
+                "dataset loader must use a canonical namespaced Hugging Face "
+                f"id, not {dataset_id!r}"
+            )
     artifact_names = {
         Path(str(row["path"])).name
         for row in evidence["artifact_writes"]
