@@ -1088,10 +1088,6 @@ class V2Controller:
             "expected=%d visible=%r' % (expected, visible))\n"
             "env['PYTHONUNBUFFERED']='1'\n"
             "env['TOKENIZERS_PARALLELISM']='false'\n"
-            "if 'HF_HUB_OFFLINE' in allowed:\n"
-            "    env.setdefault('HF_HUB_OFFLINE','1')\n"
-            "if 'TRANSFORMERS_OFFLINE' in allowed:\n"
-            "    env.setdefault('TRANSFORMERS_OFFLINE','1')\n"
             "raise SystemExit(subprocess.run("
             "contract['argv'], cwd=candidate, env=env, shell=False).returncode)"
         )

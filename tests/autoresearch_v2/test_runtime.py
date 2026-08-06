@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from researchclaw.autoresearch_v2 import runtime
 from researchclaw.autoresearch_v2.config import V2Config
+from researchclaw.autoresearch_v2.ideas import StaticIdeaGenerator
 from researchclaw.experiment.clusterbridge_pool import PoolLeaseOwnershipError
 
 
@@ -116,3 +117,61 @@ def test_invalid_pool_configuration_is_not_silently_degraded(
         pass
     else:
         raise AssertionError("invalid pool configuration must fail closed")
+
+
+def test_production_gpu_tasks_do_not_inherit_forced_offline_mode(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class _Router:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self.decision = object()
+            self.worker = object()
+            self.utility = object()
+
+    captured: dict[str, object] = {}
+
+    def build_broker(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    pool_config = _pool_config(tmp_path / "pool.yaml")
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path / "runs" / "canary"),
+                "models": {
+                    "researchclaw_config": str(tmp_path / "unused.yaml"),
+                },
+                "execution": {
+                    "allowed_env_keys": [
+                        "HF_TOKEN",
+                        "HF_HUB_OFFLINE",
+                        "TRANSFORMERS_OFFLINE",
+                    ]
+                },
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": str(pool_config),
+                    "shared_workspace_root": str(tmp_path / "runs"),
+                },
+            }
+        }
+    )
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "true")
+    monkeypatch.setattr(runtime, "RoleRouter", _Router)
+    monkeypatch.setattr(runtime, "build_clusterbridge_broker", build_broker)
+
+    controller = runtime.build_production_controller(
+        config,
+        generator=StaticIdeaGenerator([]),
+    )
+
+    assert captured["task_env"] == {"HF_TOKEN": "test-token"}
+    controller._pool.shutdown(wait=True)
+    controller._idea_pool.shutdown(wait=True)

@@ -123,6 +123,14 @@ def build_production_controller(
                     key: value
                     for key in config.execution.allowed_env_keys
                     if (value := os.environ.get(key)) is not None
+                    and not (
+                        key in {
+                            "HF_HUB_OFFLINE",
+                            "TRANSFORMERS_OFFLINE",
+                        }
+                        and str(value).strip().casefold()
+                        in {"1", "true", "yes", "on"}
+                    )
                 },
             )
         except ClusterPoolError as exc:
