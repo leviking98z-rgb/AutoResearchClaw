@@ -215,6 +215,33 @@ def test_build_commands_reject_shell_and_non_python_entrypoints() -> None:
     assert any("commands.scale entrypoint" in error for error in errors)
 
 
+def test_build_output_rejects_oversized_generated_framework() -> None:
+    value = {
+        "files": {
+            "main.py": "print('ok')\n",
+            "a.py": "x = 1\n",
+            "b.py": "x = 1\n",
+            "c.py": "x = 1\n",
+        },
+        "commands": {
+            "smoke": "python main.py",
+            "pilot": "python main.py",
+            "scale": "python main.py",
+        },
+    }
+    assert "files may contain at most three Python source files" in (
+        validate_build_output(value)
+    )
+
+    value["files"] = {
+        "main.py": "\n".join("x = 1" for _ in range(801))
+    }
+    assert (
+        "Python source files may not exceed 800 lines: main.py"
+        in validate_build_output(value)
+    )
+
+
 def test_reasonable_legacy_plan_remains_compatible() -> None:
     assert validate_plan(_legacy_plan()) == []
 

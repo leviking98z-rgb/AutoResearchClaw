@@ -713,7 +713,10 @@ class BuildJobExecutor:
         candidate = store.snapshot_current(attempt)
         result = self.role.call(
             self._prompt(idea, plan, prior_failure=job.result),
-            max_tokens=24000,
+            # Build is a small executable scaffold, not a generated framework.
+            # Bounding the response prevents one oversized project snapshot
+            # from monopolizing a Bridge slot for tens of minutes.
+            max_tokens=12000,
             temperature=0.20,
         )
         output = result.value
@@ -805,9 +808,7 @@ PRIOR FAILED ATTEMPT FEEDBACK, IF ANY:
 Return JSON:
 {{
   "files": {{
-    "main.py": "complete file",
-    "data.py": "complete file",
-    "model.py": "complete file"
+    "main.py": "complete compact experiment implementation"
   }},
   "commands": {{
     "smoke": "python main.py --mode smoke --output artifacts/smoke",
@@ -820,6 +821,11 @@ Return JSON:
 
 Requirements:
 - Every returned file is complete, never a patch or prefix.
+- Keep the project deliberately small: prefer one main.py, allow at most three
+  Python files, no file may exceed 800 lines, and do not generate a framework,
+  package boilerplate, notebooks, documentation, vendored code, or tests.
+- Reuse transformers/datasets/torch directly instead of reimplementing model,
+  dataset, statistics, or orchestration libraries.
 - The runtime must write metrics.json with result_valid and metrics.
 - The runtime must write runtime_evidence.json with exact model, datasets,
   examples, seeds, GPU count, call counts, dataset/split declarations,

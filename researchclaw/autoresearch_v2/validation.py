@@ -2280,6 +2280,23 @@ def validate_build_output(value: dict[str, Any]) -> list[str]:
     if not isinstance(files, dict) or not files:
         return ["files must be a non-empty object"]
     errors: list[str] = []
+    python_files = [
+        (str(filename), content)
+        for filename, content in files.items()
+        if str(filename).endswith(".py")
+    ]
+    if len(python_files) > 3:
+        errors.append("files may contain at most three Python source files")
+    oversized = [
+        filename
+        for filename, content in python_files
+        if isinstance(content, str) and len(content.splitlines()) > 800
+    ]
+    if oversized:
+        errors.append(
+            "Python source files may not exceed 800 lines: "
+            + ", ".join(sorted(oversized))
+        )
     for filename, content in files.items():
         if (
             not isinstance(filename, str)
