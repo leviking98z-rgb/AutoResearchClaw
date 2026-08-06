@@ -183,12 +183,13 @@ systemctl enable --now autoresearch-v2-dashboard@rsi-canary2.service
 ```
 
 The controller unit runs the dependency installer before every start, restarts
-after failures, translates `SIGTERM`/`SIGINT` into a cooperative stop, drains
-already admitted local model calls, and writes stdout/stderr to journald.
-Infrastructure interruptions are recorded but refunded from the scientific
-attempt budget. `TimeoutStopSec=15min` allows long in-flight model calls to
-finish before systemd escalates. The dashboard uses the controller tick plus
-the recorded controller PID for health: a stale lock is reported as
+after failures, and writes stdout/stderr to journald. `SIGTERM` is deliberately
+lock-free and immediate: already admitted model calls remain durable as
+RUNNING, and startup recovery records and refunds the interruption without
+consuming the scientific attempt budget. `TimeoutStopSec=10s` is a last-resort
+systemd bound rather than a model-call drain window. `SIGINT` remains a
+cooperative foreground stop. The dashboard uses the controller tick plus the
+recorded controller PID for health: a stale lock is reported as
 stopped/degraded rather than falsely shown as running.
 
 ## Run locally in simulation

@@ -18,10 +18,10 @@ ExecStartPre=/data/workspace/autoresearch-stack/AutoResearchClaw-prod/bin/resear
 ExecStart=/data/workspace/autoresearch-stack/AutoResearchClaw-prod/.venv/bin/python -m researchclaw.autoresearch_v2.cli --config ${AUTORESEARCH_V2_CONFIG} start
 Restart=on-failure
 RestartSec=10
-# Worker/Decision calls can legitimately take several minutes. SIGTERM first
-# requests a cooperative drain; leave enough time for admitted calls to finish
-# so a deployment restart does not turn infrastructure churn into a retry.
-TimeoutStopSec=15min
+# SIGTERM exits immediately. Jobs and attempts are durable before dispatch,
+# and startup recovery refunds interrupted infrastructure work without
+# consuming the scientific retry budget.
+TimeoutStopSec=10s
 KillMode=mixed
 UMask=0077
 NoNewPrivileges=yes
