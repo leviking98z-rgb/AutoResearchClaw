@@ -46,6 +46,7 @@ from .models import (
     JobStatus,
     utc_now,
 )
+from .research_memory import ResearchMemory
 from .store import V2Store
 from .validation import (
     validate_execution_argv,
@@ -87,6 +88,11 @@ class _IdeaGeneration:
     requested: int
 
 
+@dataclass(slots=True)
+class _ResearchMemorySync:
+    future: concurrent.futures.Future[None]
+
+
 class V2Controller:
     """One controller, SQLite source of truth, isolated immutable attempts."""
 
@@ -99,6 +105,7 @@ class V2Controller:
         executors: Mapping[JobKind, JobExecutor] | None = None,
         gpu_broker: GPUBroker | None = None,
         configured_gpu_capacity: int = 0,
+        research_memory: ResearchMemory | None = None,
         sleep: Any = time.sleep,
     ) -> None:
         self.config = config
@@ -114,6 +121,7 @@ class V2Controller:
             else _MissingExecutor()
         )
         self.gpu_broker = gpu_broker
+        self.research_memory = research_memory
         self.configured_gpu_capacity = max(
             0,
             int(configured_gpu_capacity),
@@ -148,10 +156,17 @@ class V2Controller:
             thread_name_prefix="autoresearch-v2-ideas",
             on_shutdown=lambda: None,
         )
+        self._research_memory_pool = _ControllerThreadPool(
+            max_workers=1,
+            thread_name_prefix="autoresearch-v2-memory",
+            on_shutdown=lambda: None,
+        )
         self._running: dict[str, _Running] = {}
         self._idea_generation: _IdeaGeneration | None = None
+        self._research_memory_sync: _ResearchMemorySync | None = None
         self._idea_generation_failures = 0
         self._idea_generation_retry_not_before = 0.0
+        self._research_memory_fingerprints: dict[str, str] = {}
         self._stop = False
         self._stop_reason = ""
         self._initialized = False
@@ -172,6 +187,10 @@ class V2Controller:
         )
 
     def close(self) -> None:
+        self._research_memory_pool.shutdown(
+            wait=True,
+            cancel_futures=False,
+        )
         self._idea_pool.shutdown(wait=True, cancel_futures=False)
         self._pool.shutdown(wait=True, cancel_futures=False)
         if self.gpu_broker is not None:
@@ -214,6 +233,10 @@ class V2Controller:
                     wait=False,
                     cancel_futures=True,
                 )
+                self._research_memory_pool.shutdown(
+                    wait=False,
+                    cancel_futures=True,
+                )
                 self._pool.shutdown(wait=False, cancel_futures=True)
                 # ThreadPoolExecutor registers a private atexit hook that joins
                 # every worker even after shutdown(wait=False). Service stops
@@ -222,6 +245,7 @@ class V2Controller:
                 # removed from that interpreter-exit join registry.
                 self._pool.detach_workers_for_process_exit()
                 self._idea_pool.detach_workers_for_process_exit()
+                self._research_memory_pool.detach_workers_for_process_exit()
                 # Do not synchronously probe or stop a remote pool from a
                 # POSIX-signal path. Any submitted GPU tasks remain durable and
                 # are adopted by startup recovery; the process exiting stops
@@ -281,6 +305,7 @@ class V2Controller:
             self.request_stop(reason="control_stop")
         self._collect_finished()
         self._collect_idea_generation()
+        self._collect_research_memory_sync()
         self._collect_gpu_finished()
         self._enforce_liveness_budgets()
         if not self.store.control_requested("pause") and not self._stop:
@@ -315,9 +340,81 @@ class V2Controller:
                 ),
             )
             self.store.event("maintenance_completed", **maintenance)
+        if (
+            self.research_memory is not None
+            and self._tick_count
+            % self.config.research_memory.reconcile_interval_ticks
+            == 0
+        ):
+            self._start_research_memory_sync()
         snapshot = self.snapshot()
         self.store.event("controller_tick", **snapshot)
         return snapshot
+
+    def _start_research_memory_sync(self) -> None:
+        if self._research_memory_sync is not None:
+            return
+        self._research_memory_sync = _ResearchMemorySync(
+            future=self._research_memory_pool.submit(
+                self._reconcile_research_memory
+            )
+        )
+
+    def _collect_research_memory_sync(self) -> None:
+        running = self._research_memory_sync
+        if running is None or not running.future.done():
+            return
+        self._research_memory_sync = None
+        try:
+            running.future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.store.event(
+                "research_memory_reconcile_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def _reconcile_research_memory(self) -> None:
+        """Best-effort InfoHub sync; never block the scientific state machine."""
+
+        for idea in self.store.list_ideas():
+            fingerprint = json.dumps(
+                {
+                    "status": idea.status.value,
+                    "updated_at": idea.updated_at,
+                    "current_job_id": idea.current_job_id,
+                    "exit_reason": idea.exit_reason,
+                    "final_outcome": idea.candidate.get(
+                        "final_outcome",
+                        "",
+                    ),
+                    "llm_tokens": idea.llm_tokens_spent,
+                    "llm_calls": idea.llm_calls,
+                    "gpu_seconds": round(idea.gpu_seconds_spent, 6),
+                },
+                sort_keys=True,
+            )
+            if self._research_memory_fingerprints.get(
+                idea.idea_id
+            ) == fingerprint:
+                continue
+            result = self.research_memory.reconcile(idea)
+            if result.ok:
+                self._research_memory_fingerprints[
+                    idea.idea_id
+                ] = fingerprint
+                self.store.event(
+                    "research_memory_synced",
+                    idea_id=idea.idea_id,
+                    external_id=result.external_id,
+                    status=idea.status.value,
+                )
+            else:
+                self.store.event(
+                    "research_memory_sync_failed",
+                    idea_id=idea.idea_id,
+                    external_id=result.external_id,
+                    error=result.error,
+                )
 
     def is_idle(self) -> bool:
         active = self.store.list_ideas(statuses=set(ACTIVE_IDEA_STATUSES))

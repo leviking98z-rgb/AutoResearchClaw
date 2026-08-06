@@ -26,6 +26,8 @@ def test_config_accepts_parallel_defaults() -> None:
     assert config.concurrency.max_gpu_jobs == 6
     assert config.budgets.max_job_attempts == 3
     assert config.budgets.max_design_revisions == 2
+    assert config.research_memory.enabled is True
+    assert config.research_memory.reconcile_interval_ticks == 15
 
 
 def test_config_rejects_impossible_target() -> None:
@@ -95,6 +97,19 @@ def test_attempt_and_revision_budgets_must_be_positive() -> None:
                 "autoresearch_v2": {
                     "budgets": {
                         "max_design_revisions": 0,
+                    }
+                }
+            }
+        )
+
+
+def test_research_memory_interval_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="reconcile_interval_ticks"):
+        V2Config.from_mapping(
+            {
+                "autoresearch_v2": {
+                    "research_memory": {
+                        "reconcile_interval_ticks": 0,
                     }
                 }
             }

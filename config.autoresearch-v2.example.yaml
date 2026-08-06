@@ -86,3 +86,11 @@ autoresearch_v2:
     collect_platforms: [arxiv, scholar, bing]
     refresh_on_low_results: true
     min_results: 8
+
+  # InfoHub is a searchable Research Memory projection, not the scientific
+  # source of truth. SQLite plus immutable attempt artifacts remain canonical.
+  research_memory:
+    enabled: true
+    url: http://127.0.0.1:8077
+    timeout_sec: 10
+    reconcile_interval_ticks: 15

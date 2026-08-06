@@ -22,6 +22,7 @@ from .literature import InfoHubLiteratureProvider
 from .llm import RoleRouter, StructuredRole
 from .models import JobKind
 from .protocols import validate_protocol_draft
+from .research_memory import InfoHubResearchMemory
 from .store import V2Store
 from .validation import validate_build_output
 
@@ -53,6 +54,11 @@ def build_production_controller(
         utility_role=config.models.utility_role,
     )
     literature = InfoHubLiteratureProvider(config.literature)
+    research_memory = InfoHubResearchMemory(
+        config=config.research_memory,
+        system_id=config.system_id,
+        store=store,
+    )
     idea_generator = generator or LLMBoardIdeaGenerator(
         llm=router.decision,
         brief=config.topic_brief,
@@ -156,6 +162,7 @@ def build_production_controller(
         },
         gpu_broker=broker,
         configured_gpu_capacity=configured_gpu_capacity,
+        research_memory=research_memory,
     )
     if gpu_broker_error:
         controller.store.initialize()

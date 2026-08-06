@@ -61,6 +61,11 @@ def test_production_controller_starts_without_live_gpu_lease(
     )
     monkeypatch.setattr(
         runtime,
+        "InfoHubResearchMemory",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(
+        runtime,
         "build_clusterbridge_broker",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             PoolLeaseOwnershipError("inactive or missing lease")

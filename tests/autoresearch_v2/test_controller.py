@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import researchclaw.autoresearch_v2.controller as controller_module
 from researchclaw.autoresearch_v2.config import V2Config
@@ -338,6 +339,103 @@ def test_completed_negative_report_preserves_terminal_negative_status(
 
     assert idea.status is IdeaStatus.COMPLETED_NEGATIVE
     assert job.status is JobStatus.SUCCEEDED
+    controller._pool.shutdown(wait=True)
+
+
+def test_research_memory_http_never_blocks_controller_tick(
+    tmp_path: Path,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class _Memory:
+        def reconcile(self, idea):
+            started.set()
+            assert release.wait(timeout=5)
+            return SimpleNamespace(
+                ok=True,
+                external_id=f"memory:{idea.idea_id}",
+                error="",
+            )
+
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "research_memory": {
+                    "reconcile_interval_ticks": 1,
+                },
+            }
+        }
+    )
+    controller = V2Controller(
+        config=config,
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([]),
+        research_memory=_Memory(),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    controller.store.save_idea(candidate_to_idea(_candidate(0)))
+
+    before = time.monotonic()
+    controller.tick()
+    elapsed = time.monotonic() - before
+
+    assert elapsed < 0.5
+    assert started.wait(timeout=1)
+    release.set()
+    assert controller._research_memory_sync is not None
+    controller._research_memory_sync.future.result(timeout=2)
+    controller._collect_research_memory_sync()
+    controller.close()
+
+
+def test_research_memory_reconcile_is_idempotent_until_idea_changes(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    class _Memory:
+        def reconcile(self, idea):
+            calls.append(idea.status.value)
+            return SimpleNamespace(
+                ok=True,
+                external_id=f"memory:{idea.idea_id}",
+                error="",
+            )
+
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "research_memory": {
+                    "reconcile_interval_ticks": 1,
+                },
+            }
+        }
+    )
+    controller = V2Controller(
+        config=config,
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([]),
+        research_memory=_Memory(),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    idea = candidate_to_idea(_candidate(0))
+    controller.store.save_idea(idea)
+
+    controller._reconcile_research_memory()
+    controller._reconcile_research_memory()
+    assert calls == ["new"]
+
+    idea.status = IdeaStatus.REPORTING
+    controller.store.save_idea(idea)
+    controller._reconcile_research_memory()
+    assert calls == ["new", "reporting"]
     controller._pool.shutdown(wait=True)
 
 

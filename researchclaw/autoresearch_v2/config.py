@@ -112,6 +112,16 @@ class LiteratureConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ResearchMemoryConfig:
+    """Best-effort projection of durable research state into InfoHub."""
+
+    enabled: bool = True
+    url: str = "http://127.0.0.1:8077"
+    timeout_sec: float = 10.0
+    reconcile_interval_ticks: int = 15
+
+
+@dataclass(frozen=True, slots=True)
 class ModelConfig:
     researchclaw_config: str = "config.rsi.yaml"
     decision_role: str = "research_director"
@@ -134,6 +144,9 @@ class V2Config:
     gpu: GPUConfig = field(default_factory=GPUConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
     literature: LiteratureConfig = field(default_factory=LiteratureConfig)
+    research_memory: ResearchMemoryConfig = field(
+        default_factory=ResearchMemoryConfig
+    )
 
     @property
     def root(self) -> Path:
@@ -343,6 +356,29 @@ class V2Config:
             ),
             min_results=int(literature_raw.get("min_results", 8)),
         )
+        research_memory_raw = _mapping(
+            data.get("research_memory"),
+            "research_memory",
+        )
+        research_memory = ResearchMemoryConfig(
+            enabled=bool(research_memory_raw.get("enabled", True)),
+            url=str(
+                research_memory_raw.get(
+                    "url",
+                    literature.url,
+                )
+                or literature.url
+            ),
+            timeout_sec=float(
+                research_memory_raw.get("timeout_sec", 10.0)
+            ),
+            reconcile_interval_ticks=int(
+                research_memory_raw.get(
+                    "reconcile_interval_ticks",
+                    15,
+                )
+            ),
+        )
         config = cls(
             enabled=bool(data.get("enabled", False)),
             system_id=str(data.get("system_id", "autoresearch-v2")),
@@ -359,6 +395,7 @@ class V2Config:
             gpu=gpu,
             models=models,
             literature=literature,
+            research_memory=research_memory,
         )
         config.validate()
         return config
@@ -438,6 +475,21 @@ class V2Config:
             raise ValueError("retention limits must be positive")
         if self.execution.smoke_timeout_sec <= 0:
             raise ValueError("execution.smoke_timeout_sec must be positive")
+        if self.research_memory.timeout_sec <= 0:
+            raise ValueError(
+                "research_memory.timeout_sec must be positive"
+            )
+        if self.research_memory.reconcile_interval_ticks < 1:
+            raise ValueError(
+                "research_memory.reconcile_interval_ticks must be positive"
+            )
+        if (
+            self.research_memory.enabled
+            and not self.research_memory.url.strip()
+        ):
+            raise ValueError(
+                "research_memory.url is required when enabled"
+            )
         if self.execution.smoke_environment not in {
             "auto",
             "local",

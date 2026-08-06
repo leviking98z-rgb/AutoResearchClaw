@@ -67,6 +67,35 @@ paper never stops the system.
 
 Failed, truncated, or partial model output never mutates `current/`.
 
+## InfoHub Research Memory
+
+AutoResearch projects every Idea into one idempotently updated InfoHub
+Research Note:
+
+```text
+autoresearch-v2:<system_id>:<idea_id>
+```
+
+The note contains the question, hypothesis, literature context, plan, current
+Pilot/Scale metrics, decision history, final review, paper Markdown, and a
+SHA-256 manifest of accepted artifacts. This makes completed work, negative
+results, and in-progress decisions searchable and reusable across later Idea
+cycles.
+
+InfoHub is intentionally a **projection**, not the scientific source of truth.
+`autoresearch.db`, immutable attempt directories, signed execution evidence,
+and `current/` remain canonical. The Controller periodically reconciles all
+Ideas, uses an idempotent HTTP upsert, and records sync success/failure as
+events. InfoHub downtime never blocks Design, Build, GPU execution, or Report.
+
+```yaml
+research_memory:
+  enabled: true
+  url: http://127.0.0.1:8077
+  timeout_sec: 10
+  reconcile_interval_ticks: 15
+```
+
 ## Model policy
 
 Only three model clients are constructed:
