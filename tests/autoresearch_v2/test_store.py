@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from researchclaw.autoresearch_v2.models import (
@@ -125,6 +126,42 @@ def test_commit_replaces_current_atomically_without_stale_files(
     assert not (current / "stale.py").exists()
 
 
+def test_concurrent_commits_do_not_destroy_staged_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    jobs = [
+        JobRecord(
+            job_id=f"idea-test-build-{index}",
+            idea_id=idea.idea_id,
+            kind=JobKind.BUILD,
+        )
+        for index in range(2)
+    ]
+    for job in jobs:
+        store.save_job(job)
+    attempts = [store.create_attempt(job) for job in jobs]
+    for index, attempt in enumerate(attempts):
+        candidate = store.prepare_candidate(attempt)
+        (candidate / "main.py").write_text(
+            f"print({index})\n",
+            encoding="utf-8",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        committed = list(executor.map(store.commit_candidate, attempts))
+
+    assert all(path == store.current_dir(idea.idea_id) for path in committed)
+    assert (
+        store.current_dir(idea.idea_id) / "main.py"
+    ).read_text(encoding="utf-8") in {"print(0)\n", "print(1)\n"}
+    assert not list(store.idea_dir(idea.idea_id).glob(".current.*.tmp"))
+    assert not list(store.idea_dir(idea.idea_id).glob(".current.previous*"))
+
+
 def test_initialize_restores_interrupted_current_swap(tmp_path: Path) -> None:
     store = V2Store(tmp_path)
     store.initialize()
@@ -143,6 +180,22 @@ def test_initialize_restores_interrupted_current_swap(tmp_path: Path) -> None:
     )
     assert not backup.exists()
     assert not staged.exists()
+
+
+def test_read_only_initialize_does_not_remove_live_staging(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea_dir = store.idea_dir("idea-live")
+    idea_dir.mkdir(parents=True)
+    staged = idea_dir / ".current.attempt.tmp"
+    staged.mkdir()
+    (staged / "main.py").write_text("in progress\n", encoding="utf-8")
+
+    V2Store(tmp_path).initialize(recover_filesystem=False)
+
+    assert (staged / "main.py").read_text(encoding="utf-8") == "in progress\n"
 
 
 def test_maintenance_rotates_logs_and_prunes_old_failed_candidates(

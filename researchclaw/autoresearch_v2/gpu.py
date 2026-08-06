@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import math
 import os
 import socket
@@ -206,6 +207,13 @@ class GPUBroker:
                     daemon=True,
                 )
                 self._lease_thread.start()
+        # Pool probes use ClusterBridge subprocesses. Reconcile them in
+        # parallel so tick latency is bounded by one transport call instead of
+        # growing linearly with the number of running GPU jobs.
+        self._probe_workers = max(
+            1,
+            min(32, int(getattr(scheduler, "total_gpus", 1) or 1)),
+        )
         if hasattr(self.pool, "start_keepalive"):
             self.pool.start_keepalive()
 
@@ -340,10 +348,33 @@ class GPUBroker:
     def reconcile(self) -> list[tuple[str, dict[str, Any]]]:
         self._refresh_global_leases()
         completed: list[tuple[str, dict[str, Any]]] = []
-        for job_id, lease in list(self.leases.items()):
-            try:
-                probe = self.pool.probe_task(lease.task_id)
-            except Exception as exc:  # noqa: BLE001
+        leases = list(self.leases.items())
+        probes: dict[str, tuple[Any | None, Exception | None]] = {}
+        if leases:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(self._probe_workers, len(leases)),
+                thread_name_prefix="autoresearch-v2-gpu-probe",
+            ) as executor:
+                future_to_job = {
+                    executor.submit(self.pool.probe_task, lease.task_id): job_id
+                    for job_id, lease in leases
+                }
+                for future, job_id in (
+                    (future, future_to_job[future])
+                    for future in concurrent.futures.as_completed(
+                        future_to_job
+                    )
+                ):
+                    try:
+                        probes[job_id] = (future.result(), None)
+                    except Exception as exc:  # noqa: BLE001
+                        probes[job_id] = (None, exc)
+        for job_id, lease in leases:
+            probe, probe_error = probes.get(
+                job_id,
+                (None, RuntimeError("GPU probe result missing")),
+            )
+            if probe_error is not None:
                 lease.probe_failures += 1
                 lease.state = "probe_degraded"
                 if lease.probe_failures < self.probe_failure_threshold:
@@ -360,7 +391,9 @@ class GPUBroker:
                             "returncode": -1,
                             "elapsed_sec": 0.0,
                             "pool_state": "probe_failed",
-                            "error": f"{type(exc).__name__}: {exc}",
+                            "error": (
+                                f"{type(probe_error).__name__}: {probe_error}"
+                            ),
                             "task_id": lease.task_id,
                         },
                     )

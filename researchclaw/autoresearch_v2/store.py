@@ -36,12 +36,18 @@ class V2Store:
         self.control_dir = self.root / "control"
         self._writer_lock_stream: Any | None = None
         self._event_lock = threading.Lock()
+        # Job executors commit accepted snapshots from a shared thread pool.
+        # Serialize filesystem swaps in-process so dashboard/status
+        # initialization cannot treat an active ``.current.*.tmp`` directory
+        # as crash debris while a worker is committing it.
+        self._commit_lock = threading.Lock()
 
-    def initialize(self) -> None:
+    def initialize(self, *, recover_filesystem: bool = True) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.ideas_root.mkdir(parents=True, exist_ok=True)
         self.control_dir.mkdir(parents=True, exist_ok=True)
-        self._recover_filesystem_commits()
+        if recover_filesystem:
+            self._recover_filesystem_commits()
         # The controller may already be doing a large WAL transaction while a
         # read-only process (dashboard/status) starts.  Setting journal_mode is
         # a database-wide write and can therefore fail with "database is
@@ -111,12 +117,18 @@ class V2Store:
             if not idea_dir.is_dir():
                 continue
             current = idea_dir / "current"
-            backup = idea_dir / ".current.previous"
+            backups = sorted(idea_dir.glob(".current.previous*"))
             staged = sorted(idea_dir.glob(".current.*.tmp"))
-            if not current.exists() and backup.is_dir():
-                os.replace(backup, current)
-            elif current.exists() and backup.exists():
-                shutil.rmtree(backup, ignore_errors=True)
+            if not current.exists():
+                recoverable = next(
+                    (path for path in reversed(backups) if path.is_dir()),
+                    None,
+                )
+                if recoverable is not None:
+                    os.replace(recoverable, current)
+            for backup in backups:
+                if backup.exists():
+                    shutil.rmtree(backup, ignore_errors=True)
             for path in staged:
                 shutil.rmtree(path, ignore_errors=True)
 
@@ -720,19 +732,29 @@ class V2Store:
         candidate = self.attempt_dir(attempt) / "candidate"
         if not candidate.is_dir():
             raise FileNotFoundError(candidate)
-        current = self.current_dir(attempt.idea_id)
-        staged = current.with_name(f".current.{attempt.attempt_id}.tmp")
-        if staged.exists():
-            shutil.rmtree(staged)
-        shutil.copytree(candidate, staged)
-        backup = current.with_name(".current.previous")
-        if backup.exists():
-            shutil.rmtree(backup)
-        if current.exists():
-            os.replace(current, backup)
-        os.replace(staged, current)
-        if backup.exists():
-            shutil.rmtree(backup)
+        with self._commit_lock:
+            current = self.current_dir(attempt.idea_id)
+            staged = current.with_name(f".current.{attempt.attempt_id}.tmp")
+            if staged.exists():
+                shutil.rmtree(staged)
+            shutil.copytree(candidate, staged)
+            # Give every commit a private backup path.  Startup recovery
+            # accepts both the legacy name and these attempt-scoped backups.
+            backup = current.with_name(
+                f".current.previous.{attempt.attempt_id}"
+            )
+            if backup.exists():
+                shutil.rmtree(backup)
+            if current.exists():
+                os.replace(current, backup)
+            try:
+                os.replace(staged, current)
+            except Exception:
+                if not current.exists() and backup.is_dir():
+                    os.replace(backup, current)
+                raise
+            if backup.exists():
+                shutil.rmtree(backup)
         attempt.status = AttemptStatus.ACCEPTED
         self.save_attempt(attempt)
         self.event(

@@ -1142,7 +1142,7 @@ class ClusterBridgePool:
         remote = self.client.run_node(
             head,
             self._task_probe_command(task_dir),
-            timeout_sec=self.config.command_timeout_sec,
+            timeout_sec=self._task_probe_timeout_sec(),
         )
         payload = _extract_prefixed_json(remote.stdout)
         state = str(payload.get("state", "unknown"))
@@ -1156,7 +1156,7 @@ class ClusterBridgePool:
             remote = self.client.run_node(
                 head,
                 self._task_probe_command(task_dir),
-                timeout_sec=self.config.command_timeout_sec,
+                timeout_sec=self._task_probe_timeout_sec(),
             )
             payload = _extract_prefixed_json(remote.stdout)
             state = "timed_out"
@@ -1235,7 +1235,7 @@ class ClusterBridgePool:
         probe = self.client.run_node(
             head,
             self._task_probe_command(task_dir),
-            timeout_sec=self.config.command_timeout_sec,
+            timeout_sec=self._task_probe_timeout_sec(),
         )
         payload = _extract_prefixed_json(probe.stdout)
         if str(payload.get("state")) == "running":
@@ -1243,7 +1243,7 @@ class ClusterBridgePool:
             probe = self.client.run_node(
                 head,
                 self._task_probe_command(task_dir),
-                timeout_sec=self.config.command_timeout_sec,
+                timeout_sec=self._task_probe_timeout_sec(),
             )
             payload = _extract_prefixed_json(probe.stdout)
         result = self._finish_task_result(
@@ -1455,6 +1455,17 @@ class ClusterBridgePool:
             "print(prefix+json.dumps(payload, sort_keys=True))\n"
             "PY"
         )
+
+    def _task_probe_timeout_sec(self) -> float:
+        """Keep controller heartbeats responsive when ClusterBridge is busy.
+
+        A task probe only reads a PID/result file and tails two logs.  It must
+        not inherit the long lifecycle timeout used for Ray startup or node
+        cleanup; otherwise probing several jobs serially can stall one
+        controller tick for minutes.
+        """
+
+        return max(3.0, min(10.0, float(self.config.command_timeout_sec)))
 
     def _terminate_task(self, node: ClusterNode, task_dir: Path) -> None:
         grace = self.config.task_kill_grace_sec

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -156,6 +157,28 @@ def test_transient_probe_failure_keeps_lease() -> None:
     assert broker.leases["job"].probe_failures == 1
     assert broker.reconcile() == []
     assert broker.leases["job"].probe_failures == 0
+
+
+def test_reconcile_probes_multiple_gpu_jobs_concurrently() -> None:
+    barrier = threading.Barrier(2)
+
+    class Pool:
+        def probe_task(self, task_id: str):
+            del task_id
+            barrier.wait(timeout=2)
+            return {"state": "running"}
+
+    broker = GPUBroker(
+        pool=Pool(),
+        scheduler=AdaptiveGPUScheduler(total_gpus=2),
+    )
+    broker.leases = {
+        "job-a": GPULease("task-a", "idea-a", "job-a", 1),
+        "job-b": GPULease("task-b", "idea-b", "job-b", 1),
+    }
+
+    assert broker.reconcile() == []
+    assert set(broker.leases) == {"job-a", "job-b"}
 
 
 class _SharedPool:

@@ -734,6 +734,27 @@ def test_async_task_resource_change_conflicts_with_existing_task(
         )
 
 
+def test_task_probe_uses_short_transport_timeout(tmp_path: Path) -> None:
+    client = FakeClient()
+    pool = ClusterBridgePool(
+        _config(tmp_path, node_count=1),
+        client=client,
+    )
+    pool.claim(start_keepalive=False)
+    pool._prepared = True
+    client.run_handler = lambda node, command: (
+        _result("77\n") if "nohup setsid bash" in command else _result(
+            "__RESEARCHCLAW_POOL_RESULT__="
+            '{"state":"running","pid":77,"stdout.log":"","stderr.log":""}\n'
+        )
+    )
+    pool.submit_task("true", timeout_sec=30, task_id="probe-timeout")
+
+    pool.probe_task("probe-timeout")
+
+    assert client.calls[-1][3] <= 10.0
+
+
 def test_background_task_timeout_sends_term_and_kill(tmp_path: Path) -> None:
     client = FakeClient()
     ticks = iter([0.0, 0.0, 2.0, 2.0])

@@ -74,7 +74,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = V2Config.from_file(args.config)
     store = V2Store(config.root)
-    store.initialize()
+    store.initialize(
+        recover_filesystem=args.command not in {"status", "ideas"}
+    )
     if args.command == "status":
         controller = V2Controller(
             config=config,

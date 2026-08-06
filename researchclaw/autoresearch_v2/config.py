@@ -79,6 +79,8 @@ class ExecutionConfig:
         "AUTORESEARCH_V2_IDEA_ID",
         "AUTORESEARCH_V2_JOB_ID",
         "AUTORESEARCH_V2_OUTPUT_DIR",
+        "HF_HUB_DISABLE_XET",
+        "HF_HUB_ENABLE_HF_TRANSFER",
     )
 
 

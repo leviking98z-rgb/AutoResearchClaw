@@ -273,7 +273,10 @@ def create_dashboard_app(
     control_enabled: bool = True,
 ) -> FastAPI:
     store = V2Store(config.root)
-    store.initialize()
+    # Dashboard is a live read-only companion to the controller. It must not
+    # perform crash-recovery cleanup while controller worker threads are in
+    # the middle of an atomic current-directory swap.
+    store.initialize(recover_filesystem=False)
     gpu_total = 0
     if config.gpu.pool_config:
         try:
