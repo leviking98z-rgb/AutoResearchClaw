@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 
 from researchclaw.autoresearch_v2.ideas import candidate_to_idea
-from researchclaw.autoresearch_v2.protocols import compile_screening_protocol
+from researchclaw.autoresearch_v2.protocols import (
+    COMPILER_OWNED_DESIGN_FIELDS,
+    compile_screening_protocol,
+    design_gate_view,
+)
 from researchclaw.autoresearch_v2.validation import (
     validate_plan,
     validate_runtime_against_contract,
@@ -268,6 +272,33 @@ def test_compiler_owns_single_subject_model_and_bootstrap_mechanics() -> None:
     assert plan["uncertainty"]["max_undefined_fraction"] == 0.05
     assert plan["uncertainty"]["excess_undefined_decision"] == "reject"
     assert validate_plan(plan) == []
+
+
+def test_compiler_manifest_and_design_gate_view_have_disjoint_ownership() -> None:
+    plan = compile_screening_protocol(_idea(), _draft())
+
+    assert plan["compiler"]["mechanical_fields"] == list(
+        COMPILER_OWNED_DESIGN_FIELDS
+    )
+    view = design_gate_view(plan)
+    assert set(COMPILER_OWNED_DESIGN_FIELDS).isdisjoint(view)
+    assert view["arms"] == plan["arms"]
+    assert view["estimand"] == plan["estimand"]
+    assert view["hypothesis"] == plan["hypothesis"]
+    assert view["primary_metric"] == plan["primary_metric"]
+    assert view["resources"]["subject_model"] == (
+        "Qwen2.5-Coder-1.5B-Instruct"
+    )
+    assert view["resources"]["datasets"] == [
+        "HumanEval screening partition"
+    ]
+    assert view["confirmatory_claim"] == (
+        plan["confirmatory_followup"]["claim"]
+    )
+    assert "threshold" not in view["gate_statistic"]
+    assert "call_ledger" not in view
+    assert "uncertainty" not in view
+    assert "required_runtime_evidence" not in view
 
 
 def test_compiler_rejects_unbounded_protocols_and_missing_control() -> None:

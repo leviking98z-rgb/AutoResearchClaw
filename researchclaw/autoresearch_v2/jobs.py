@@ -291,6 +291,7 @@ class DesignJobExecutor:
                     "revision": revision,
                     "decision": verdict.decision,
                     "reason": verdict.reason,
+                    "blocker_codes": list(verdict.blocker_codes),
                     "required_changes": list(verdict.required_changes),
                 }
             )
@@ -319,33 +320,31 @@ class DesignJobExecutor:
                     tokens=total_tokens,
                     elapsed_sec=time.monotonic() - started,
                 )
-            if revision >= self.max_revisions:
-                attempt.output_manifest = {
-                    "files": ["plan.json", "design_review.json"]
-                }
-                attempt.validation = {
-                    "ok": False,
+            reason = (
+                "design_gate_contract_failure: validated semantic gate "
+                f"returned forbidden decision {verdict.decision!r}"
+            )
+            attempt.output_manifest = {
+                "files": ["plan.json", "design_review.json"]
+            }
+            attempt.validation = {
+                "ok": False,
+                "decision_gate": review,
+                "design_revisions": design_revisions,
+            }
+            attempt.status = AttemptStatus.REJECTED
+            attempt.error = reason
+            store.save_attempt(attempt)
+            return JobOutcome(
+                True,
+                "reject",
+                reason,
+                {
                     "decision_gate": review,
                     "design_revisions": design_revisions,
-                }
-                attempt.status = AttemptStatus.REJECTED
-                attempt.error = verdict.reason
-                store.save_attempt(attempt)
-                return JobOutcome(
-                    False,
-                    "retry",
-                    verdict.reason,
-                    {
-                        "decision_gate": review,
-                        "design_revisions": design_revisions,
-                    },
-                    tokens=total_tokens,
-                    elapsed_sec=time.monotonic() - started,
-                )
-            prompt = self._decision_repair_prompt(
-                idea=idea,
-                plan=plan,
-                review=review,
+                },
+                tokens=total_tokens,
+                elapsed_sec=time.monotonic() - started,
             )
         attempt.output_manifest = {"files": ["plan.json"]}
         attempt.validation = {
@@ -399,20 +398,43 @@ class DesignJobExecutor:
     ) -> str:
         previous_plan = dict(previous_plan or {})
         previous_review = dict(previous_review or {})
+        prior_failure = dict(prior_failure or {})
         repair = ""
         if previous_plan:
+            blocker_codes = previous_review.get("blocker_codes", [])
+            if not (
+                isinstance(blocker_codes, list)
+                and bool(blocker_codes)
+                and all(
+                    isinstance(item, str) and item
+                    for item in blocker_codes
+                )
+            ):
+                previous_review = {}
+                if prior_failure.get("decision") in {"retry", "reject"}:
+                    prior_failure = {
+                        key: value
+                        for key, value in prior_failure.items()
+                        if key
+                        not in {
+                            "decision",
+                            "reason",
+                            "decision_gate",
+                            "design_revisions",
+                        }
+                    }
             repair = f"""
 This is a REVISION attempt. Do not design a different study and do not start
 over. Preserve the Idea, primary estimand, public model, benchmark, and all
-parts of the prior plan that were not criticized. Edit the prior plan
-point-by-point so every required change in the review is resolved. If two
-review requests conflict with the screening budget, narrow the pilot claim
-rather than pretending the pilot is a confirmatory study.
+parts of the prior plan. Repair only deterministic draft/compiler/plan
+validation failures recorded in prior failed-attempt feedback. Legacy
+open-ended Design-review requests are not authoritative and must not be
+replayed.
 
 PRIOR PLAN TO EDIT:
 {json.dumps(previous_plan, ensure_ascii=False, indent=2)[:18000]}
 
-PRIOR DESIGN REVIEW TO RESOLVE:
+PRIOR CLOSED-TAXONOMY DESIGN REVIEW (informational only):
 {json.dumps(previous_review, ensure_ascii=False, indent=2)[:10000]}
 """
         inferred_template = infer_protocol_template(idea)
@@ -430,7 +452,7 @@ IDEA:
 {json.dumps(idea.candidate, ensure_ascii=False, indent=2)}
 
 Prior failed attempt feedback, if any:
-{json.dumps(dict(prior_failure), ensure_ascii=False, indent=2)[:8000]}
+{json.dumps(prior_failure, ensure_ascii=False, indent=2)[:8000]}
 {repair}
 
 Return exactly:
@@ -662,49 +684,6 @@ PRIOR JSON TO REPAIR:
 DETERMINISTIC ERRORS TO FIX:
 {json.dumps(errors, ensure_ascii=False, indent=2)[:8000]}
 """
-
-    @staticmethod
-    def _decision_repair_prompt(
-        *,
-        idea: IdeaRecord,
-        plan: Mapping[str, Any],
-        review: Mapping[str, Any],
-    ) -> str:
-        return f"""\
-Revise the typed scientific draft below in response to the Decision review.
-Return one complete JSON object containing only model-owned draft fields.
-Do not return compiled/mechanical fields.
-
-IDEA (immutable):
-{json.dumps(idea.candidate, ensure_ascii=False, indent=2)[:16000]}
-
-CURRENT COMPILED PLAN:
-{json.dumps(dict(plan), ensure_ascii=False, indent=2)[:24000]}
-
-DECISION REVIEW:
-{json.dumps(dict(review), ensure_ascii=False, indent=2)[:12000]}
-
-Preserve the research question and mechanism. Apply every required change
-point-by-point. Narrow the screening claim or simplify the pilot when needed;
-do not expand it into a confirmatory study. Prefer a simple paired 2-arm design
-plus an independent no-self-improvement control. Specify the operational
-algorithm, denominator, pairing, tie/zero handling, and comparable control
-outcome exactly enough that code can implement them without discretion.
-
-Return exactly the same typed schema requested by the original Design prompt:
-protocol_template, pilot_objective, pilot_claim_scope, research_question,
-hypothesis, primary_metric, metric_direction, unit_of_analysis, dataset,
-screening_access_policy, models, baselines, ablations, arms, pilot,
-call_ledger, gate_statistic, uncertainty, validity_criteria,
-promotion_criteria, estimand, sample_size_rationale, workload_budget, and
-confirmatory_followup.
-
-The Controller will recompile datasets, split IDs, arithmetic, decision
-regions, Scale expansion, and required runtime evidence. Do not include or
-edit those mechanical fields. Retry is only for invalid operational evidence;
-valid undefined, low-event, flat, CI-crossing, or unfavorable results reject.
-"""
-
 
 class BuildJobExecutor:
     def __init__(

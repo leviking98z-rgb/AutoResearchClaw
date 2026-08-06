@@ -338,7 +338,7 @@ def test_design_retry_edits_previous_plan_and_review(tmp_path: Path) -> None:
     assert outcome.success
     assert "This is a REVISION attempt" in role.prompts[0]
     assert "original question" in role.prompts[0]
-    assert "fix arithmetic" in role.prompts[0]
+    assert "fix arithmetic" not in role.prompts[0]
     assert "Do not design a different study" in role.prompts[0]
 
 
@@ -383,7 +383,7 @@ def test_design_executor_compiles_typed_draft_before_decision_gate(
     ).is_file()
 
 
-def test_design_repairs_decision_retry_inside_one_attempt(
+def test_legacy_design_retry_becomes_terminal_contract_reject(
     tmp_path: Path,
 ) -> None:
     store = V2Store(tmp_path)
@@ -418,30 +418,44 @@ def test_design_repairs_decision_retry_inside_one_attempt(
     )
 
     assert outcome.success
-    assert outcome.decision == "promote"
-    assert len(role.prompts) == 2
-    assert "DECISION REVIEW" in role.prompts[1]
-    assert "define the exact denominator" in role.prompts[1]
-    assert len(gate.plans) == 2
+    assert outcome.decision == "reject"
+    assert "design_gate_contract_failure" in outcome.reason
+    assert len(role.prompts) == 1
+    assert len(gate.plans) == 1
     durable = store.get_attempt(attempt.attempt_id)
     assert durable is not None
     assert [item["decision"] for item in durable.validation["design_revisions"]] == [
         "retry",
-        "promote",
     ]
 
 
-def test_design_exhausts_bounded_internal_revisions(
+def test_semantic_design_blocker_is_terminal_reject(
     tmp_path: Path,
 ) -> None:
-    class _AlwaysRetryGate:
+    class _BlockingGate:
         def review_design(self, idea, plan):
             del idea, plan
             return GateVerdict(
-                "retry",
-                "still underspecified",
+                "reject",
+                "the contrast is not identifiable",
                 1.0,
-                required_changes=("define the algorithm",),
+                raw={
+                    "schema_version": 2,
+                    "decision": "reject",
+                    "reason": "the contrast is not identifiable",
+                    "confidence": 1.0,
+                    "blocker_codes": ["non_identifiable_contrast"],
+                    "blockers": [
+                        {
+                            "code": "non_identifiable_contrast",
+                            "evidence_paths": ["/plan/estimand"],
+                            "explanation": "two mechanisms change together",
+                        }
+                    ],
+                    "risks": [],
+                    "required_changes": [],
+                },
+                blocker_codes=("non_identifiable_contrast",),
             )
 
     store = V2Store(tmp_path)
@@ -465,7 +479,7 @@ def test_design_exhausts_bounded_internal_revisions(
 
     outcome = DesignJobExecutor(
         role,
-        decision_gate=_AlwaysRetryGate(),
+        decision_gate=_BlockingGate(),
         max_revisions=1,
     ).execute(
         idea=idea,
@@ -474,13 +488,15 @@ def test_design_exhausts_bounded_internal_revisions(
         store=store,
     )
 
-    assert not outcome.success
-    assert outcome.decision == "retry"
-    assert len(role.prompts) == 2
+    assert outcome.success
+    assert outcome.decision == "reject"
+    assert len(role.prompts) == 1
     durable = store.get_attempt(attempt.attempt_id)
     assert durable is not None
     assert durable.status is AttemptStatus.REJECTED
-    assert len(durable.validation["design_revisions"]) == 2
+    assert durable.validation["design_revisions"][0]["blocker_codes"] == [
+        "non_identifiable_contrast"
+    ]
 
 
 def test_design_repairs_compiler_error_inside_revision_budget(

@@ -24,6 +24,24 @@ SUPPORTED_PROTOCOLS = frozenset(
     }
 )
 
+COMPILER_OWNED_DESIGN_FIELDS = (
+    "datasets",
+    "screening_access_policy",
+    "models",
+    "pilot",
+    "call_ledger",
+    "sample_accounting",
+    "workload_budget",
+    "effect_threshold",
+    "uncertainty",
+    "decision_contract",
+    "decision_table",
+    "promotion_rule",
+    "early_stop_rule",
+    "confirmatory_followup",
+    "required_runtime_evidence",
+)
+
 _PROTOCOL_ALIASES = {
     "calibration": "calibration_verifier",
     "verifier": "calibration_verifier",
@@ -290,24 +308,76 @@ def compile_screening_protocol(
     plan["compiler"] = {
         "name": "autoresearch_v2_protocol_compiler",
         "version": 2,
-        "mechanical_fields": [
-            "datasets",
-            "screening_access_policy",
-            "models",
-            "pilot",
-            "call_ledger",
-            "sample_accounting",
-            "workload_budget",
-            "effect_threshold",
-            "uncertainty",
-            "decision_contract",
-            "decision_table",
-            "promotion_rule",
-            "early_stop_rule",
-            "confirmatory_followup",
-        ],
+        "mechanical_fields": list(COMPILER_OWNED_DESIGN_FIELDS),
     }
     return plan
+
+
+def design_gate_view(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only scientific fields owned by the semantic Design gate.
+
+    Compiler-owned mechanics are deliberately omitted.  Once ``validate_plan``
+    has passed, split identifiers, access policy, arithmetic, bootstrap
+    settings, thresholds, decision regions, and runtime evidence contracts
+    cannot become reasons for another model-authored rewrite.
+    """
+
+    models = plan.get("models")
+    subject_model = ""
+    if isinstance(models, list):
+        for item in models:
+            if isinstance(item, Mapping) and item.get("role") == "subject":
+                subject_model = str(item.get("name", "") or "").strip()
+                if subject_model:
+                    break
+    datasets = plan.get("datasets")
+    dataset_names: list[str] = []
+    if isinstance(datasets, list):
+        for item in datasets:
+            if not isinstance(item, Mapping):
+                continue
+            if str(item.get("split_role", "")) != "screening":
+                continue
+            name = str(item.get("name", "") or "").strip()
+            if name:
+                dataset_names.append(name)
+    confirmatory = plan.get("confirmatory_followup")
+    confirmatory_claim = (
+        str(confirmatory.get("claim", "") or "").strip()
+        if isinstance(confirmatory, Mapping)
+        else ""
+    )
+    gate_statistic = plan.get("gate_statistic")
+    scientific_gate: dict[str, Any] = {}
+    if isinstance(gate_statistic, Mapping):
+        scientific_gate = {
+            key: copy.deepcopy(gate_statistic.get(key))
+            for key in ("name", "definition", "direction")
+        }
+    return {
+        key: copy.deepcopy(plan.get(key))
+        for key in (
+            "protocol_template",
+            "pilot_objective",
+            "pilot_claim_scope",
+            "research_question",
+            "hypothesis",
+            "primary_metric",
+            "metric_direction",
+            "unit_of_analysis",
+            "arms",
+            "baselines",
+            "ablations",
+            "estimand",
+        )
+    } | {
+        "gate_statistic": scientific_gate,
+        "resources": {
+            "datasets": dataset_names,
+            "subject_model": subject_model,
+        },
+        "confirmatory_claim": confirmatory_claim,
+    }
 
 
 def _compile_decision_table(
