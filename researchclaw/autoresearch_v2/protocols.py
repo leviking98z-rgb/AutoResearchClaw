@@ -530,7 +530,7 @@ def _compile_call_ledger(
         ]
     arm_names = [str(arm["name"]) for arm in arms]
     normalized_arm_names = {_slug(name): name for name in arm_names}
-    seen_names: set[str] = set()
+    seen_keys: set[tuple[str, str, str, tuple[str, ...]]] = set()
     if isinstance(raw_components, list):
         for item in raw_components:
             if not isinstance(item, Mapping):
@@ -540,9 +540,6 @@ def _compile_call_ledger(
             name = _slug(str(item.get("name", "") or ""))
             if name not in _LEDGER_COMPONENTS:
                 raise ValueError(f"unsupported call_ledger component: {name}")
-            if name in seen_names:
-                raise ValueError(f"duplicate call_ledger component: {name}")
-            seen_names.add(name)
             scope = _slug(
                 str(item.get("scope", "per_arm_example_seed") or "")
             )
@@ -591,6 +588,19 @@ def _compile_call_ledger(
                     arm_names=arm_names,
                     normalized_arm_names=normalized_arm_names,
                 )
+                component_key = (
+                    name,
+                    scope,
+                    dataset_role,
+                    tuple(selected_arms),
+                )
+                if component_key in seen_keys:
+                    raise ValueError(
+                        "duplicate call_ledger component identity: "
+                        f"{name}/{scope}/{dataset_role}/"
+                        f"{','.join(selected_arms) or '-'}"
+                    )
+                seen_keys.add(component_key)
                 multiplicity = _ledger_multiplicity(
                     scope=scope,
                     dataset_role=dataset_role,

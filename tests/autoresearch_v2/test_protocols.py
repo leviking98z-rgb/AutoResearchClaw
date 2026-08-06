@@ -218,6 +218,55 @@ def test_compiler_accounts_for_shared_initial_and_selected_repair_arms() -> None
     assert validate_plan(plan) == []
 
 
+def test_compiler_allows_one_component_across_distinct_ledger_scopes() -> None:
+    draft = _draft()
+    draft["call_ledger"] = {
+        "components": [
+            {
+                "name": "adaptation",
+                "scope": "per_arm_example_seed",
+                "dataset_role": "development",
+                "arms": ["compressed verifier"],
+                "calls_per_unit": 1,
+            },
+            {
+                "name": "adaptation",
+                "scope": "per_arm_seed",
+                "dataset_role": "none",
+                "arms": ["compressed verifier"],
+                "calls_per_unit": 2,
+            },
+        ]
+    }
+
+    plan = compile_screening_protocol(_idea(), draft)
+
+    assert [item["total_calls"] for item in plan["call_ledger"]["components"]] == [
+        16,
+        2,
+    ]
+    assert plan["call_ledger"]["total_model_calls"] == 18
+    assert validate_plan(plan) == []
+
+
+def test_compiler_rejects_exact_duplicate_ledger_identity() -> None:
+    draft = _draft()
+    component = {
+        "name": "adaptation",
+        "scope": "per_arm_example_seed",
+        "dataset_role": "development",
+        "arms": ["compressed verifier"],
+        "calls_per_unit": 1,
+    }
+    draft["call_ledger"] = {"components": [component, dict(component)]}
+
+    with pytest.raises(
+        ValueError,
+        match="duplicate call_ledger component identity",
+    ):
+        compile_screening_protocol(_idea(), draft)
+
+
 def test_runtime_call_ledger_is_enforced() -> None:
     plan = compile_screening_protocol(_idea(), _draft())
     runtime = {
@@ -251,3 +300,56 @@ def test_runtime_call_ledger_is_enforced() -> None:
         allocated_gpus=1,
         mode="pilot",
     ) == []
+
+
+def test_runtime_call_counts_aggregate_repeated_component_names() -> None:
+    draft = _draft()
+    draft["call_ledger"] = {
+        "components": [
+            {
+                "name": "adaptation",
+                "scope": "per_arm_example_seed",
+                "dataset_role": "development",
+                "arms": ["compressed verifier"],
+                "calls_per_unit": 1,
+            },
+            {
+                "name": "adaptation",
+                "scope": "per_arm_seed",
+                "dataset_role": "none",
+                "arms": ["compressed verifier"],
+                "calls_per_unit": 2,
+            },
+        ]
+    }
+    plan = compile_screening_protocol(_idea(), draft)
+    runtime = {
+        "gpu_count": 1,
+        "examples_processed": 32,
+        "examples_by_role": {
+            "development": 16,
+            "screening": 32,
+        },
+        "seeds": [0],
+        "call_counts": {"adaptation": 18},
+    }
+
+    assert validate_runtime_against_contract(
+        plan=plan,
+        runtime_evidence=runtime,
+        allocated_gpus=1,
+        mode="pilot",
+    ) == []
+
+    runtime["call_counts"]["adaptation"] = 19
+    errors = validate_runtime_against_contract(
+        plan=plan,
+        runtime_evidence=runtime,
+        allocated_gpus=1,
+        mode="pilot",
+    )
+    assert any(
+        "call_counts[adaptation]=19 exceed compiled component budget=18"
+        in error
+        for error in errors
+    )

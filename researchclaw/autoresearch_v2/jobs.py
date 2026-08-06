@@ -334,6 +334,9 @@ Mechanical fields that the Controller owns and will overwrite:
 Allowed call_ledger component names are:
 adaptation, candidate_generation, verifier_scoring, calibration,
 memory_writing, shadow_continuation, baseline_reference, final_evaluation.
+The same component name may appear more than once when its scope,
+dataset_role, or exact arm subset differs; do not duplicate the exact same
+name/scope/dataset_role/arms tuple.
 Allowed scopes are:
 - per_arm_example_seed: multiplied by selected arms, dataset examples, seeds;
 - per_example_seed: one shared call per dataset example and seed;
@@ -367,6 +370,8 @@ For call_ledger:
 - allowed names are adaptation, candidate_generation, verifier_scoring,
   calibration, memory_writing, shadow_continuation, baseline_reference,
   final_evaluation;
+- the same name may be reused only for a different scope, dataset_role, or
+  exact arm subset; never duplicate the same name/scope/dataset_role/arms;
 - allowed scopes are per_arm_example_seed, per_example_seed, per_arm_seed,
   per_seed, fixed;
 - scopes containing "arm" may name an exact arm subset;

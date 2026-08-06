@@ -339,7 +339,7 @@ def _validate_protocol_compiler_contract(
         errors.append("call_ledger.components must be a non-empty list")
         return
     compiled_total = 0
-    names: set[str] = set()
+    identities: set[tuple[str, str, str, tuple[str, ...]]] = set()
     for index, component in enumerate(components):
         if not isinstance(component, Mapping):
             errors.append(
@@ -351,10 +351,25 @@ def _validate_protocol_compiler_contract(
             errors.append(
                 f"missing call_ledger.components[{index}].name"
             )
-        elif name in names:
-            errors.append(f"duplicate call_ledger component {name!r}")
         else:
-            names.add(name)
+            raw_arms = component.get("arms")
+            arms = (
+                tuple(str(arm) for arm in raw_arms)
+                if isinstance(raw_arms, list)
+                else ()
+            )
+            identity = (
+                name,
+                str(component.get("scope", "") or ""),
+                str(component.get("dataset_role", "") or ""),
+                arms,
+            )
+            if identity in identities:
+                errors.append(
+                    f"duplicate call_ledger component identity {identity!r}"
+                )
+            else:
+                identities.add(identity)
         calls = component.get("calls_per_unit")
         if (
             isinstance(calls, bool)
@@ -2276,14 +2291,19 @@ def _validate_runtime_call_ledger(
             "runtime_evidence.call_counts is required by compiled protocol"
         )
         return
-    expected = {
-        str(component.get("name", "") or ""): int(
-            component.get("total_calls", -1)
-        )
-        for component in expected_components
-        if isinstance(component, Mapping)
-        and str(component.get("name", "") or "")
-    }
+    expected: dict[str, int] = {}
+    for component in expected_components:
+        if not isinstance(component, Mapping):
+            continue
+        name = str(component.get("name", "") or "")
+        if not name:
+            continue
+        try:
+            expected[name] = expected.get(name, 0) + int(
+                component.get("total_calls", -1)
+            )
+        except (TypeError, ValueError):
+            continue
     actual_names = {
         str(name)
         for name, count in actual.items()
