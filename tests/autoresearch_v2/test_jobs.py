@@ -303,6 +303,7 @@ def test_report_retries_in_place_and_commits_corrected_package(
         (store.current_dir(idea.idea_id) / "report.json").read_text()
     )
     assert report["title"] == "Corrected"
+    assert gate.evidence[0]["plan"]["workload"]["total_calls"] == 288
     durable = store.get_attempt(attempt.attempt_id)
     assert durable is not None
     assert durable.status is AttemptStatus.ACCEPTED

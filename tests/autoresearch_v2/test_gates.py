@@ -342,6 +342,48 @@ def test_design_gate_prompt_omits_compiler_mechanics() -> None:
     assert "Do not return a decision" in prompt
 
 
+def test_report_gate_supplies_plan_to_reviewer() -> None:
+    client = _Client(
+        {
+            "decision": "complete",
+            "reason": "evidence complete",
+            "confidence": 1.0,
+            "risks": [],
+            "required_changes": [],
+        }
+    )
+    gate = LLMDecisionGate(client=client)
+    report = {
+        "claims": [
+            {
+                "claim": "The measured effect was zero.",
+                "evidence_paths": [
+                    "/evidence/pilot/metrics/endpoint_correct_diff"
+                ],
+                "strength": "measured",
+            }
+        ]
+    }
+    verdict = gate.review_report(
+        _idea(),
+        report,
+        {
+            "idea": {"title": "Test"},
+            "plan": {"promotion_criteria": [{"value": 3.0}]},
+            "evidence": {
+                "pilot": {
+                    "metrics": {"endpoint_correct_diff": 0.0}
+                }
+            },
+        },
+    )
+
+    assert verdict.decision == "complete"
+    prompt = client.prompts[0]
+    assert "PLAN:" in prompt
+    assert '"promotion_criteria"' in prompt
+
+
 def test_design_preflight_uses_deterministic_blocker_code() -> None:
     idea = _idea()
     idea.candidate.pop("novelty_evidence")

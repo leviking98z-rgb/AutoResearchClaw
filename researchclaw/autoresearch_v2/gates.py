@@ -453,6 +453,7 @@ Return:
         supplied = dict(evidence)
         if (
             isinstance(supplied.get("idea"), Mapping)
+            and isinstance(supplied.get("plan"), Mapping)
             and isinstance(supplied.get("evidence"), Mapping)
         ):
             context = supplied
@@ -476,6 +477,7 @@ Return:
                         [],
                     ),
                 },
+                "plan": {},
                 "evidence": supplied,
             }
         preflight = _report_preflight(report, context)
@@ -487,6 +489,9 @@ Audit the final claim-evidence package.
 
 IDEA:
 {json.dumps(context["idea"], ensure_ascii=False, indent=2)[:12000]}
+
+PLAN:
+{json.dumps(context["plan"], ensure_ascii=False, indent=2)[:24000]}
 
 REPORT:
 {json.dumps(dict(report), ensure_ascii=False, indent=2)[:24000]}
