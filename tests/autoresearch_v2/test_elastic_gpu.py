@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -133,6 +134,7 @@ class _FakePool:
         self._state_lock = threading.RLock()
         self.adopted = 0
         self.prepared_calls = 0
+        self.restored = 0
 
     def adopt_claimed_lease(self) -> None:
         self.adopted += 1
@@ -145,6 +147,11 @@ class _FakePool:
         self.prepared_calls += 1
         self.claimed = True
         self.prepared = True
+
+    def restore_allocated_state(self, data: dict[str, Any]) -> None:
+        self.restored += 1
+        self.claimed = bool(data.get("claimed"))
+        self.prepared = bool(data.get("prepared"))
 
 
 class _FakeBroker:
@@ -342,6 +349,51 @@ def test_later_reconcile_hot_attaches_granted_allocation(
     assert client.renewals == [("alloc-1", 120)]
     assert manager.snapshot()["state"] == "ready"
     assert manager.snapshot()["allocated_gpus"] == 16
+
+
+def test_existing_allocated_pool_state_skips_per_node_claim_restore(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    client = _FakeResourceClient()
+    allocation = _allocation()
+    client.allocations = [allocation]
+    pools = _PoolFactory()
+    brokers = _BrokerFactory()
+    pool_id = "autoresearch-v2-alloc-1"
+    state_dir = Path(config.gpu.resource_manager.log_root) / pool_id
+    state_dir.mkdir(parents=True)
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "pool_id": pool_id,
+                "nodes": [
+                    {"address": item["ip"]}
+                    for item in allocation["node_details"]
+                ],
+                "claimed": True,
+                "prepared": True,
+                "ray_started": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = ResourceManagedGPUManager(
+        config.gpu,
+        client=client,
+        pool_factory=pools,
+        broker_factory=brokers,
+        monotonic=lambda: 0.0,
+        prepare_async=False,
+    )
+
+    manager.bootstrap()
+
+    pool = pools.pools[0]
+    assert pool.restored == 1
+    assert pool.adopted == 0
+    assert pool.prepared_calls == 0
+    assert manager.broker is brokers.brokers[0]
 
 
 def test_renewal_does_not_block_reconcile(tmp_path: Path) -> None:

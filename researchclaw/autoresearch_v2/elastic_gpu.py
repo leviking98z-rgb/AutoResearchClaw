@@ -533,8 +533,16 @@ class ResourceManagedGPUManager:
         restored = False
         if state_path.is_file():
             try:
-                pool.restore_state()
-                restored = pool.claimed and pool.prepared
+                # The allocation is already authoritative lease evidence. Fast
+                # restore the durable prepared/Ray flags without re-reading
+                # every CephFS claim file; the resource-manager snapshot above
+                # has already validated owner, allocation id, nodes and status.
+                restored = self._restore_allocated_pool_state(
+                    pool,
+                    state_path,
+                    pool_id=pool_id,
+                    node_addresses=[node.address for node in nodes],
+                )
             except Exception:  # noqa: BLE001
                 restored = False
         if not restored:
@@ -557,6 +565,41 @@ class ResourceManagedGPUManager:
                 return
             self._pool = pool
             self._broker = broker
+
+    @staticmethod
+    def _restore_allocated_pool_state(
+        pool: ClusterBridgePool,
+        state_path: Path,
+        *,
+        pool_id: str,
+        node_addresses: list[str],
+    ) -> bool:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if str(data.get("pool_id", "")) != pool_id:
+            return False
+        state_nodes = [
+            str(item.get("address", ""))
+            for item in data.get("nodes", ())
+            if isinstance(item, Mapping)
+        ]
+        if state_nodes != node_addresses:
+            return False
+        if not (
+            bool(data.get("claimed"))
+            and bool(data.get("prepared"))
+            and bool(data.get("ray_started"))
+        ):
+            return False
+        restore_allocated = getattr(
+            pool,
+            "restore_allocated_state",
+            None,
+        )
+        if callable(restore_allocated):
+            restore_allocated(data)
+        else:
+            pool.restore_state()
+        return True
 
     def _start_attach(self, allocation: Mapping[str, Any]) -> None:
         thread = self._prepare_thread

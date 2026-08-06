@@ -265,6 +265,24 @@ class ClusterBridgePool:
             self._ray_started = durable_claimed and bool(data.get("ray_started"))
         return data
 
+    def restore_allocated_state(
+        self,
+        data: Mapping[str, Any],
+    ) -> None:
+        """Restore trusted flags after resource-manager allocation validation.
+
+        Unlike ``restore_state()``, this method does not read per-node claim
+        files. It is only for callers that already validated an authoritative
+        central allocation containing the exact owner and node set.
+        """
+
+        with self._state_lock:
+            self._claimed = bool(data.get("claimed"))
+            self._prepared = self._claimed and bool(data.get("prepared"))
+            self._ray_started = self._prepared and bool(
+                data.get("ray_started")
+            )
+
     def verify_claim_ownership(self) -> dict[str, dict[str, object]]:
         """Fail unless every configured node has this pool's active lease."""
 
