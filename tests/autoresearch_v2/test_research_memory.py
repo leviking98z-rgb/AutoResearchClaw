@@ -148,3 +148,27 @@ def test_infohub_failure_is_returned_not_raised(
 
     assert result.ok is False
     assert "offline" in result.error
+
+
+def test_infohub_fingerprint_changes_when_current_artifacts_change(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    current = store.current_dir(idea.idea_id)
+    current.mkdir(parents=True)
+    paper = current / "paper.md"
+    paper.write_text("# First\n", encoding="utf-8")
+    memory = InfoHubResearchMemory(
+        config=ResearchMemoryConfig(),
+        system_id="rsi-prod",
+        store=store,
+    )
+
+    first = memory.fingerprint(idea)
+    paper.write_text("# Second, longer\n", encoding="utf-8")
+    second = memory.fingerprint(idea)
+
+    assert first != second

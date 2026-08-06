@@ -110,6 +110,51 @@ class InfoHubResearchMemory:
             )
         return ResearchMemoryResult(ok=True, external_id=external_id)
 
+    def fingerprint(self, idea: IdeaRecord) -> str:
+        """Fingerprint both lifecycle state and accepted artifact contents."""
+
+        current = self.store.current_dir(idea.idea_id)
+        artifact_state: list[dict[str, Any]] = []
+        for relative in (
+            "plan.json",
+            "artifacts/pilot/metrics.json",
+            "artifacts/pilot/runtime_evidence.json",
+            "artifacts/scale/metrics.json",
+            "artifacts/scale/runtime_evidence.json",
+            "report.json",
+            "paper.md",
+            "final_review.json",
+        ):
+            path = current / relative
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            artifact_state.append(
+                {
+                    "path": relative,
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+            )
+        return json.dumps(
+            {
+                "status": idea.status.value,
+                "updated_at": idea.updated_at,
+                "current_job_id": idea.current_job_id,
+                "exit_reason": idea.exit_reason,
+                "final_outcome": idea.candidate.get(
+                    "final_outcome",
+                    "",
+                ),
+                "llm_tokens": idea.llm_tokens_spent,
+                "llm_calls": idea.llm_calls,
+                "gpu_seconds": round(idea.gpu_seconds_spent, 6),
+                "artifacts": artifact_state,
+            },
+            sort_keys=True,
+        )
+
     def _payload(
         self,
         idea: IdeaRecord,

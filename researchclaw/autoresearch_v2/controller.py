@@ -377,22 +377,33 @@ class V2Controller:
         """Best-effort InfoHub sync; never block the scientific state machine."""
 
         for idea in self.store.list_ideas():
-            fingerprint = json.dumps(
-                {
-                    "status": idea.status.value,
-                    "updated_at": idea.updated_at,
-                    "current_job_id": idea.current_job_id,
-                    "exit_reason": idea.exit_reason,
-                    "final_outcome": idea.candidate.get(
-                        "final_outcome",
-                        "",
-                    ),
-                    "llm_tokens": idea.llm_tokens_spent,
-                    "llm_calls": idea.llm_calls,
-                    "gpu_seconds": round(idea.gpu_seconds_spent, 6),
-                },
-                sort_keys=True,
+            fingerprint_fn = getattr(
+                self.research_memory,
+                "fingerprint",
+                None,
             )
+            if callable(fingerprint_fn):
+                fingerprint = str(fingerprint_fn(idea))
+            else:
+                fingerprint = json.dumps(
+                    {
+                        "status": idea.status.value,
+                        "updated_at": idea.updated_at,
+                        "current_job_id": idea.current_job_id,
+                        "exit_reason": idea.exit_reason,
+                        "final_outcome": idea.candidate.get(
+                            "final_outcome",
+                            "",
+                        ),
+                        "llm_tokens": idea.llm_tokens_spent,
+                        "llm_calls": idea.llm_calls,
+                        "gpu_seconds": round(
+                            idea.gpu_seconds_spent,
+                            6,
+                        ),
+                    },
+                    sort_keys=True,
+                )
             if self._research_memory_fingerprints.get(
                 idea.idea_id
             ) == fingerprint:
