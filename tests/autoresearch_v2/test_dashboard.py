@@ -10,7 +10,10 @@ from researchclaw.autoresearch_v2.config import (
     UsageMonitoringConfig,
     V2Config,
 )
-from researchclaw.autoresearch_v2.dashboard import V2Dashboard
+from researchclaw.autoresearch_v2.dashboard import (
+    V2Dashboard,
+    configured_gpu_total,
+)
 from researchclaw.autoresearch_v2.models import (
     IdeaRecord,
     IdeaStatus,
@@ -107,6 +110,37 @@ def test_config_contains_shared_workspace_and_infohub_defaults() -> None:
     assert config.gpu.shared_workspace_root.startswith("/root/shared/")
     assert config.literature.enabled
     assert "8077" in config.literature.url
+
+
+def test_dashboard_uses_desired_resource_manager_gpu_capacity(
+    tmp_path: Path,
+) -> None:
+    shared_root = tmp_path / "shared-runs"
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "state_dir": str(shared_root / "canary"),
+                "population": {
+                    "active_idea_target": 1,
+                    "max_active_ideas": 1,
+                },
+                "gpu": {
+                    "enabled": True,
+                    "mode": "resource_manager",
+                    "pool_config": "",
+                    "shared_workspace_root": str(shared_root),
+                    "resource_manager": {
+                        "owner": "019fc877-7045-7a40-935d-d2bef7883945",
+                        "min_gpus": 8,
+                        "desired_gpus": 32,
+                        "max_gpus": 64,
+                    },
+                },
+            }
+        }
+    )
+
+    assert configured_gpu_total(config) == 32
 
 
 def test_health_uses_controller_tick_not_unrelated_event(

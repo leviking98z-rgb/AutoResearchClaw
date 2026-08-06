@@ -24,6 +24,29 @@ class ControlRequest(BaseModel):
     reason: str = Field(default="", max_length=500)
 
 
+def configured_gpu_total(config: V2Config) -> int:
+    """Return the GPU capacity represented by the active backend config."""
+    if not config.gpu.enabled:
+        return 0
+    if config.gpu.mode == "resource_manager":
+        return max(0, int(config.gpu.resource_manager.desired_gpus))
+    if not config.gpu.pool_config:
+        return 0
+    try:
+        from researchclaw.factory.pool_config import PoolConfigSummary
+
+        return max(
+            0,
+            int(
+                PoolConfigSummary.from_file(
+                    config.gpu.pool_config
+                ).expected_total_gpus
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 class V2Dashboard:
     def __init__(
         self,
@@ -282,16 +305,7 @@ def create_dashboard_app(
     # perform crash-recovery cleanup while controller worker threads are in
     # the middle of an atomic current-directory swap.
     store.initialize(recover_filesystem=False)
-    gpu_total = 0
-    if config.gpu.pool_config:
-        try:
-            from researchclaw.factory.pool_config import PoolConfigSummary
-
-            gpu_total = PoolConfigSummary.from_file(
-                config.gpu.pool_config
-            ).expected_total_gpus
-        except Exception:  # noqa: BLE001
-            gpu_total = 0
+    gpu_total = configured_gpu_total(config)
     usage_monitor = (
         UsageMonitor(
             store=store,
