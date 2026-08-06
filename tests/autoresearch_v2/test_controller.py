@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -392,6 +393,117 @@ def test_infrastructure_retry_does_not_spend_scientific_attempt(
     assert job.attempt == 1
     assert job.attempt_limit == 2
     assert job.result["infrastructure_retries"] == 1
+    controller.request_stop()
+    controller._pool.shutdown(wait=True)
+
+
+def test_controller_rejects_uncached_idea_before_admission(
+    tmp_path: Path,
+) -> None:
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([_candidate(0)]),
+        available_models=("Qwen/Qwen2.5-1.5B-Instruct",),
+        available_datasets=("openai/gsm8k",),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+
+    controller._maintain_reservoir()
+
+    ideas = controller.store.list_ideas()
+    assert len(ideas) == 1
+    assert ideas[0].status is IdeaStatus.REJECTED
+    assert ideas[0].exit_reason.startswith("resource_unavailable:model:")
+    controller.request_stop()
+    controller._pool.shutdown(wait=True)
+
+
+def test_plan_manifest_preflight_blocks_gpu_before_attempt(
+    tmp_path: Path,
+) -> None:
+    class _Pool:
+        def cancel_task(self, task_id: str):
+            del task_id
+            return {"returncode": 130}
+
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": str(tmp_path / "pool.yaml"),
+                    "shared_workspace_root": str(tmp_path),
+                },
+            }
+        }
+    )
+    controller = V2Controller(
+        config=config,
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([]),
+        gpu_broker=SimpleNamespace(
+            leases={},
+            scheduler=SimpleNamespace(
+                order=lambda jobs, priorities: list(jobs)
+            ),
+            pool=_Pool(),
+        ),
+        available_models=("Qwen/Qwen2.5-1.5B-Instruct",),
+        available_datasets=("openai/gsm8k",),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    idea = candidate_to_idea(_candidate(0))
+    idea.status = IdeaStatus.PILOTING
+    current = controller.store.current_dir(idea.idea_id)
+    current.mkdir(parents=True)
+    (current / "plan.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "name": "Qwen/Qwen2.5-3B-Instruct",
+                        "role": "subject",
+                    }
+                ],
+                "datasets": [
+                    {
+                        "name": "ARC development partition",
+                        "resource_id": "allenai/ai2_arc",
+                        "split_role": "development",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    job = JobRecord(
+        job_id=f"{idea.idea_id}-pilot",
+        idea_id=idea.idea_id,
+        kind=JobKind.PILOT,
+        requires_gpu=True,
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+    )
+    idea.current_job_id = job.job_id
+    controller.store.save_idea(idea)
+    controller.store.save_job(job)
+
+    controller._dispatch()
+
+    durable_idea = controller.store.get_idea(idea.idea_id)
+    durable_job = controller.store.get_job(job.job_id)
+    assert durable_idea is not None
+    assert durable_job is not None
+    assert durable_idea.status is IdeaStatus.QUARANTINED
+    assert durable_job.status is JobStatus.FAILED
+    assert durable_job.result["blocked_before_gpu_submit"] is True
+    assert controller.store.list_attempts(job_id=job.job_id) == []
     controller.request_stop()
     controller._pool.shutdown(wait=True)
 

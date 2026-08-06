@@ -84,10 +84,22 @@ class DesignJobExecutor:
         *,
         decision_gate: DecisionGate | None = None,
         max_revisions: int = 1,
+        available_models: tuple[str, ...] = (),
+        available_datasets: tuple[str, ...] = (),
     ) -> None:
         self.role = role
         self.decision_gate = decision_gate
         self.max_revisions = max(0, int(max_revisions))
+        self.available_models = tuple(
+            str(value).strip()
+            for value in available_models
+            if str(value).strip()
+        )
+        self.available_datasets = tuple(
+            str(value).strip()
+            for value in available_datasets
+            if str(value).strip()
+        )
 
     def execute(
         self,
@@ -212,7 +224,12 @@ class DesignJobExecutor:
             pending_draft = None
             pending_errors = []
             try:
-                plan = compile_screening_protocol(idea, result.value)
+                plan = compile_screening_protocol(
+                    idea,
+                    result.value,
+                    available_models=self.available_models,
+                    available_datasets=self.available_datasets,
+                )
             except (TypeError, ValueError) as exc:
                 design_revisions.append(
                     {
@@ -394,8 +411,8 @@ class DesignJobExecutor:
             _read_json(candidate / "design_review.json"),
         )
 
-    @staticmethod
     def _prompt(
+        self,
         idea: IdeaRecord,
         *,
         prior_failure: Mapping[str, Any],
@@ -431,11 +448,12 @@ class DesignJobExecutor:
                     }
             repair = f"""
 This is a REVISION attempt. Do not design a different study and do not start
-over. Preserve the Idea, primary estimand, public model, benchmark, and all
-parts of the prior plan. Repair only deterministic draft/compiler/plan
-validation failures recorded in prior failed-attempt feedback. Legacy
-open-ended Design-review requests are not authoritative and must not be
-replayed.
+over. Preserve the Idea, primary estimand, and all scientific parts of the
+prior plan. Preserve its public model and benchmark only when they remain in
+the executable resource manifest below; otherwise replace them with exact
+manifest entries. Repair only deterministic draft/compiler/plan validation
+failures recorded in prior failed-attempt feedback. Legacy open-ended
+Design-review requests are not authoritative and must not be replayed.
 
 PRIOR PLAN TO EDIT:
 {json.dumps(previous_plan, ensure_ascii=False, indent=2)[:18000]}
@@ -453,6 +471,12 @@ SUPPORTED PROTOCOL TEMPLATES:
 
 INFERRED TEMPLATE FOR THIS IDEA:
 {json.dumps(inferred_template, ensure_ascii=False)}
+
+EXECUTABLE RESOURCE MANIFEST:
+- subject models: {json.dumps(list(self.available_models), ensure_ascii=False)}
+- public benchmarks: {json.dumps(list(self.available_datasets), ensure_ascii=False)}
+When either list is non-empty, the typed draft must use an exact value from
+that list. Do not choose a nearby model size or a benchmark alias.
 
 IDEA:
 {json.dumps(idea.candidate, ensure_ascii=False, indent=2)}

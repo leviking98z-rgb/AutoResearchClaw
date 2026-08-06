@@ -213,6 +213,10 @@ def test_production_gpu_tasks_force_configured_offline_cache(
                 "execution": {
                     "gpu_dependency_mode": "offline",
                     "gpu_cache_dir": str(cache_dir),
+                    "available_models": [
+                        "Qwen/Qwen2.5-1.5B-Instruct"
+                    ],
+                    "available_datasets": ["openai/gsm8k"],
                     "allowed_env_keys": ["HF_TOKEN"],
                 },
                 "gpu": {

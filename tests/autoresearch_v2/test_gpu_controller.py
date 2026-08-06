@@ -220,6 +220,15 @@ def test_remote_smoke_infrastructure_classifier_reads_stdout() -> None:
         )
         == "gpu_task_lost"
     )
+    assert (
+        classify(
+            result={"pool_state": "lost", "error": "remote task lost"},
+            stdout="",
+            stderr="LocalEntryNotFoundError: offline cache miss",
+            returncode=1,
+        )
+        == "dependency_cache_miss"
+    )
 
 
 def test_controller_runs_build_smoke_on_gpu_pool_before_pilot(

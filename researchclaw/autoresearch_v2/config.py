@@ -85,6 +85,11 @@ class ExecutionConfig:
     gpu_dependency_mode: str = "online"
     gpu_cache_dir: str = ""
     gpu_cache_archive: str = ""
+    # In offline mode these are the exact immutable resources staged on every
+    # GPU node.  Keeping the manifest in config lets the Idea board and typed
+    # protocol compiler fail before spending LLM/GPU attempts on cache misses.
+    available_models: tuple[str, ...] = ()
+    available_datasets: tuple[str, ...] = ()
     allowed_env_keys: tuple[str, ...] = (
         "AUTORESEARCH_V2_ATTEMPT_ID",
         "AUTORESEARCH_V2_GPU_COUNT",
@@ -360,6 +365,18 @@ class V2Config:
                 for value in (env_keys_raw or ())
                 if str(value).strip()
             )
+
+        def _string_tuple(raw: object) -> tuple[str, ...]:
+            if isinstance(raw, str):
+                values = raw.split(",")
+            else:
+                values = raw or ()
+            return tuple(
+                str(value).strip()
+                for value in values
+                if str(value).strip()
+            )
+
         execution = ExecutionConfig(
             python_executable=str(
                 execution_raw.get("python_executable", "python")
@@ -395,6 +412,12 @@ class V2Config:
             gpu_cache_archive=str(
                 execution_raw.get("gpu_cache_archive", "") or ""
             ).strip(),
+            available_models=_string_tuple(
+                execution_raw.get("available_models", ())
+            ),
+            available_datasets=_string_tuple(
+                execution_raw.get("available_datasets", ())
+            ),
             allowed_env_keys=(
                 allowed_env_keys or ExecutionConfig().allowed_env_keys
             ),
@@ -911,6 +934,24 @@ class V2Config:
             raise ValueError(
                 "execution.gpu_cache_dir is required when "
                 "gpu_cache_archive is configured"
+            )
+        if (
+            self.execution.gpu_dependency_mode == "offline"
+            and self.gpu.enabled
+            and not self.execution.available_models
+        ):
+            raise ValueError(
+                "execution.available_models is required for offline GPU "
+                "dependencies"
+            )
+        if (
+            self.execution.gpu_dependency_mode == "offline"
+            and self.gpu.enabled
+            and not self.execution.available_datasets
+        ):
+            raise ValueError(
+                "execution.available_datasets is required for offline GPU "
+                "dependencies"
             )
         if not self.execution.python_executable.strip():
             raise ValueError("execution.python_executable is required")

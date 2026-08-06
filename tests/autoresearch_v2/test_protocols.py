@@ -302,6 +302,35 @@ def test_compiler_manifest_and_design_gate_view_have_disjoint_ownership() -> Non
     assert "required_runtime_evidence" not in view
 
 
+def test_compiler_enforces_exact_executable_resource_manifest() -> None:
+    plan = compile_screening_protocol(
+        _idea(),
+        _draft(),
+        available_models=("Qwen2.5-Coder-1.5B-Instruct",),
+        available_datasets=("HumanEval",),
+    )
+
+    assert plan["models"][0]["name"] == "Qwen2.5-Coder-1.5B-Instruct"
+    assert {item["resource_id"] for item in plan["datasets"]} == {
+        "HumanEval"
+    }
+
+    with pytest.raises(ValueError, match="subject model"):
+        compile_screening_protocol(
+            _idea(),
+            _draft(),
+            available_models=("Qwen/Qwen2.5-1.5B-Instruct",),
+            available_datasets=("HumanEval",),
+        )
+    with pytest.raises(ValueError, match="screening dataset"):
+        compile_screening_protocol(
+            _idea(),
+            _draft(),
+            available_models=("Qwen2.5-Coder-1.5B-Instruct",),
+            available_datasets=("openai/gsm8k",),
+        )
+
+
 def test_compiler_rejects_unbounded_protocols_and_missing_control() -> None:
     draft = _draft()
     draft["protocol_template"] = "arbitrary_free_form"

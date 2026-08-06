@@ -148,6 +148,9 @@ def infer_protocol_template(idea: IdeaRecord) -> str:
 def compile_screening_protocol(
     idea: IdeaRecord,
     draft: Mapping[str, Any],
+    *,
+    available_models: tuple[str, ...] = (),
+    available_datasets: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Compile one model draft into an executable screening contract.
 
@@ -189,9 +192,14 @@ def compile_screening_protocol(
         plan.get("dataset"),
         plan.get("datasets"),
         screening_access_policy=screening_access_policy,
+        available_datasets=available_datasets,
     )
     plan["screening_access_policy"] = screening_access_policy
-    plan["models"] = _compile_models(idea, plan.get("models"))
+    plan["models"] = _compile_models(
+        idea,
+        plan.get("models"),
+        available_models=available_models,
+    )
     plan["arms"] = _compile_arms(plan.get("arms"))
     plan["baselines"] = _compile_string_list(
         plan.get("baselines"),
@@ -829,6 +837,7 @@ def _compile_datasets(
     existing: Any,
     *,
     screening_access_policy: Mapping[str, bool],
+    available_datasets: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     names: list[str] = []
     if isinstance(dataset, str) and dataset.strip():
@@ -850,10 +859,16 @@ def _compile_datasets(
             if str(item or "").strip()
         )
     base = names[0] if names else "public benchmark"
+    if available_datasets and base not in available_datasets:
+        raise ValueError(
+            "screening dataset is not in the executable resource manifest: "
+            f"{base!r}; available={list(available_datasets)!r}"
+        )
     slug = _slug(base) or "benchmark"
     return [
         {
             "name": f"{base} development partition",
+            "resource_id": base,
             "split_role": "development",
             "split_id": f"{slug}-development-v1",
             "used_for_adaptation": True,
@@ -868,6 +883,7 @@ def _compile_datasets(
         },
         {
             "name": f"{base} screening partition",
+            "resource_id": base,
             "split_role": "screening",
             "split_id": f"{slug}-screening-v1",
             "used_for_adaptation": bool(
@@ -881,6 +897,7 @@ def _compile_datasets(
         },
         {
             "name": f"{base} confirmatory partition",
+            "resource_id": base,
             "split_role": "heldout_confirmatory",
             "split_id": f"{slug}-confirmatory-v1",
             "used_for_adaptation": False,
@@ -900,6 +917,8 @@ def _compile_datasets(
 def _compile_models(
     idea: IdeaRecord,
     value: Any,
+    *,
+    available_models: tuple[str, ...] = (),
 ) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     if isinstance(value, list):
@@ -916,7 +935,13 @@ def _compile_models(
         subjects = [
             item for item in result if _slug(item["role"]) == "subject"
         ]
-        return [subjects[0] if subjects else result[0]]
+        selected = subjects[0] if subjects else result[0]
+        if available_models and selected["name"] not in available_models:
+            raise ValueError(
+                "subject model is not in the executable resource manifest: "
+                f"{selected['name']!r}; available={list(available_models)!r}"
+            )
+        return [selected]
     candidates = idea.candidate.get("models", [])
     if isinstance(candidates, list):
         for item in candidates:
@@ -924,7 +949,15 @@ def _compile_models(
             if name:
                 result.append({"name": name, "role": "subject"})
     if result:
-        return [result[0]]
+        selected = result[0]
+        if available_models and selected["name"] not in available_models:
+            raise ValueError(
+                "subject model is not in the executable resource manifest: "
+                f"{selected['name']!r}; available={list(available_models)!r}"
+            )
+        return [selected]
+    if available_models:
+        return [{"name": available_models[0], "role": "subject"}]
     return [{"name": "open-weight model", "role": "subject"}]
 
 

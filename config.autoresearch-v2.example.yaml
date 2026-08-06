@@ -63,6 +63,10 @@ autoresearch_v2:
     # Optional immutable tar archive extracted once per allocated node before
     # Ray starts. Prefer a large-file sync/object-store path, not Ceph small files.
     gpu_cache_archive: ""
+    # Required when gpu_dependency_mode=offline. Use canonical identifiers
+    # exactly as generated code must pass them to transformers/datasets.
+    available_models: []
+    available_datasets: []
 
   gpu:
     enabled: false

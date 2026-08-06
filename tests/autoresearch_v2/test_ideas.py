@@ -171,6 +171,34 @@ def test_board_keeps_valid_candidates_when_one_candidate_is_invalid() -> None:
     )
 
 
+def test_board_prompt_binds_exact_executable_resources() -> None:
+    prompts: list[str] = []
+    candidate = _candidate()
+    candidate["datasets"] = ["openai/gsm8k"]
+    candidate["models"] = ["Qwen/Qwen2.5-1.5B-Instruct"]
+
+    class _Response:
+        content = json.dumps({"candidates": [candidate]})
+
+    class _Client:
+        def chat(self, messages, **kwargs):
+            del kwargs
+            prompts.append(messages[0]["content"])
+            return _Response()
+
+    generator = LLMBoardIdeaGenerator(
+        llm=_Client(),
+        brief="RSI mechanisms",
+        available_models=("Qwen/Qwen2.5-1.5B-Instruct",),
+        available_datasets=("openai/gsm8k",),
+    )
+
+    assert generator.generate(count=1, existing=[])
+    assert "Qwen/Qwen2.5-1.5B-Instruct" in prompts[0]
+    assert "openai/gsm8k" in prompts[0]
+    assert "Never\npropose a nearby size" in prompts[0]
+
+
 def test_designability_penalizes_reviewable_budget_and_access_uncertainty() -> None:
     candidate = _candidate()
     candidate["datasets"] = ["Acme Reasoning Suite"]

@@ -1063,7 +1063,11 @@ def test_design_continues_after_structured_role_exhausts_local_retries(
 
 
 def test_first_design_attempt_has_no_revision_directive() -> None:
-    prompt = DesignJobExecutor._prompt(
+    prompt = DesignJobExecutor(
+        _Role(_typed_draft()),
+        available_models=("Qwen/Qwen2.5-1.5B-Instruct",),
+        available_datasets=("openai/gsm8k",),
+    )._prompt(
         _idea(),
         prior_failure={},
     )
@@ -1075,6 +1079,8 @@ def test_first_design_attempt_has_no_revision_directive() -> None:
     assert '"screening_access_policy": {' in prompt
     assert "Controller creates disjoint" in prompt
     assert "Mechanical fields that the Controller owns" in prompt
+    assert "Qwen/Qwen2.5-1.5B-Instruct" in prompt
+    assert "openai/gsm8k" in prompt
 
 
 def test_design_structured_retry_repairs_prior_json_locally() -> None:

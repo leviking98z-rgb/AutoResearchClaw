@@ -681,11 +681,23 @@ class LLMBoardIdeaGenerator:
         brief: str,
         literature: LiteratureProvider | None = None,
         utility_llm: Any | None = None,
+        available_models: Iterable[str] = (),
+        available_datasets: Iterable[str] = (),
     ) -> None:
         self.llm = llm
         self.utility_llm = utility_llm
         self.brief = brief
         self.literature = literature
+        self.available_models = tuple(
+            str(value).strip()
+            for value in available_models
+            if str(value).strip()
+        )
+        self.available_datasets = tuple(
+            str(value).strip()
+            for value in available_datasets
+            if str(value).strip()
+        )
         self.round = 0
         self.last_context = LiteratureContext()
         self.last_rejections: list[dict[str, Any]] = []
@@ -850,6 +862,12 @@ Prior/active archive to avoid repeating:
 
 Recent and reusable literature evidence from InfoHub:
 {json.dumps(list(literature.papers), ensure_ascii=False, indent=2)[:24000]}
+
+Executable resource manifest for this deployment:
+- subject models: {json.dumps(list(self.available_models), ensure_ascii=False)}
+- public benchmarks: {json.dumps(list(self.available_datasets), ensure_ascii=False)}
+When either list is non-empty, choose exact values from that list only. Never
+propose a nearby size, legacy alias, or uncached substitute.
 
 Each candidate must test a mechanism of LLM/agent recursive self-improvement,
 not merely benchmark a prompt. Favor ideas whose cheap pilot can falsify the

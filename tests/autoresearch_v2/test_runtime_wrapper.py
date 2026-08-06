@@ -19,11 +19,13 @@ def _plan() -> dict[str, object]:
         "datasets": [
             {
                 "name": "GSM8K-development",
+                "resource_id": "openai/gsm8k",
                 "split_role": "development",
                 "split_id": "gsm8k-dev-v1",
             },
             {
                 "name": "GSM8K-screening",
+                "resource_id": "openai/gsm8k",
                 "split_role": "screening",
                 "split_id": "gsm8k-screen-v1",
             },
@@ -130,6 +132,9 @@ def test_runtime_wrapper_compiles_and_is_idempotent(tmp_path: Path) -> None:
     assert runtime["wrapper_version"] == WRAPPER_VERSION
     assert runtime["seeds"] == [7]
     assert runtime["gpu_count"] == 1
+    assert runtime["dataset_roles"]["GSM8K-development"]["resource_id"] == (
+        "openai/gsm8k"
+    )
     assert runtime["criterion_results"] == {
         "completed_examples": {"value": 4, "passed": True},
         "primary_effect": {"value": 0.20, "passed": True},

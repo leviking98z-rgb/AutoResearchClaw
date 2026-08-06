@@ -25,7 +25,7 @@ from typing import Any
 
 WRAPPER_FILENAME = "_autoresearch_runtime.py"
 WRAPPER_SCHEMA = "autoresearch_v2.controller_runtime"
-WRAPPER_VERSION = 3
+WRAPPER_VERSION = 4
 RAW_DIRNAME = "_raw"
 
 
@@ -484,6 +484,9 @@ def _compile_dataset_contract(
             "role": role,
             "split_id": split_id,
         }
+        resource_id = str(item.get("resource_id", "") or "").strip()
+        if resource_id:
+            declaration["resource_id"] = resource_id
         if role == "confirmatory":
             declaration["untouched"] = bool(
                 item.get(

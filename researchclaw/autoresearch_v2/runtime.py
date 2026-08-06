@@ -76,6 +76,8 @@ def build_production_controller(
         brief=config.topic_brief,
         literature=literature,
         utility_llm=router.utility,
+        available_models=config.execution.available_models,
+        available_datasets=config.execution.available_datasets,
     )
     decision_gate = LLMDecisionGate(client=router.decision)
     design = DesignJobExecutor(
@@ -89,6 +91,8 @@ def build_production_controller(
         ),
         decision_gate=decision_gate,
         max_revisions=config.budgets.max_design_revisions,
+        available_models=config.execution.available_models,
+        available_datasets=config.execution.available_datasets,
     )
     build = BuildJobExecutor(
         StructuredRole(
@@ -212,6 +216,8 @@ def build_production_controller(
         gpu_manager=gpu_manager,
         configured_gpu_capacity=configured_gpu_capacity,
         research_memory=research_memory,
+        available_models=config.execution.available_models,
+        available_datasets=config.execution.available_datasets,
     )
     if gpu_broker_error:
         controller.store.initialize(recover_filesystem=False)

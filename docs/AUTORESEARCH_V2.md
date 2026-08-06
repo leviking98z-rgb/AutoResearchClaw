@@ -269,6 +269,13 @@ attestation succeeds. `execution.smoke_environment` may be `auto`
 (recommended), `gpu_pool`, or `local`; `auto` selects the GPU pool when GPU
 execution is enabled and local execution otherwise.
 
+For offline pools, the immutable cache is also a scheduling contract. Configure
+`execution.available_models` and `execution.available_datasets` with canonical
+identifiers that are physically staged in `gpu_cache_dir`. The Idea board and
+typed Design compiler may select only those identifiers; a deterministic
+offline cache miss is returned to Build rather than retried forever as transient
+infrastructure.
+
 Generated shell programs are not accepted. Build commands are normalized into
 direct Python `argv` and checked against an allowlist. Before Pilot/Scale, the
 Controller writes `execution_contract.json` containing the exact argv, bound

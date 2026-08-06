@@ -143,6 +143,10 @@ def test_offline_gpu_dependencies_require_cache_dir(tmp_path) -> None:
                     "gpu_dependency_mode": "OFFLINE",
                     "gpu_cache_dir": "/data/cache/autoresearch-v2/huggingface",
                     "gpu_cache_archive": "/root/sync/autoresearch-cache.tar",
+                    "available_models": [
+                        "Qwen/Qwen2.5-1.5B-Instruct"
+                    ],
+                    "available_datasets": ["openai/gsm8k"],
                 },
                 "gpu": {
                     "enabled": True,
@@ -155,6 +159,37 @@ def test_offline_gpu_dependencies_require_cache_dir(tmp_path) -> None:
     assert config.execution.gpu_dependency_mode == "offline"
     assert config.execution.gpu_cache_dir.endswith("huggingface")
     assert config.execution.gpu_cache_archive.endswith(".tar")
+    assert config.execution.available_models == (
+        "Qwen/Qwen2.5-1.5B-Instruct",
+    )
+    assert config.execution.available_datasets == ("openai/gsm8k",)
+
+
+def test_offline_gpu_dependencies_require_resource_manifest(
+    tmp_path,
+) -> None:
+    base = {
+        "autoresearch_v2": {
+            "state_dir": str(tmp_path / "runs" / "state"),
+            "execution": {
+                "gpu_dependency_mode": "offline",
+                "gpu_cache_dir": "/data/cache/autoresearch-v2/huggingface",
+            },
+            "gpu": {
+                "enabled": True,
+                "pool_config": str(tmp_path / "pool.yaml"),
+                "shared_workspace_root": str(tmp_path / "runs"),
+            },
+        }
+    }
+
+    with pytest.raises(ValueError, match="available_models"):
+        V2Config.from_mapping(base)
+    base["autoresearch_v2"]["execution"]["available_models"] = [
+        "Qwen/Qwen2.5-1.5B-Instruct"
+    ]
+    with pytest.raises(ValueError, match="available_datasets"):
+        V2Config.from_mapping(base)
 
 
 def test_attestation_key_cannot_live_in_generated_candidate(

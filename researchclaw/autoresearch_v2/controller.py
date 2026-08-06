@@ -110,6 +110,8 @@ class V2Controller:
         gpu_manager: Any | None = None,
         configured_gpu_capacity: int = 0,
         research_memory: ResearchMemory | None = None,
+        available_models: tuple[str, ...] = (),
+        available_datasets: tuple[str, ...] = (),
         sleep: Any = time.sleep,
     ) -> None:
         self.config = config
@@ -127,6 +129,16 @@ class V2Controller:
         self.gpu_broker = gpu_broker
         self.gpu_manager = gpu_manager
         self.research_memory = research_memory
+        self.available_models = tuple(
+            str(value).strip()
+            for value in available_models
+            if str(value).strip()
+        )
+        self.available_datasets = tuple(
+            str(value).strip()
+            for value in available_datasets
+            if str(value).strip()
+        )
         self.configured_gpu_capacity = max(
             0,
             int(configured_gpu_capacity),
@@ -593,6 +605,20 @@ class V2Controller:
         rejected = 0
         known = list(ideas)
         for idea in generated:
+            resource_reason = self._resource_manifest_rejection(idea)
+            if resource_reason:
+                idea.status = IdeaStatus.REJECTED
+                idea.exit_reason = resource_reason
+                self.store.save_idea(idea)
+                self.store.event(
+                    "idea_rejected",
+                    idea_id=idea.idea_id,
+                    reason=resource_reason,
+                    duplicate_of="",
+                )
+                rejected += 1
+                known.append(idea)
+                continue
             decision = self.admission.decide(idea, existing=known)
             if not decision.admitted:
                 idea.status = IdeaStatus.REJECTED
@@ -632,6 +658,90 @@ class V2Controller:
             "reservoir_added": added,
             "rejected": rejected,
         }
+
+    def _resource_manifest_rejection(self, idea: IdeaRecord) -> str:
+        """Reject Ideas that cannot execute on the configured offline pool."""
+
+        if self.available_models:
+            requested_models = idea.candidate.get("models", [])
+            if not isinstance(requested_models, list):
+                requested_models = []
+            missing_models = [
+                str(value).strip()
+                for value in requested_models
+                if str(value).strip()
+                and str(value).strip() not in self.available_models
+            ]
+            if missing_models:
+                return "resource_unavailable:model:" + ",".join(
+                    missing_models
+                )
+        if self.available_datasets:
+            requested_datasets = idea.candidate.get("datasets", [])
+            if not isinstance(requested_datasets, list):
+                requested_datasets = []
+            missing_datasets = [
+                str(value).strip()
+                for value in requested_datasets
+                if str(value).strip()
+                and str(value).strip() not in self.available_datasets
+            ]
+            if missing_datasets:
+                return "resource_unavailable:dataset:" + ",".join(
+                    missing_datasets
+                )
+        return ""
+
+    def _plan_resource_manifest_rejection(
+        self,
+        plan: Mapping[str, Any],
+    ) -> str:
+        """Reject a compiled Plan that cannot execute on this deployment."""
+
+        if self.available_models:
+            models = plan.get("models")
+            requested_models = [
+                str(item.get("name", "") or "").strip()
+                for item in models
+                if isinstance(item, Mapping)
+                and str(item.get("role", "subject") or "").strip().casefold()
+                == "subject"
+            ] if isinstance(models, list) else []
+            missing_models = [
+                value
+                for value in requested_models
+                if value and value not in self.available_models
+            ]
+            if not requested_models:
+                return "resource_unavailable:model:missing_subject"
+            if missing_models:
+                return "resource_unavailable:model:" + ",".join(
+                    missing_models
+                )
+        if self.available_datasets:
+            datasets = plan.get("datasets")
+            requested_datasets: list[str] = []
+            if isinstance(datasets, list):
+                for item in datasets:
+                    if not isinstance(item, Mapping):
+                        continue
+                    resource_id = str(
+                        item.get("resource_id", "") or ""
+                    ).strip()
+                    if resource_id:
+                        requested_datasets.append(resource_id)
+            missing_datasets = [
+                value
+                for value in requested_datasets
+                if value not in self.available_datasets
+            ]
+            if not requested_datasets:
+                return "resource_unavailable:dataset:missing_resource_id"
+            if missing_datasets:
+                return "resource_unavailable:dataset:" + ",".join(
+                    sorted(set(missing_datasets))
+                )
+        return ""
 
     def _running_llm_count(self) -> int:
         local = sum(
@@ -837,9 +947,8 @@ class V2Controller:
             remote_cancel_pending = False
             if job.status is JobStatus.RUNNING:
                 running = self._running.get(job.job_id)
-                if running is not None:
-                    if running.future.cancel():
-                        self._running.pop(job.job_id, None)
+                if running is not None and running.future.cancel():
+                    self._running.pop(job.job_id, None)
                 if (
                     job.requires_gpu
                     and job.submitted_task_id
@@ -1060,6 +1169,16 @@ class V2Controller:
                 break
             idea = self.store.get_idea(job.idea_id)
             if idea is None:
+                continue
+            resource_reason = self._plan_resource_manifest_rejection(
+                self._read_current_json(idea.idea_id, "plan.json")
+            )
+            if resource_reason:
+                self._reject_gpu_resource_mismatch(
+                    idea=idea,
+                    job=job,
+                    reason=resource_reason,
+                )
                 continue
             if self._block_unchanged_gpu_implementation(
                 idea=idea,
@@ -1398,6 +1517,38 @@ class V2Controller:
             f"{shlex.quote(str(candidate))}"
         )
         return command, output_dir
+
+    def _reject_gpu_resource_mismatch(
+        self,
+        *,
+        idea: IdeaRecord,
+        job: JobRecord,
+        reason: str,
+    ) -> None:
+        """Quarantine an impossible Plan before allocating a GPU."""
+
+        idea.status = IdeaStatus.QUARANTINED
+        idea.exit_reason = reason
+        idea.current_job_id = ""
+        idea.last_progress_at = utc_now()
+        job.status = JobStatus.FAILED
+        job.retry_not_before = ""
+        job.result = {
+            **job.result,
+            "decision": "quarantine",
+            "reason": reason,
+            "failure_class": "resource_unavailable",
+            "failure_code": "offline_resource_manifest_mismatch",
+            "blocked_before_gpu_submit": True,
+        }
+        self.store.save_job(job)
+        self.store.save_idea(idea)
+        self.store.event(
+            "gpu_job_rejected_resource_manifest",
+            idea_id=idea.idea_id,
+            job_id=job.job_id,
+            reason=reason,
+        )
 
     def _collect_gpu_finished(self) -> None:
         if self.gpu_broker is None:
@@ -1959,6 +2110,16 @@ class V2Controller:
                 ),
                 returncode=returncode,
             )
+            if (
+                infrastructure_code == "dependency_cache_miss"
+                and self.config.execution.gpu_dependency_mode == "offline"
+            ):
+                infrastructure_code = ""
+                validation["errors"].append(
+                    "offline dependency manifest mismatch; rebuild the Idea "
+                    "against execution.available_models/available_datasets "
+                    "or stage a new immutable cache archive"
+                )
             if infrastructure_code:
                 outcome = JobOutcome(
                     False,
@@ -2292,14 +2453,6 @@ class V2Controller:
                 str(result.get("error", "") or ""),
             )
         ).casefold()
-        if str(result.get("pool_state", "") or "") in {
-            "lost",
-            "unknown",
-            "probe_failed",
-        }:
-            return "gpu_task_lost"
-        if result.get("error"):
-            return "gpu_pool_collect_failed"
         if any(
             marker in text
             for marker in (
@@ -2313,6 +2466,14 @@ class V2Controller:
             )
         ):
             return "dependency_cache_miss"
+        if str(result.get("pool_state", "") or "") in {
+            "lost",
+            "unknown",
+            "probe_failed",
+        }:
+            return "gpu_task_lost"
+        if result.get("error"):
+            return "gpu_pool_collect_failed"
         if any(
             marker in text
             for marker in (
