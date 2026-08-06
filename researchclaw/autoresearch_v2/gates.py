@@ -508,6 +508,13 @@ writer to add unsupported assertions merely because they appeared in an
 earlier draft or possible follow-up. Aggregate disagreement, tie, and
 abstention rates describe separate observables and do not establish
 transition-level conversions.
+runtime.examples_processed is the canonical endpoint evaluation count. It is
+not required to equal the sum of runtime.examples_by_role because development
+examples are reported separately and are not endpoint evaluation units.
+When runtime.uncertainty.decision_role is "descriptive", an unavailable
+uncertainty interval is an explicit limitation, not a validity failure, unless
+a typed validity_criteria or promotion_criteria entry references an emitted
+uncertainty metric or interval bound.
 
 Return:
 {{

@@ -382,6 +382,11 @@ def test_report_gate_supplies_plan_to_reviewer() -> None:
     prompt = client.prompts[0]
     assert "PLAN:" in prompt
     assert '"promotion_criteria"' in prompt
+    assert (
+        "examples_processed is the canonical endpoint evaluation count"
+        in prompt
+    )
+    assert 'uncertainty.decision_role is "descriptive"' in prompt
 
 
 def test_design_preflight_uses_deterministic_blocker_code() -> None:

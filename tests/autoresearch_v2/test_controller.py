@@ -12,7 +12,13 @@ from researchclaw.autoresearch_v2.ideas import (
     candidate_to_idea,
 )
 from researchclaw.autoresearch_v2.jobs import JobOutcome, SimulatedJobExecutor
-from researchclaw.autoresearch_v2.models import IdeaStatus, JobKind, JobStatus
+from researchclaw.autoresearch_v2.models import (
+    AttemptRecord,
+    IdeaStatus,
+    JobKind,
+    JobRecord,
+    JobStatus,
+)
 from researchclaw.autoresearch_v2.store import V2Store
 
 
@@ -295,6 +301,43 @@ def test_report_job_uses_one_outer_attempt(tmp_path: Path) -> None:
     )
     assert report.attempt_limit == 1
     controller.request_stop()
+    controller._pool.shutdown(wait=True)
+
+
+def test_completed_negative_report_preserves_terminal_negative_status(
+    tmp_path: Path,
+) -> None:
+    controller = V2Controller(
+        config=_config(tmp_path),
+        store=V2Store(tmp_path),
+        generator=StaticIdeaGenerator([]),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    idea = candidate_to_idea(_candidate(0))
+    idea.status = IdeaStatus.REPORTING
+    idea.candidate["final_outcome"] = "informative_negative"
+    job = JobRecord(
+        job_id=f"{idea.idea_id}-report",
+        idea_id=idea.idea_id,
+        kind=JobKind.REPORT,
+    )
+    attempt = AttemptRecord(
+        attempt_id=f"{job.job_id}-attempt-01",
+        idea_id=idea.idea_id,
+        job_id=job.job_id,
+        number=1,
+    )
+
+    controller._apply_outcome(
+        idea,
+        job,
+        attempt,
+        JobOutcome(True, "complete", "paper_package_generated", {}),
+    )
+
+    assert idea.status is IdeaStatus.COMPLETED_NEGATIVE
+    assert job.status is JobStatus.SUCCEEDED
     controller._pool.shutdown(wait=True)
 
 

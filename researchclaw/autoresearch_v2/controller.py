@@ -2235,7 +2235,14 @@ class V2Controller:
                         JobKind.REPORT: IdeaStatus.COMPLETED,
                     }[job.kind]
             elif outcome.decision == "complete":
-                idea.status = IdeaStatus.COMPLETED
+                if (
+                    job.kind is JobKind.REPORT
+                    and idea.candidate.get("final_outcome")
+                    == "informative_negative"
+                ):
+                    idea.status = IdeaStatus.COMPLETED_NEGATIVE
+                else:
+                    idea.status = IdeaStatus.COMPLETED
                 idea.exit_reason = outcome.reason
             elif outcome.decision == "complete_negative":
                 # Valid negative evidence still receives a report.
@@ -2325,7 +2332,12 @@ class V2Controller:
                         JobKind.BUILD: IdeaStatus.PILOTING,
                         JobKind.PILOT: IdeaStatus.SCALING,
                         JobKind.SCALE: IdeaStatus.REPORTING,
-                        JobKind.REPORT: IdeaStatus.COMPLETED,
+                        JobKind.REPORT: (
+                            IdeaStatus.COMPLETED_NEGATIVE
+                            if idea.candidate.get("final_outcome")
+                            == "informative_negative"
+                            else IdeaStatus.COMPLETED
+                        ),
                     }[job.kind]
                 idea.last_progress_at = utc_now()
                 self.store.save_job(job)

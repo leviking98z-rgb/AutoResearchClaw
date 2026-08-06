@@ -1677,13 +1677,13 @@ def _collect_report_evidence(root: Path) -> dict[str, Any]:
                     "call_counts",
                     "examples_processed",
                     "examples_by_role",
-                    "example_diagnostics",
                     "gpu_count",
                     "model_loaded",
                     "datasets_loaded",
                     "dataset_roles",
                     "seeds",
                     "split_identifiers",
+                    "uncertainty",
                 )
                 if key in runtime
             },

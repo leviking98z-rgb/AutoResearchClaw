@@ -664,6 +664,10 @@ def _compile_uncertainty(value: Any) -> dict[str, Any]:
         "cluster_unit": cluster_unit,
         "confidence_level": float(confidence_level),
         "resamples": resamples,
+        # Screening promotion is decided by the typed criteria below. The
+        # interval is descriptive unless a separately declared promotion
+        # criterion names one of its emitted bounds.
+        "decision_role": "descriptive",
     }
     if "bootstrap" in method:
         # Bootstrap mechanics are Controller-owned so Design review does not

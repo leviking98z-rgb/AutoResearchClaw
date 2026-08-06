@@ -160,8 +160,9 @@ def test_report_evidence_uses_stable_nested_paths(tmp_path: Path) -> None:
                         "split_id": "gsm8k-screening-v1",
                     }
                 },
-                "example_diagnostics": {
-                    "canonical_examples_processed": 24,
+                "uncertainty": {
+                    "available": False,
+                    "decision_role": "descriptive",
                 },
                 "criterion_results": {
                     "primary_effect": {"value": 0.0, "passed": False}
@@ -180,9 +181,9 @@ def test_report_evidence_uses_stable_nested_paths(tmp_path: Path) -> None:
     assert evidence["pilot"]["runtime"]["dataset_roles"][
         "GSM8K screening"
     ]["role"] == "screening"
-    assert evidence["pilot"]["runtime"]["example_diagnostics"][
-        "canonical_examples_processed"
-    ] == 24
+    assert evidence["pilot"]["runtime"]["uncertainty"][
+        "decision_role"
+    ] == "descriptive"
 
 
 def test_report_retries_in_place_and_commits_corrected_package(

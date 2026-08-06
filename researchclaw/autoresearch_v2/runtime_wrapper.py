@@ -25,7 +25,7 @@ from typing import Any
 
 WRAPPER_FILENAME = "_autoresearch_runtime.py"
 WRAPPER_SCHEMA = "autoresearch_v2.controller_runtime"
-WRAPPER_VERSION = 2
+WRAPPER_VERSION = 3
 RAW_DIRNAME = "_raw"
 
 
@@ -152,6 +152,12 @@ def normalize_runtime_artifacts(
         raise RuntimeArtifactError(
             "generated artifacts contain no finite scalar metrics"
         )
+    uncertainty = _compile_uncertainty_evidence(
+        plan=plan,
+        raw_runtime=raw_runtime,
+        metrics=metrics,
+        mode=mode,
+    )
 
     model_loaded = raw_runtime.get("model_loaded")
     if not isinstance(model_loaded, str) or not model_loaded.strip():
@@ -214,6 +220,8 @@ def normalize_runtime_artifacts(
         runtime["metric_diagnostics"] = metric_diagnostics
     if example_diagnostics:
         runtime["example_diagnostics"] = example_diagnostics
+    if uncertainty:
+        runtime["uncertainty"] = uncertainty
 
     if mode == "smoke":
         evidence_valid = (
@@ -559,6 +567,60 @@ def _normalize_examples_processed(
         f"examples_by_role[{endpoint_role!r}]={endpoint_count}; "
         f"reported {reported}"
     )
+
+
+def _compile_uncertainty_evidence(
+    *,
+    plan: Mapping[str, Any],
+    raw_runtime: Mapping[str, Any],
+    metrics: Mapping[str, float | int],
+    mode: str,
+) -> dict[str, Any]:
+    """Expose auditable uncertainty without inventing unavailable samples.
+
+    Generated workers may emit a complete uncertainty object. Otherwise a
+    single-seed screening run cannot reconstruct a paired item bootstrap from
+    aggregate counts, so the controller records that limitation explicitly.
+    This does not invalidate a point-estimate decision unless a typed validity
+    or promotion criterion references an uncertainty metric.
+    """
+
+    if mode == "smoke":
+        return {}
+    configured = plan.get("uncertainty")
+    if not isinstance(configured, Mapping):
+        return {}
+    raw = raw_runtime.get("uncertainty")
+    if isinstance(raw, Mapping):
+        supplied = dict(raw)
+        supplied.setdefault("method", configured.get("method"))
+        supplied.setdefault(
+            "confidence_level",
+            configured.get("confidence_level"),
+        )
+        supplied.setdefault("decision_role", "descriptive")
+        return supplied
+    gate = plan.get("gate_statistic")
+    gate_name = str(
+        gate.get("name", "") if isinstance(gate, Mapping) else ""
+    )
+    return {
+        "available": False,
+        "method": configured.get("method"),
+        "confidence_level": configured.get("confidence_level"),
+        "resamples": configured.get("resamples"),
+        "rng_seed": configured.get("rng_seed"),
+        "undefined_resample_policy": configured.get(
+            "undefined_resample_policy"
+        ),
+        "decision_role": configured.get(
+            "decision_role",
+            "descriptive",
+        ),
+        "metric": gate_name,
+        "point_estimate": metrics.get(gate_name),
+        "reason": "item_level_paired_observations_not_emitted",
+    }
 
 
 def _normalize_call_counts(value: Any) -> dict[str, int]:

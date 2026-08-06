@@ -268,6 +268,7 @@ def test_compiler_owns_single_subject_model_and_bootstrap_mechanics() -> None:
     assert plan["pilot"]["development_examples"] == 16
     assert plan["uncertainty"]["rng_seed"] == 1729
     assert plan["uncertainty"]["interval"] == "percentile"
+    assert plan["uncertainty"]["decision_role"] == "descriptive"
     assert plan["uncertainty"]["undefined_resample_policy"] == "drop"
     assert plan["uncertainty"]["max_undefined_fraction"] == 0.05
     assert plan["uncertainty"]["excess_undefined_decision"] == "reject"

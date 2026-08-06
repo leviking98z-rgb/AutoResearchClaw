@@ -29,6 +29,14 @@ def _plan() -> dict[str, object]:
             },
         ],
         "gate_statistic": {"name": "paired_accuracy_difference"},
+        "uncertainty": {
+            "method": "paired_bootstrap",
+            "confidence_level": 0.9,
+            "resamples": 1000,
+            "rng_seed": 1729,
+            "undefined_resample_policy": "drop",
+            "decision_role": "descriptive",
+        },
         "validity_criteria": [
             {
                 "id": "completed_examples",
@@ -225,6 +233,18 @@ def test_runtime_wrapper_normalizes_legacy_all_role_example_total(
         "reported_examples_processed": 6,
         "canonical_examples_processed": 4,
         "normalization": "legacy_all_roles_total_to_endpoint_count",
+    }
+    assert runtime["uncertainty"] == {
+        "available": False,
+        "method": "paired_bootstrap",
+        "confidence_level": 0.9,
+        "resamples": 1000,
+        "rng_seed": 1729,
+        "undefined_resample_policy": "drop",
+        "decision_role": "descriptive",
+        "metric": "paired_accuracy_difference",
+        "point_estimate": 0.2,
+        "reason": "item_level_paired_observations_not_emitted",
     }
 
 
