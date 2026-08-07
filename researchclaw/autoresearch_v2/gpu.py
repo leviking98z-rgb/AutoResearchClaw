@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import math
 import os
+import re
 import socket
 import threading
 import uuid
@@ -19,6 +21,9 @@ from .gpu_lease import (
     stable_pool_identity,
 )
 from .models import JobRecord
+
+_MAX_POOL_TASK_ID_LENGTH = 128
+_TASK_NAMESPACE_LENGTH = 12
 
 
 class AsyncGPUPool(Protocol):
@@ -63,6 +68,36 @@ def _value(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(name, default)
     return getattr(value, name, default)
+
+
+def stable_task_namespace(value: str) -> str:
+    """Return a short, safe namespace for one controller system id."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("._-")
+    if not slug or not slug[0].isalnum():
+        slug = "run"
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+    prefix = slug[: _TASK_NAMESPACE_LENGTH - len(digest) - 1]
+    return f"{prefix}-{digest}" if prefix else digest
+
+
+def _new_pool_task_id(
+    job: JobRecord,
+    *,
+    task_namespace: str,
+) -> str:
+    """Build a deterministic pool id without truncation collisions."""
+
+    base = f"{job.job_id}-attempt-{job.attempt + 1:02d}"
+    candidate = f"{task_namespace}-{base}" if task_namespace else base
+    if len(candidate) <= _MAX_POOL_TASK_ID_LENGTH:
+        return candidate
+    digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:16]
+    prefix_length = _MAX_POOL_TASK_ID_LENGTH - len(digest) - 1
+    return f"{candidate[:prefix_length].rstrip('._-')}-{digest}"
 
 
 class AdaptiveGPUScheduler:
@@ -173,6 +208,7 @@ class GPUBroker:
         owner_id: str | None = None,
         lease_heartbeat_interval_sec: float | None = None,
         task_env: Mapping[str, str] | None = None,
+        task_namespace: str = "",
     ) -> None:
         self.pool = pool
         self.scheduler = scheduler
@@ -184,6 +220,7 @@ class GPUBroker:
             str(key): str(value)
             for key, value in (task_env or {}).items()
         }
+        self.task_namespace = stable_task_namespace(task_namespace)
         self.leases: dict[str, GPULease] = {}
         self.lease_registry = lease_registry
         self.owner_id = owner_id or (
@@ -236,7 +273,10 @@ class GPUBroker:
             )
         task_id = (
             job.submitted_task_id
-            or f"{job.job_id}-attempt-{job.attempt + 1:02d}"
+            or _new_pool_task_id(
+                job,
+                task_namespace=self.task_namespace,
+            )
         )
         if self.lease_registry is not None:
             self._refresh_global_leases()
@@ -592,6 +632,7 @@ def build_clusterbridge_broker(
     probe_failure_threshold: int = 3,
     task_env: Mapping[str, str] | None = None,
     restore_state: bool = True,
+    task_namespace: str = "",
 ) -> GPUBroker:
     """Adopt a prepared ClusterBridge/Ray pool without owning its lifecycle."""
 
@@ -625,6 +666,7 @@ def build_clusterbridge_broker(
         target_utilization=target_utilization,
         probe_failure_threshold=probe_failure_threshold,
         task_env=task_env,
+        task_namespace=task_namespace,
     )
 
 
@@ -638,6 +680,7 @@ def build_clusterbridge_broker_from_pool(
     probe_failure_threshold: int = 3,
     task_env: Mapping[str, str] | None = None,
     lease_registry_path: str | Path | None = None,
+    task_namespace: str = "",
 ) -> GPUBroker:
     """Build a broker around an already claimed and prepared pool object."""
 
@@ -682,6 +725,7 @@ def build_clusterbridge_broker_from_pool(
         probe_failure_threshold=probe_failure_threshold,
         lease_registry=lease_registry,
         task_env=task_env,
+        task_namespace=task_namespace,
     )
 
 

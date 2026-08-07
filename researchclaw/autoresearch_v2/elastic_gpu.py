@@ -152,6 +152,7 @@ class ResourceManagedGPUManager:
         ),
         monotonic: Callable[[], float] = time.monotonic,
         prepare_async: bool = True,
+        task_namespace: str = "",
     ) -> None:
         self.config = config
         self.elastic = config.resource_manager
@@ -161,6 +162,7 @@ class ResourceManagedGPUManager:
         }
         self.cache_dir = str(cache_dir or "").strip()
         self.cache_archive = str(cache_archive or "").strip()
+        self.task_namespace = str(task_namespace or "").strip()
         self.client = client or ClusterBridgeResourceClient(
             self.elastic.cb_command,
             owner=self.elastic.owner,
@@ -574,6 +576,7 @@ class ResourceManagedGPUManager:
             target_utilization=self.config.target_utilization,
             probe_failure_threshold=self.config.probe_failure_threshold,
             task_env=self.task_env,
+            task_namespace=self.task_namespace,
             lease_registry_path=(
                 Path("/root/.local/state/autoresearch-v2/gpu-leases")
                 / f"{pool_id}.sqlite3"

@@ -129,6 +129,65 @@ def test_broker_forwards_trusted_task_environment() -> None:
     assert environment["AUTORESEARCH_V2_IDEA_ID"] == "idea-env"
 
 
+def test_task_namespace_isolates_identical_jobs_between_runs() -> None:
+    pool = _SharedPool()
+    first = GPUBroker(
+        pool=pool,
+        scheduler=AdaptiveGPUScheduler(total_gpus=2),
+        task_namespace="rsi-canary-a",
+    )
+    second = GPUBroker(
+        pool=pool,
+        scheduler=AdaptiveGPUScheduler(total_gpus=2),
+        task_namespace="rsi-canary-b",
+    )
+    first_job = _job("same-idea", (1, 1, 1))
+    second_job = _job("same-idea", (1, 1, 1))
+    first_job.command = second_job.command = "true"
+
+    first_task = first.submit(first_job, priorities={}).task_id
+    second_task = second.submit(second_job, priorities={}).task_id
+
+    assert first_task != second_task
+    assert len(first_task) <= 128
+    assert len(second_task) <= 128
+    assert first_task in pool.requests
+    assert second_task in pool.requests
+
+
+def test_existing_submitted_task_id_is_preserved_across_namespace_change() -> None:
+    pool = _SharedPool()
+    broker = GPUBroker(
+        pool=pool,
+        scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        task_namespace="new-run",
+    )
+    job = _job("idea-resume", (1, 1, 1))
+    job.command = "true"
+    job.submitted_task_id = "legacy-task-id"
+
+    decision = broker.submit(job, priorities={})
+
+    assert decision.task_id == "legacy-task-id"
+    assert "legacy-task-id" in pool.requests
+
+
+def test_long_job_id_gets_bounded_collision_resistant_task_id() -> None:
+    pool = _SharedPool()
+    broker = GPUBroker(
+        pool=pool,
+        scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        task_namespace="rsi-canary-long",
+    )
+    job = _job("idea-" + ("x" * 180), (1, 1, 1))
+    job.command = "true"
+
+    task_id = broker.submit(job, priorities={}).task_id
+
+    assert len(task_id) <= 128
+    assert task_id in pool.requests
+
+
 def test_transient_probe_failure_keeps_lease() -> None:
     class Pool:
         def __init__(self) -> None:

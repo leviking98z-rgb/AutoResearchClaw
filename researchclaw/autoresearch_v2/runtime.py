@@ -171,6 +171,7 @@ def build_production_controller(
                 task_env=task_env,
                 cache_dir=config.execution.gpu_cache_dir,
                 cache_archive=config.execution.gpu_cache_archive,
+                task_namespace=config.system_id,
             )
             gpu_manager.bootstrap()
             broker = gpu_manager.broker
@@ -191,6 +192,7 @@ def build_production_controller(
                         config.gpu.probe_failure_threshold
                     ),
                     task_env=task_env,
+                    task_namespace=config.system_id,
                 )
             except ClusterPoolError as exc:
                 # Idea generation, Design, and Build do not require a live

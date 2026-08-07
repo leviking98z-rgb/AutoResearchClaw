@@ -287,6 +287,28 @@ def test_resource_manager_projects_cache_prepare_policy(
     )
 
 
+def test_resource_manager_passes_task_namespace_to_broker(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    client = _FakeResourceClient()
+    client.allocations = [_allocation()]
+    brokers = _BrokerFactory()
+    manager = ResourceManagedGPUManager(
+        config.gpu,
+        client=client,
+        pool_factory=_PoolFactory(),
+        broker_factory=brokers,
+        monotonic=lambda: 0.0,
+        prepare_async=False,
+        task_namespace="rsi-canary-seven",
+    )
+
+    manager.bootstrap()
+
+    assert brokers.calls[0]["task_namespace"] == "rsi-canary-seven"
+
+
 def test_resource_manager_can_pin_exact_allocation(tmp_path: Path) -> None:
     base = _config(tmp_path)
     raw = {
