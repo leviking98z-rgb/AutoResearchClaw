@@ -1199,7 +1199,14 @@ class V2Controller:
                 job=job,
                 attempt=attempt,
             )
-            candidate = self.store.snapshot_current(attempt)
+            candidate = self.store.snapshot_current(
+                attempt,
+                # Remote smoke is a Build validation job. It needs the
+                # accepted source and protocol, not prior runtime artifacts;
+                # copying those artifacts over CephFS can stall a controller
+                # tick for minutes before a one-example smoke run starts.
+                include_artifacts=not self._is_remote_smoke_job(job),
+            )
             try:
                 if self._is_remote_smoke_job(job):
                     command, output_dir = self._gpu_smoke_command(

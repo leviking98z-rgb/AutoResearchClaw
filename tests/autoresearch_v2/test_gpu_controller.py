@@ -786,6 +786,101 @@ def test_unchanged_remote_smoke_repair_is_blocked_before_gpu_submit(
     controller.close()
 
 
+def test_remote_smoke_dispatch_uses_source_only_snapshot(
+    tmp_path: Path,
+) -> None:
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
+                },
+            }
+        }
+    )
+    store = V2Store(tmp_path)
+    pool = _Pool()
+    controller = V2Controller(
+        config=config,
+        store=store,
+        generator=_NoopGenerator(),
+        gpu_broker=GPUBroker(
+            pool=pool,
+            scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        ),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    idea = candidate_to_idea(_candidate(0))
+    idea.status = IdeaStatus.PILOTING
+    current = store.current_dir(idea.idea_id)
+    current.mkdir(parents=True, exist_ok=True)
+    (current / "plan.json").write_text(
+        json.dumps({"required_runtime_evidence": []}),
+        encoding="utf-8",
+    )
+    (current / "main.py").write_text("print('smoke')\n", encoding="utf-8")
+    (current / "build.json").write_text(
+        json.dumps(
+            {
+                "files": {"main.py": "print('smoke')\n"},
+                "commands": {
+                    "smoke": ["python", "main.py"],
+                    "pilot": ["python", "main.py"],
+                    "scale": ["python", "main.py"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (current / "artifacts" / "pilot").mkdir(parents=True)
+    (current / "artifacts" / "pilot" / "historical.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    job = JobRecord(
+        job_id=f"{idea.idea_id}-pilot",
+        idea_id=idea.idea_id,
+        kind=JobKind.BUILD,
+        status=JobStatus.READY,
+        requires_gpu=True,
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+        result={"remote_smoke": True, "next_kind": "pilot"},
+    )
+    idea.current_job_id = job.job_id
+    store.save_idea(idea)
+    store.save_job(job)
+
+    captured: dict[str, object] = {}
+
+    def prepare_smoke(**kwargs):
+        candidate = Path(kwargs["candidate"])
+        captured["candidate"] = candidate
+        output = candidate / "artifacts" / "smoke"
+        output.mkdir(parents=True, exist_ok=True)
+        return "python main.py", output
+
+    controller._gpu_smoke_command = prepare_smoke  # type: ignore[method-assign]
+    controller._dispatch()
+
+    durable = store.get_job(job.job_id)
+    assert durable is not None
+    assert durable.status is JobStatus.RUNNING
+    attempt = store.get_attempt(durable.attempt_id)
+    assert attempt is not None
+    candidate = Path(captured["candidate"])
+    assert (candidate / "main.py").is_file()
+    assert not (candidate / "artifacts" / "pilot").exists()
+    assert (candidate / "artifacts" / "smoke").is_dir()
+    controller.close()
+
+
 def test_unchanged_pilot_contract_failure_is_blocked_before_gpu_submit(
     tmp_path: Path,
 ) -> None:
