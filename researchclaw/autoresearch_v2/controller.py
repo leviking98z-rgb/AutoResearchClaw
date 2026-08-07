@@ -1239,10 +1239,10 @@ class V2Controller:
             job.command = command
             job.expected_output_dir = str(output_dir)
             job.attempt_id = attempt.attempt_id
-            # Leave new task-id construction to GPUBroker so it can include the
-            # controller namespace. A non-empty value is only recovery evidence
-            # for a task that was durably submitted by an earlier process.
-            job.submitted_task_id = ""
+            job.submitted_task_id = self.gpu_broker.task_id_for(
+                job,
+                attempt_number=attempt.number,
+            )
             self.store.save_attempt(attempt)
             try:
                 decision = self.gpu_broker.submit(
@@ -2846,24 +2846,33 @@ class V2Controller:
             idea = self.store.get_idea(job.idea_id)
             if (
                 job.requires_gpu
-                and self.gpu_broker is not None
                 and job.submitted_task_id
             ):
-                self.gpu_broker.adopt(
-                    job,
-                    task_id=job.submitted_task_id,
-                    allocated_gpus=int(
-                        job.result.get("allocated_gpus", job.min_gpus) or 1
-                    ),
-                )
-                self.store.event(
-                    "gpu_job_adopted",
-                    idea_id=job.idea_id,
-                    job_id=job.job_id,
-                    attempt_id=job.attempt_id,
-                    task_id=job.submitted_task_id,
-                )
-                continue
+                if self.gpu_broker is not None:
+                    self.gpu_broker.adopt(
+                        job,
+                        task_id=job.submitted_task_id,
+                        allocated_gpus=int(
+                            job.result.get("allocated_gpus", job.min_gpus) or 1
+                        ),
+                    )
+                    self.store.event(
+                        "gpu_job_adopted",
+                        idea_id=job.idea_id,
+                        job_id=job.job_id,
+                        attempt_id=job.attempt_id,
+                        task_id=job.submitted_task_id,
+                    )
+                    continue
+                if self.gpu_manager is not None:
+                    self.store.event(
+                        "gpu_job_adoption_deferred",
+                        idea_id=job.idea_id,
+                        job_id=job.job_id,
+                        attempt_id=job.attempt_id,
+                        task_id=job.submitted_task_id,
+                    )
+                    continue
             accepted = (
                 self.store.get_attempt(job.attempt_id)
                 if job.attempt_id

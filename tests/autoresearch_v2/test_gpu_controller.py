@@ -882,6 +882,19 @@ def test_controller_submits_multiple_gpu_ideas_into_one_pool(
         assert request["command"]
         assert "execution_contract.json" in str(request["command"])
         assert "shell=False" in str(request["command"])
+    for task_id in pilot_requests:
+        job = next(
+            job
+            for job in store.list_jobs()
+            if job.submitted_task_id == task_id
+        )
+        assert job.result["task_id"] == task_id
+        assert any(
+            event["event_type"] == "gpu_job_submitted"
+            and event["job_id"] == job.job_id
+            and event["task_id"] == task_id
+            for event in store.list_events(limit=5000)
+        )
     contract_paths = list(
         tmp_path.rglob("execution_contract.json")
     )
@@ -895,6 +908,94 @@ def test_controller_submits_multiple_gpu_ideas_into_one_pool(
     assert any(
         idea.status in {IdeaStatus.SCALING, IdeaStatus.REPORTING}
         for idea in store.list_ideas()
+    )
+    controller._pool.shutdown(wait=True)
+
+
+def test_elastic_recovery_defers_gpu_adoption_until_broker_attaches(
+    tmp_path: Path,
+) -> None:
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "gpu": {
+                    "enabled": True,
+                    "mode": "resource_manager",
+                    "shared_workspace_root": str(tmp_path),
+                    "resource_manager": {
+                        "owner": "test-owner",
+                    },
+                },
+            }
+        }
+    )
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = candidate_to_idea(_candidate(0))
+    idea.status = IdeaStatus.PILOTING
+    idea.current_job_id = f"{idea.idea_id}-pilot"
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id=idea.current_job_id,
+        idea_id=idea.idea_id,
+        kind=JobKind.PILOT,
+        status=JobStatus.RUNNING,
+        attempt=1,
+        requires_gpu=True,
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+        attempt_id=f"{idea.current_job_id}-attempt-01",
+        submitted_task_id="legacy-running-task",
+        result={"allocated_gpus": 1},
+    )
+    store.save_job(job)
+
+    class DelayedManager:
+        broker = None
+        configured_capacity = 1
+
+        def reconcile(self) -> bool:
+            return False
+
+        def snapshot(self) -> dict[str, object]:
+            return {}
+
+    manager = DelayedManager()
+    controller = V2Controller(
+        config=config,
+        store=store,
+        generator=_NoopGenerator(),
+        gpu_manager=manager,
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+
+    durable = store.get_job(job.job_id)
+    assert durable is not None
+    assert durable.status is JobStatus.RUNNING
+    assert durable.submitted_task_id == "legacy-running-task"
+    assert any(
+        event["event_type"] == "gpu_job_adoption_deferred"
+        for event in store.list_events()
+    )
+
+    pool = _Pool()
+    broker = GPUBroker(
+        pool=pool,
+        scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        task_namespace="new-run",
+    )
+    manager.broker = broker
+    controller._reconcile_gpu_manager()
+
+    assert broker.leases[job.job_id].task_id == "legacy-running-task"
+    assert any(
+        event["event_type"] == "gpu_job_adopted"
+        and event.get("reconnect") is True
+        for event in store.list_events()
     )
     controller._pool.shutdown(wait=True)
 

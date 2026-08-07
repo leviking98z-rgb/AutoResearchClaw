@@ -88,10 +88,16 @@ def _new_pool_task_id(
     job: JobRecord,
     *,
     task_namespace: str,
+    attempt_number: int | None = None,
 ) -> str:
     """Build a deterministic pool id without truncation collisions."""
 
-    base = f"{job.job_id}-attempt-{job.attempt + 1:02d}"
+    number = (
+        job.attempt + 1
+        if attempt_number is None
+        else max(1, int(attempt_number))
+    )
+    base = f"{job.job_id}-attempt-{number:02d}"
     candidate = f"{task_namespace}-{base}" if task_namespace else base
     if len(candidate) <= _MAX_POOL_TASK_ID_LENGTH:
         return candidate
@@ -273,10 +279,7 @@ class GPUBroker:
             )
         task_id = (
             job.submitted_task_id
-            or _new_pool_task_id(
-                job,
-                task_namespace=self.task_namespace,
-            )
+            or self.task_id_for(job)
         )
         if self.lease_registry is not None:
             self._refresh_global_leases()
@@ -358,6 +361,20 @@ class GPUBroker:
             decision.allocated_gpus,
             "admitted",
             task_id,
+        )
+
+    def task_id_for(
+        self,
+        job: JobRecord,
+        *,
+        attempt_number: int | None = None,
+    ) -> str:
+        """Return the namespaced deterministic id for one new attempt."""
+
+        return _new_pool_task_id(
+            job,
+            task_namespace=self.task_namespace,
+            attempt_number=attempt_number,
         )
 
     def adopt(

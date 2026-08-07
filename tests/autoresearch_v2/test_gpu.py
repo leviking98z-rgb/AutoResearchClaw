@@ -188,6 +188,22 @@ def test_long_job_id_gets_bounded_collision_resistant_task_id() -> None:
     assert task_id in pool.requests
 
 
+def test_explicit_attempt_number_produces_distinct_task_ids() -> None:
+    broker = GPUBroker(
+        pool=_SharedPool(),
+        scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        task_namespace="retry-run",
+    )
+    job = _job("idea-retry", (1, 1, 1))
+
+    first = broker.task_id_for(job, attempt_number=1)
+    second = broker.task_id_for(job, attempt_number=2)
+
+    assert first != second
+    assert first.endswith("-attempt-01")
+    assert second.endswith("-attempt-02")
+
+
 def test_transient_probe_failure_keeps_lease() -> None:
     class Pool:
         def __init__(self) -> None:
