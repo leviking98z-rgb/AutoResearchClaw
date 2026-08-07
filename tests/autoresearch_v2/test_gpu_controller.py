@@ -1240,6 +1240,80 @@ def test_gpu_submission_failure_does_not_exhaust_scientific_attempts(
     controller.close()
 
 
+def test_startup_recovers_legacy_gpu_submission_quarantine(
+    tmp_path: Path,
+) -> None:
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
+                },
+                "budgets": {
+                    "max_job_attempts": 3,
+                },
+            }
+        }
+    )
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = candidate_to_idea(_candidate(0))
+    idea.status = IdeaStatus.QUARANTINED
+    idea.exit_reason = "gpu_submission_failed"
+    job = JobRecord(
+        job_id=f"{idea.idea_id}-pilot",
+        idea_id=idea.idea_id,
+        kind=JobKind.PILOT,
+        status=JobStatus.FAILED,
+        attempt=3,
+        attempt_limit=3,
+        requires_gpu=True,
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+        result={
+            "decision": "retry",
+            "reason": "gpu_submission_failed",
+            "error": "legacy keepalive failure",
+        },
+    )
+    store.save_idea(idea)
+    store.save_job(job)
+
+    controller = V2Controller(
+        config=config,
+        store=store,
+        generator=_NoopGenerator(),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+
+    recovered_idea = store.get_idea(idea.idea_id)
+    recovered_job = store.get_job(job.job_id)
+    assert recovered_idea is not None
+    assert recovered_job is not None
+    assert recovered_idea.status is IdeaStatus.PILOTING
+    assert recovered_idea.current_job_id == job.job_id
+    assert recovered_idea.exit_reason == ""
+    assert recovered_job.status is JobStatus.RETRY_WAIT
+    assert recovered_job.attempt == 0
+    assert recovered_job.result["failure_class"] == (
+        "infrastructure_transient"
+    )
+    assert recovered_job.result["consume_attempt"] is False
+    assert recovered_job.result["refunded_attempts"] == 3
+    assert any(
+        event["event_type"]
+        == "gpu_infrastructure_quarantine_recovered"
+        for event in store.list_events(limit=20)
+    )
+    controller.close()
+
+
 def test_runtime_contract_failure_with_raw_artifacts_returns_to_build(
     tmp_path: Path,
     monkeypatch,

@@ -199,6 +199,7 @@ class V2Controller:
         self.store.initialize(recover_filesystem=False)
         self.store.acquire_writer_lock()
         self.store.recover_filesystem_commits()
+        self._recover_quarantined_gpu_infrastructure_failures()
         self._restore_budget_pause_state()
         self._sync_gpu_budget_pause_state()
         self._reconcile_current_jobs()
@@ -2990,6 +2991,80 @@ class V2Controller:
                 status=job.status.value,
                 interrupted_attempt_id=interrupted_attempt_id,
                 attempt_refunded=refunded,
+                scientific_attempt=job.attempt,
+            )
+
+    def _recover_quarantined_gpu_infrastructure_failures(self) -> None:
+        """Refund Ideas quarantined solely by a prior GPU outage.
+
+        Older controllers counted ``gpu_submission_failed`` against the
+        scientific retry budget. Once the implementation classifies submission
+        failures as infrastructure-transient, startup can safely repair those
+        durable rows without reviving scientific contract failures.
+        """
+
+        for idea in self.store.list_ideas(
+            statuses={IdeaStatus.QUARANTINED}
+        ):
+            if idea.exit_reason != "gpu_submission_failed":
+                continue
+            candidates = [
+                job
+                for job in self.store.list_jobs()
+                if (
+                    job.idea_id == idea.idea_id
+                    and job.requires_gpu
+                    and job.status is JobStatus.FAILED
+                    and job.result.get("reason") == "gpu_submission_failed"
+                )
+            ]
+            if not candidates:
+                continue
+            candidates.sort(
+                key=lambda item: (item.updated_at, item.job_id),
+                reverse=True,
+            )
+            job = candidates[0]
+            try:
+                refunded_attempts = max(
+                    1,
+                    min(int(job.attempt), int(job.attempt_limit)),
+                )
+            except (TypeError, ValueError):
+                refunded_attempts = 1
+            job.attempt = max(0, job.attempt - refunded_attempts)
+            job.attempt_limit = max(
+                job.attempt_limit,
+                self.config.budgets.max_job_attempts,
+            )
+            job.status = JobStatus.RETRY_WAIT
+            job.retry_not_before = datetime.now(UTC).isoformat(
+                timespec="milliseconds"
+            )
+            job.attempt_id = ""
+            job.submitted_task_id = ""
+            job.result = {
+                **job.result,
+                "failure_class": "infrastructure_transient",
+                "consume_attempt": False,
+                "infrastructure_retries": int(
+                    job.result.get("infrastructure_retries", 0) or 0
+                )
+                + 1,
+                "recovered_quarantine": True,
+                "refunded_attempts": refunded_attempts,
+            }
+            idea.status = _STATUS_FOR_KIND[job.kind]
+            idea.current_job_id = job.job_id
+            idea.exit_reason = ""
+            idea.last_progress_at = utc_now()
+            self.store.save_job(job)
+            self.store.save_idea(idea)
+            self.store.event(
+                "gpu_infrastructure_quarantine_recovered",
+                idea_id=idea.idea_id,
+                job_id=job.job_id,
+                refunded_attempts=refunded_attempts,
                 scientific_attempt=job.attempt,
             )
 
