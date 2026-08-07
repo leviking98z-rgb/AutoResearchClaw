@@ -341,7 +341,8 @@ class V2Controller:
         # may replace or close the Broker between ticks. Refresh the pointer
         # before touching GPU tasks so a stale, already-closed Broker is never
         # asked to schedule new futures.
-        self._sync_gpu_broker_from_manager()
+        if self._sync_gpu_broker_from_manager():
+            self._record_gpu_broker_change()
         # Collect durable terminal GPU tasks before calculating allocation
         # demand. Otherwise a just-finished lease can retain capacity for
         # another resource-manager interval.
@@ -401,10 +402,15 @@ class V2Controller:
         if manager is None:
             return
         demand = self._gpu_resource_demand()
-        prior = self.gpu_broker
-        changed = manager.reconcile(**demand)
-        self._sync_gpu_broker_from_manager()
-        if not changed and prior is self.gpu_broker:
+        manager_changed = manager.reconcile(**demand)
+        pointer_changed = self._sync_gpu_broker_from_manager()
+        if not manager_changed and not pointer_changed:
+            return
+        self._record_gpu_broker_change()
+
+    def _record_gpu_broker_change(self) -> None:
+        manager = self.gpu_manager
+        if manager is None:
             return
         state = manager.snapshot()
         self.store.event(
@@ -416,15 +422,17 @@ class V2Controller:
         if self.gpu_broker is not None:
             self._adopt_interrupted_gpu_jobs()
 
-    def _sync_gpu_broker_from_manager(self) -> None:
+    def _sync_gpu_broker_from_manager(self) -> bool:
         manager = self.gpu_manager
         if manager is None:
-            return
+            return False
+        prior = self.gpu_broker
         self.gpu_broker = manager.broker
         self.configured_gpu_capacity = max(
             0,
             int(manager.configured_capacity),
         )
+        return prior is not self.gpu_broker
 
     def _gpu_resource_demand(self) -> dict[str, int]:
         """Return durable useful-work demand for the elastic GPU manager."""
