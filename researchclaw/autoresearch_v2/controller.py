@@ -96,6 +96,20 @@ class _ResearchMemorySync:
     future: concurrent.futures.Future[None]
 
 
+@dataclass(frozen=True, slots=True)
+class _GPUFinalizationResult:
+    outcome: JobOutcome | None = None
+    build_repair_reason: str = ""
+    build_repair_diagnostics: Mapping[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class _GPUFinalization:
+    future: concurrent.futures.Future[_GPUFinalizationResult]
+    job_id: str
+    attempt_id: str
+
+
 class V2Controller:
     """One controller, SQLite source of truth, isolated immutable attempts."""
 
@@ -178,7 +192,17 @@ class V2Controller:
             thread_name_prefix="autoresearch-v2-memory",
             on_shutdown=lambda: None,
         )
+        # GPU transport completion and scientific finalization are separate
+        # lifecycles. The broker releases physical GPUs as soon as a durable
+        # terminal payload is harvested; validation and strong-model review
+        # continue here without blocking the Controller heartbeat.
+        self._gpu_finalizer_pool = _ControllerThreadPool(
+            max_workers=max(1, config.concurrency.max_llm_jobs),
+            thread_name_prefix="autoresearch-v2-gpu-finalizer",
+            on_shutdown=lambda: None,
+        )
         self._running: dict[str, _Running] = {}
+        self._gpu_finalizing: dict[str, _GPUFinalization] = {}
         self._idea_generation: _IdeaGeneration | None = None
         self._research_memory_sync: _ResearchMemorySync | None = None
         self._idea_generation_failures = 0
@@ -203,6 +227,7 @@ class V2Controller:
         self._restore_budget_pause_state()
         self._sync_gpu_budget_pause_state()
         self._reconcile_current_jobs()
+        self._recover_pending_gpu_finalizations()
         self._recover_interrupted_jobs()
         self.store.recover_retry_candidate_workspaces()
         self._initialized = True
@@ -221,6 +246,10 @@ class V2Controller:
             cancel_futures=False,
         )
         self._idea_pool.shutdown(wait=True, cancel_futures=False)
+        self._gpu_finalizer_pool.shutdown(
+            wait=True,
+            cancel_futures=False,
+        )
         self._pool.shutdown(wait=True, cancel_futures=False)
         if self.gpu_manager is not None:
             self.gpu_manager.close()
@@ -270,6 +299,10 @@ class V2Controller:
                     wait=False,
                     cancel_futures=True,
                 )
+                self._gpu_finalizer_pool.shutdown(
+                    wait=False,
+                    cancel_futures=True,
+                )
                 self._pool.shutdown(wait=False, cancel_futures=True)
                 # ThreadPoolExecutor registers a private atexit hook that joins
                 # every worker even after shutdown(wait=False). Service stops
@@ -279,6 +312,7 @@ class V2Controller:
                 self._pool.detach_workers_for_process_exit()
                 self._idea_pool.detach_workers_for_process_exit()
                 self._research_memory_pool.detach_workers_for_process_exit()
+                self._gpu_finalizer_pool.detach_workers_for_process_exit()
                 # Do not synchronously probe or stop a remote pool from a
                 # POSIX-signal path. Any submitted GPU tasks remain durable and
                 # are adopted by startup recovery; the process exiting stops
@@ -296,16 +330,24 @@ class V2Controller:
         # request to finish every downstream stage. Drain only work that was
         # already submitted by the final tick. The next invocation resumes the
         # durable state and schedules subsequent jobs.
-        while self._running or self._idea_generation is not None:
+        while (
+            self._running
+            or self._gpu_finalizing
+            or self._idea_generation is not None
+        ):
             futures = [
                 entry.future for entry in self._running.values()
             ]
+            futures.extend(
+                entry.future for entry in self._gpu_finalizing.values()
+            )
             if self._idea_generation is not None:
                 futures.append(self._idea_generation.future)
             concurrent.futures.wait(
                 futures,
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
+            self._collect_gpu_finalizations()
             self._collect_finished()
             self._collect_idea_generation()
 
@@ -319,6 +361,7 @@ class V2Controller:
                 "controller_stop_requested",
                 reason=self._stop_reason,
                 running_futures=len(self._running),
+                gpu_finalizing=len(self._gpu_finalizing),
                 idea_generation_running=(
                     self._idea_generation is not None
                 ),
@@ -347,6 +390,8 @@ class V2Controller:
         # demand. Otherwise a just-finished lease can retain capacity for
         # another resource-manager interval.
         self._collect_gpu_finished()
+        self._collect_gpu_finalizations()
+        self._start_pending_gpu_finalizations()
         self._reconcile_gpu_manager()
         self._collect_finished()
         self._collect_idea_generation()
@@ -450,6 +495,8 @@ class V2Controller:
             if not job.requires_gpu:
                 continue
             if job.status is JobStatus.RUNNING:
+                if job.result.get("gpu_execution_complete"):
+                    continue
                 running.append(job)
                 continue
             if (
@@ -574,6 +621,7 @@ class V2Controller:
             not active
             and not ready
             and not self._running
+            and not self._gpu_finalizing
             and self._idea_generation is None
             and not gpu_running
         )
@@ -825,6 +873,7 @@ class V2Controller:
                 and job.kind in _LLM_KINDS
             )
         ) + int(self._idea_generation is not None)
+        local += len(self._gpu_finalizing)
         if self._simulation_mode:
             return local
         # A service restart deliberately detaches non-cancellable CLI-backed
@@ -833,6 +882,14 @@ class V2Controller:
         # minutes, so count live gateway children as well as this process's
         # in-memory futures before dispatching replacements.
         return max(local, _live_model_gateway_calls())
+
+    def _gpu_finalizer_capacity_available(self) -> bool:
+        if self._simulation_mode:
+            return True
+        return (
+            self._running_llm_count()
+            < self.config.concurrency.max_llm_jobs
+        )
 
     def _admit_reservoir(self) -> None:
         ideas = self.store.list_ideas()
@@ -1736,23 +1793,295 @@ class V2Controller:
                 str(result.get("stderr", "") or ""),
                 encoding="utf-8",
             )
-            returncode = int(result.get("returncode", -1))
-            elapsed_sec = float(result.get("elapsed_sec", 0.0) or 0.0)
-            allocated = int(
-                result.get(
-                    "allocated_gpus",
-                    job.result.get("allocated_gpus", 0),
-                )
-                or 0
+            result_path = attempt_dir / "pool_result.json"
+            self.store._atomic_json(result_path, dict(result))
+            attempt.output_manifest = {
+                **attempt.output_manifest,
+                "pool_result_path": str(result_path),
+            }
+            attempt.status = AttemptStatus.VALIDATING
+            attempt.error = ""
+            self.store.save_attempt(attempt)
+            job.result = {
+                **job.result,
+                "gpu_execution_complete": True,
+                "gpu_execution_completed_at": utc_now(),
+                "finalization_state": "pending",
+                "pool_result_path": str(result_path),
+            }
+            self.store.save_job(job)
+            self.store.event(
+                "gpu_execution_harvested",
+                idea_id=job.idea_id,
+                job_id=job.job_id,
+                attempt_id=attempt.attempt_id,
+                task_id=str(result.get("task_id", "")),
+                pool_state=str(result.get("pool_state", "")),
+                result_path=str(result_path),
             )
-            if str(result.get("pool_state", "")) == "submission_failed":
-                attempt.status = AttemptStatus.FAILED
-                attempt.error = str(
-                    result.get("error", "GPU submission failed")
+            self._start_gpu_finalization(job, attempt)
+
+    def _start_gpu_finalization(
+        self,
+        job: JobRecord,
+        attempt: AttemptRecord,
+    ) -> bool:
+        if job.job_id in self._gpu_finalizing:
+            return False
+        if (
+            job.status is not JobStatus.RUNNING
+            or not job.result.get("gpu_execution_complete")
+            or job.result.get("finalization_state") != "pending"
+        ):
+            return False
+        if not self._gpu_finalizer_capacity_available():
+            return False
+        job.result = {
+            **job.result,
+            "finalization_state": "running",
+            "finalization_started_at": utc_now(),
+        }
+        self.store.save_job(job)
+        try:
+            future = self._gpu_finalizer_pool.submit(
+                self._finalize_gpu_execution,
+                job.job_id,
+                attempt.attempt_id,
+            )
+        except Exception:
+            job.result = {
+                **job.result,
+                "finalization_state": "pending",
+            }
+            self.store.save_job(job)
+            raise
+        self._gpu_finalizing[job.job_id] = _GPUFinalization(
+            future=future,
+            job_id=job.job_id,
+            attempt_id=attempt.attempt_id,
+        )
+        self.store.event(
+            "gpu_finalization_started",
+            idea_id=job.idea_id,
+            job_id=job.job_id,
+            attempt_id=attempt.attempt_id,
+        )
+        return True
+
+    def _collect_gpu_finalizations(self) -> None:
+        for job_id, running in list(self._gpu_finalizing.items()):
+            if not running.future.done():
+                continue
+            self._gpu_finalizing.pop(job_id, None)
+            job = self.store.get_job(job_id)
+            attempt = self.store.get_attempt(running.attempt_id)
+            if job is None or attempt is None:
+                continue
+            idea = self.store.get_idea(job.idea_id)
+            if (
+                idea is None
+                or job.status is JobStatus.CANCELLED
+                or idea.status not in ACTIVE_IDEA_STATUSES
+                or idea.current_job_id != job.job_id
+            ):
+                if attempt.status in {
+                    AttemptStatus.CREATED,
+                    AttemptStatus.RUNNING,
+                    AttemptStatus.VALIDATING,
+                }:
+                    attempt.status = AttemptStatus.CANCELLED
+                    attempt.error = str(
+                        job.result.get("reason", "stale_job")
+                    )
+                    attempt.finished_at = utc_now()
+                    self.store.save_attempt(attempt)
+                self.store.event(
+                    "stale_gpu_finalization_discarded",
+                    idea_id=job.idea_id,
+                    job_id=job.job_id,
+                    attempt_id=attempt.attempt_id,
                 )
-                attempt.finished_at = utc_now()
-                self.store.save_attempt(attempt)
-                outcome = JobOutcome(
+                continue
+            try:
+                finalized = running.future.result()
+            except Exception as exc:  # noqa: BLE001
+                job.result = {
+                    **job.result,
+                    "finalization_state": "pending",
+                    "finalization_error": f"{type(exc).__name__}: {exc}",
+                }
+                self.store.save_job(job)
+                self.store.event(
+                    "gpu_finalization_failed",
+                    idea_id=job.idea_id,
+                    job_id=job.job_id,
+                    attempt_id=attempt.attempt_id,
+                    error=job.result["finalization_error"],
+                )
+                continue
+            if finalized.build_repair_reason:
+                diagnostics = dict(
+                    finalized.build_repair_diagnostics or {}
+                )
+                idea.candidate[
+                    "_autoresearch_v2_last_implementation_failure"
+                ] = diagnostics
+                self._queue_build_repair(
+                    idea=idea,
+                    job=job,
+                    attempt=attempt,
+                    reason=finalized.build_repair_reason,
+                    diagnostics=diagnostics,
+                )
+                continue
+            if finalized.outcome is None:
+                job.result = {
+                    **job.result,
+                    "finalization_state": "pending",
+                    "finalization_error": "missing finalization outcome",
+                }
+                self.store.save_job(job)
+                continue
+            self._apply_outcome(
+                idea,
+                job,
+                attempt,
+                finalized.outcome,
+            )
+
+    def _start_pending_gpu_finalizations(self) -> None:
+        for job in self.store.list_jobs(statuses={JobStatus.RUNNING}):
+            if not self._gpu_finalizer_capacity_available():
+                break
+            if (
+                not job.requires_gpu
+                or not job.result.get("gpu_execution_complete")
+                or job.result.get("finalization_state") != "pending"
+            ):
+                continue
+            attempt = (
+                self.store.get_attempt(job.attempt_id)
+                if job.attempt_id
+                else None
+            )
+            if attempt is not None:
+                self._start_gpu_finalization(job, attempt)
+
+    def _recover_pending_gpu_finalizations(self) -> None:
+        for job in self.store.list_jobs(statuses={JobStatus.RUNNING}):
+            if not job.requires_gpu or not job.result.get(
+                "gpu_execution_complete"
+            ):
+                continue
+            attempt = (
+                self.store.get_attempt(job.attempt_id)
+                if job.attempt_id
+                else None
+            )
+            if attempt is None:
+                continue
+            result_path = str(
+                job.result.get("pool_result_path", "") or ""
+            ).strip()
+            if not result_path:
+                result_path = str(
+                    self.store.attempt_dir(attempt) / "pool_result.json"
+                )
+            if not Path(result_path).is_file():
+                # A process can die between the Broker releasing its lease and
+                # the Controller durably writing the terminal payload. Do not
+                # treat an incomplete marker as recoverable finalization; fall
+                # back to normal interruption refund instead.
+                job.result = {
+                    **job.result,
+                    "gpu_execution_complete": False,
+                    "finalization_state": "",
+                    "finalization_recovery_error": (
+                        "durable pool_result.json missing"
+                    ),
+                }
+                self.store.save_job(job)
+                self.store.event(
+                    "gpu_finalization_recovery_invalid",
+                    idea_id=job.idea_id,
+                    job_id=job.job_id,
+                    attempt_id=attempt.attempt_id,
+                    result_path=result_path,
+                )
+                continue
+            job.result = {
+                **job.result,
+                "finalization_state": "pending",
+                "finalization_recovered_at": utc_now(),
+            }
+            self.store.save_job(job)
+            started = self._start_gpu_finalization(job, attempt)
+            self.store.event(
+                "gpu_finalization_recovered",
+                idea_id=job.idea_id,
+                job_id=job.job_id,
+                attempt_id=attempt.attempt_id,
+                started=started,
+            )
+
+    def _load_gpu_pool_result(
+        self,
+        job: JobRecord,
+        attempt: AttemptRecord,
+    ) -> dict[str, Any]:
+        configured = str(
+            job.result.get("pool_result_path", "") or ""
+        ).strip()
+        result_path = (
+            Path(configured)
+            if configured
+            else self.store.attempt_dir(attempt) / "pool_result.json"
+        )
+        expected_root = self.store.attempt_dir(attempt).resolve()
+        resolved = result_path.expanduser().resolve()
+        if not resolved.is_relative_to(expected_root):
+            raise ValueError(
+                "GPU pool result path escapes the durable attempt directory"
+            )
+        value = json.loads(resolved.read_text(encoding="utf-8"))
+        if not isinstance(value, Mapping):
+            raise TypeError("GPU pool result must be a JSON object")
+        return dict(value)
+
+    def _finalize_gpu_execution(
+        self,
+        job_id: str,
+        attempt_id: str,
+    ) -> _GPUFinalizationResult:
+        job = self.store.get_job(job_id)
+        attempt = self.store.get_attempt(attempt_id)
+        if job is None or attempt is None:
+            raise RuntimeError("durable GPU finalization state disappeared")
+        idea = self.store.get_idea(job.idea_id)
+        if idea is None:
+            raise RuntimeError("GPU finalization Idea disappeared")
+        result = self._load_gpu_pool_result(job, attempt)
+        attempt_dir = self.store.attempt_dir(attempt)
+        stdout_path = attempt_dir / "stdout.log"
+        stderr_path = attempt_dir / "stderr.log"
+        returncode = int(result.get("returncode", -1))
+        elapsed_sec = float(result.get("elapsed_sec", 0.0) or 0.0)
+        allocated = int(
+            result.get(
+                "allocated_gpus",
+                job.result.get("allocated_gpus", 0),
+            )
+            or 0
+        )
+        if str(result.get("pool_state", "")) == "submission_failed":
+            attempt.status = AttemptStatus.FAILED
+            attempt.error = str(
+                result.get("error", "GPU submission failed")
+            )
+            attempt.finished_at = utc_now()
+            self.store.save_attempt(attempt)
+            return _GPUFinalizationResult(
+                outcome=JobOutcome(
                     False,
                     "retry",
                     "gpu_submission_failed",
@@ -1763,280 +2092,56 @@ class V2Controller:
                     },
                     elapsed_sec=elapsed_sec,
                 )
-                job.attempt = max(job.attempt, attempt.number)
-                self._apply_outcome(idea, job, attempt, outcome)
-                continue
-            output_dir = (
-                Path(job.expected_output_dir)
-                if job.expected_output_dir
-                else self.store.attempt_dir(attempt)
-                / "candidate"
-                / "artifacts"
-                / (
-                    "smoke"
-                    if self._is_remote_smoke_job(job)
-                    else "pilot"
-                    if job.kind is JobKind.PILOT
-                    else "scale"
-                )
             )
-            if self._is_remote_smoke_job(job):
-                self._complete_remote_smoke(
-                    idea=idea,
-                    job=job,
-                    attempt=attempt,
-                    result=result,
-                    output_dir=output_dir,
-                    stdout_path=stdout_path,
-                    stderr_path=stderr_path,
-                    returncode=returncode,
-                    allocated_gpus=allocated,
-                    elapsed_sec=elapsed_sec,
-                )
-                continue
-            plan = self._read_current_json(idea.idea_id, "plan.json")
-            source_compiler = self._candidate_runtime_compiler(
-                output_dir.parent.parent
+        output_dir = (
+            Path(job.expected_output_dir)
+            if job.expected_output_dir
+            else attempt_dir
+            / "candidate"
+            / "artifacts"
+            / (
+                "smoke"
+                if self._is_remote_smoke_job(job)
+                else "pilot"
+                if job.kind is JobKind.PILOT
+                else "scale"
             )
-            active_compiler = self._runtime_compiler_identity()
-            if (
-                source_compiler
-                and source_compiler != active_compiler
-            ):
-                wrapper_path = (
-                    output_dir.parent.parent
-                    / "_autoresearch_runtime.py"
-                )
-                from .runtime_wrapper import wrapper_source
-
-                wrapper_path.write_text(
-                    wrapper_source(),
-                    encoding="utf-8",
-                )
-                self.store.event(
-                    "runtime_wrapper_refreshed",
-                    idea_id=idea.idea_id,
-                    job_id=job.job_id,
-                    attempt_id=attempt.attempt_id,
-                    previous=source_compiler,
-                    current=active_compiler,
-                )
-            wrapper = (
-                {"compiled": False, "simulation": True}
-                if self._simulation_mode
-                else self._normalize_controller_runtime_artifacts(
-                    output_dir=output_dir,
-                    plan=plan,
-                    mode=job.kind.value,
-                    allocated_gpus=allocated,
-                    returncode=returncode,
-                )
-            )
-            validation = validate_experiment_artifacts(output_dir)
-            if wrapper.get("error"):
-                validation["errors"] = [
-                    *validation.get("errors", []),
-                    str(wrapper["error"]),
-                ]
-                validation["ok"] = False
-            if self._simulation_mode:
-                validation["execution_attestation"] = {
-                    "simulation": True
-                }
-            else:
-                attestation = self._attest_gpu_execution(
-                    idea=idea,
-                    job=job,
-                    attempt=attempt,
-                    output_dir=output_dir,
-                    stdout_path=stdout_path,
-                    stderr_path=stderr_path,
-                    returncode=returncode,
-                    allocated_gpus=allocated,
-                    elapsed_sec=elapsed_sec,
-                )
-                if attestation.get("errors"):
-                    validation["errors"].extend(attestation["errors"])
-                    validation["ok"] = False
-                else:
-                    validation["execution_attestation"] = attestation
-            pilot_runtime = (
-                self._read_current_json(
-                    idea.idea_id,
-                    "artifacts/pilot/runtime_evidence.json",
-                )
-                if job.kind is JobKind.SCALE
-                else None
-            )
-            contract_errors = validate_runtime_against_contract(
-                plan=plan,
-                runtime_evidence=validation.get(
-                    "runtime_evidence",
-                    {},
-                ),
+        )
+        if self._is_remote_smoke_job(job):
+            outcome, repair = self._finalize_remote_smoke(
+                idea=idea,
+                job=job,
+                attempt=attempt,
+                result=result,
+                output_dir=output_dir,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                returncode=returncode,
                 allocated_gpus=allocated,
-                mode=job.kind.value,
-                pilot_runtime=pilot_runtime,
+                elapsed_sec=elapsed_sec,
             )
-            if contract_errors:
-                validation["errors"].extend(contract_errors)
-                validation["ok"] = False
-            attempt.output_manifest = {
-                **dict(result),
-                "output_dir": str(output_dir),
-                "files": validation.get("files", []),
-            }
-            attempt.validation = validation
-            if returncode != 0 or not validation["ok"]:
-                attempt.status = AttemptStatus.REJECTED
-                attempt.error = (
-                    f"returncode={returncode}; "
-                    + "; ".join(validation.get("errors", []))
-                )
-                attempt.finished_at = utc_now()
-                self.store.save_attempt(attempt)
-                raw_artifacts_present = (
-                    (output_dir / "_raw" / "metrics.json").is_file()
-                    and (
-                        output_dir
-                        / "_raw"
-                        / "runtime_evidence.json"
-                    ).is_file()
-                )
-                deterministic_contract_failure = bool(
-                    raw_artifacts_present
-                    and (wrapper.get("error") or contract_errors)
-                )
-                if deterministic_contract_failure:
-                    diagnostics = {
-                        "failure_class": "runtime_contract_invalid",
-                        "failure_code": (
-                            f"{job.kind.value}_runtime_contract_invalid"
-                        ),
-                        "source_stage": job.kind.value,
-                        "returncode": returncode,
-                        "errors": list(validation.get("errors", [])),
-                        **self._implementation_failure_fingerprint(
-                            idea_id=idea.idea_id,
-                            errors=list(validation.get("errors", [])),
-                        ),
-                    }
-                    idea.candidate[
-                        "_autoresearch_v2_last_implementation_failure"
-                    ] = diagnostics
-                    self._queue_build_repair(
-                        idea=idea,
-                        job=job,
-                        attempt=attempt,
-                        reason=(
-                            f"{job.kind.value}_runtime_contract_invalid"
-                        ),
-                        diagnostics=diagnostics,
-                    )
-                    continue
-                outcome = JobOutcome(
-                    False,
-                    "retry",
-                    "gpu_experiment_invalid",
-                    {
-                        "returncode": returncode,
-                        "validation": validation,
-                        "pool_result": dict(result),
-                    },
-                    elapsed_sec=elapsed_sec,
-                )
-            else:
-                gate = _experiment_gate(validation["metrics"])
-                decision_gate = getattr(
-                    self.executors.get(job.kind),
-                    "decision_gate",
-                    None,
-                )
-                gate_tokens = 0
-                if decision_gate is not None:
-                    verdict = decision_gate.review_experiment(
-                        idea,
-                        kind=job.kind,
-                        plan=plan,
-                        metrics=validation["metrics"],
-                        runtime_evidence=validation["runtime_evidence"],
-                    )
-                    gate = {
-                        "decision": verdict.decision,
-                        "reason": verdict.reason,
-                        "confidence": verdict.confidence,
-                        "risks": list(verdict.risks),
-                        "required_changes": list(
-                            verdict.required_changes
-                        ),
-                    }
-                    gate_tokens = verdict.tokens
-                gate = resolve_experiment_lifecycle_gate(
-                    runtime_evidence=validation["runtime_evidence"],
-                    gate=gate,
-                )
-                decision_path = attempt_dir / "decision_review.json"
-                decision_path.write_text(
-                    json.dumps(
-                        gate,
-                        ensure_ascii=False,
-                        indent=2,
-                        sort_keys=True,
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                )
-                attempt.validation["decision_gate"] = gate
-                if gate["decision"] == "retry":
-                    attempt.status = AttemptStatus.REJECTED
-                    attempt.error = str(gate["reason"])
-                    attempt.finished_at = utc_now()
-                    self.store.save_attempt(attempt)
-                    outcome = JobOutcome(
-                        False,
-                        "retry",
-                        str(gate["reason"]),
-                        {
-                            "metrics": validation["metrics"],
-                            "gate": gate,
-                        },
-                        tokens=gate_tokens,
-                        elapsed_sec=elapsed_sec,
-                    )
-                else:
-                    attempt.status = AttemptStatus.VALIDATING
-                    attempt.finished_at = utc_now()
-                    self.store.save_attempt(attempt)
-                    self.store.commit_candidate(attempt)
-                    outcome = JobOutcome(
-                        True,
-                        str(gate["decision"]),
-                        str(gate["reason"]),
-                        {
-                            "metrics": validation["metrics"],
-                            "runtime_evidence": validation[
-                                "runtime_evidence"
-                            ],
-                            "gate": gate,
-                            "pool_result": dict(result),
-                        },
-                        tokens=gate_tokens,
-                        elapsed_sec=elapsed_sec,
-                    )
-            # Charge exact GPU seconds once. _apply_outcome receives zero GPU
-            # elapsed to avoid double counting.
-            idea.gpu_seconds_spent += allocated * max(0.0, elapsed_sec)
-            outcome = JobOutcome(
-                outcome.success,
-                outcome.decision,
-                outcome.reason,
-                outcome.result,
-                tokens=outcome.tokens,
-                elapsed_sec=0.0,
+            if repair is not None:
+                return repair
+        else:
+            outcome, repair = self._finalize_gpu_experiment(
+                idea=idea,
+                job=job,
+                attempt=attempt,
+                result=result,
+                output_dir=output_dir,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                returncode=returncode,
+                allocated_gpus=allocated,
+                elapsed_sec=elapsed_sec,
             )
-            self._apply_outcome(idea, job, attempt, outcome)
+            if repair is not None:
+                return repair
+        # Exact GPU seconds are charged once in the Controller thread. The
+        # scientific worker returns elapsed time as the sole charge source.
+        return _GPUFinalizationResult(outcome=outcome)
 
-    def _complete_remote_smoke(
+    def _finalize_gpu_experiment(
         self,
         *,
         idea: IdeaRecord,
@@ -2049,7 +2154,230 @@ class V2Controller:
         returncode: int,
         allocated_gpus: int,
         elapsed_sec: float,
-    ) -> None:
+    ) -> tuple[JobOutcome, _GPUFinalizationResult | None]:
+        attempt_dir = self.store.attempt_dir(attempt)
+        plan = self._read_current_json(idea.idea_id, "plan.json")
+        source_compiler = self._candidate_runtime_compiler(
+            output_dir.parent.parent
+        )
+        active_compiler = self._runtime_compiler_identity()
+        if source_compiler and source_compiler != active_compiler:
+            wrapper_path = (
+                output_dir.parent.parent / "_autoresearch_runtime.py"
+            )
+            from .runtime_wrapper import wrapper_source
+
+            wrapper_path.write_text(wrapper_source(), encoding="utf-8")
+            self.store.event(
+                "runtime_wrapper_refreshed",
+                idea_id=idea.idea_id,
+                job_id=job.job_id,
+                attempt_id=attempt.attempt_id,
+                previous=source_compiler,
+                current=active_compiler,
+            )
+        wrapper = (
+            {"compiled": False, "simulation": True}
+            if self._simulation_mode
+            else self._normalize_controller_runtime_artifacts(
+                output_dir=output_dir,
+                plan=plan,
+                mode=job.kind.value,
+                allocated_gpus=allocated_gpus,
+                returncode=returncode,
+            )
+        )
+        validation = validate_experiment_artifacts(output_dir)
+        if wrapper.get("error"):
+            validation["errors"] = [
+                *validation.get("errors", []),
+                str(wrapper["error"]),
+            ]
+            validation["ok"] = False
+        if self._simulation_mode:
+            validation["execution_attestation"] = {"simulation": True}
+        else:
+            attestation = self._attest_gpu_execution(
+                idea=idea,
+                job=job,
+                attempt=attempt,
+                output_dir=output_dir,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                returncode=returncode,
+                allocated_gpus=allocated_gpus,
+                elapsed_sec=elapsed_sec,
+            )
+            if attestation.get("errors"):
+                validation["errors"].extend(attestation["errors"])
+                validation["ok"] = False
+            else:
+                validation["execution_attestation"] = attestation
+        pilot_runtime = (
+            self._read_current_json(
+                idea.idea_id,
+                "artifacts/pilot/runtime_evidence.json",
+            )
+            if job.kind is JobKind.SCALE
+            else None
+        )
+        contract_errors = validate_runtime_against_contract(
+            plan=plan,
+            runtime_evidence=validation.get("runtime_evidence", {}),
+            allocated_gpus=allocated_gpus,
+            mode=job.kind.value,
+            pilot_runtime=pilot_runtime,
+        )
+        if contract_errors:
+            validation["errors"].extend(contract_errors)
+            validation["ok"] = False
+        attempt.output_manifest = {
+            **attempt.output_manifest,
+            **dict(result),
+            "output_dir": str(output_dir),
+            "files": validation.get("files", []),
+        }
+        attempt.validation = validation
+        if returncode != 0 or not validation["ok"]:
+            attempt.status = AttemptStatus.REJECTED
+            attempt.error = (
+                f"returncode={returncode}; "
+                + "; ".join(validation.get("errors", []))
+            )
+            attempt.finished_at = utc_now()
+            self.store.save_attempt(attempt)
+            raw_artifacts_present = (
+                (output_dir / "_raw" / "metrics.json").is_file()
+                and (
+                    output_dir / "_raw" / "runtime_evidence.json"
+                ).is_file()
+            )
+            if raw_artifacts_present and (
+                wrapper.get("error") or contract_errors
+            ):
+                diagnostics = {
+                    "failure_class": "runtime_contract_invalid",
+                    "failure_code": (
+                        f"{job.kind.value}_runtime_contract_invalid"
+                    ),
+                    "source_stage": job.kind.value,
+                    "returncode": returncode,
+                    "errors": list(validation.get("errors", [])),
+                    **self._implementation_failure_fingerprint(
+                        idea_id=idea.idea_id,
+                        errors=list(validation.get("errors", [])),
+                    ),
+                }
+                return (
+                    JobOutcome(False, "retry", "", {}),
+                    _GPUFinalizationResult(
+                        build_repair_reason=(
+                            f"{job.kind.value}_runtime_contract_invalid"
+                        ),
+                        build_repair_diagnostics=diagnostics,
+                    ),
+                )
+            return (
+                JobOutcome(
+                    False,
+                    "retry",
+                    "gpu_experiment_invalid",
+                    {
+                        "returncode": returncode,
+                        "validation": validation,
+                        "pool_result": dict(result),
+                    },
+                    elapsed_sec=elapsed_sec,
+                ),
+                None,
+            )
+        gate = _experiment_gate(validation["metrics"])
+        decision_gate = getattr(
+            self.executors.get(job.kind),
+            "decision_gate",
+            None,
+        )
+        gate_tokens = 0
+        if decision_gate is not None:
+            verdict = decision_gate.review_experiment(
+                idea,
+                kind=job.kind,
+                plan=plan,
+                metrics=validation["metrics"],
+                runtime_evidence=validation["runtime_evidence"],
+            )
+            gate = {
+                "decision": verdict.decision,
+                "reason": verdict.reason,
+                "confidence": verdict.confidence,
+                "risks": list(verdict.risks),
+                "required_changes": list(verdict.required_changes),
+            }
+            gate_tokens = verdict.tokens
+        gate = resolve_experiment_lifecycle_gate(
+            runtime_evidence=validation["runtime_evidence"],
+            gate=gate,
+        )
+        decision_path = attempt_dir / "decision_review.json"
+        self.store._atomic_json(decision_path, gate)
+        attempt.output_manifest["decision_review_path"] = str(
+            decision_path
+        )
+        attempt.validation["decision_gate"] = gate
+        if gate["decision"] == "retry":
+            attempt.status = AttemptStatus.REJECTED
+            attempt.error = str(gate["reason"])
+            attempt.finished_at = utc_now()
+            self.store.save_attempt(attempt)
+            return (
+                JobOutcome(
+                    False,
+                    "retry",
+                    str(gate["reason"]),
+                    {
+                        "metrics": validation["metrics"],
+                        "gate": gate,
+                    },
+                    tokens=gate_tokens,
+                    elapsed_sec=elapsed_sec,
+                ),
+                None,
+            )
+        attempt.status = AttemptStatus.VALIDATING
+        attempt.finished_at = utc_now()
+        self.store.save_attempt(attempt)
+        self.store.commit_candidate(attempt)
+        return (
+            JobOutcome(
+                True,
+                str(gate["decision"]),
+                str(gate["reason"]),
+                {
+                    "metrics": validation["metrics"],
+                    "runtime_evidence": validation["runtime_evidence"],
+                    "gate": gate,
+                    "pool_result": dict(result),
+                },
+                tokens=gate_tokens,
+                elapsed_sec=elapsed_sec,
+            ),
+            None,
+        )
+
+    def _finalize_remote_smoke(
+        self,
+        *,
+        idea: IdeaRecord,
+        job: JobRecord,
+        attempt: AttemptRecord,
+        result: Mapping[str, Any],
+        output_dir: Path,
+        stdout_path: Path,
+        stderr_path: Path,
+        returncode: int,
+        allocated_gpus: int,
+        elapsed_sec: float,
+    ) -> tuple[JobOutcome, _GPUFinalizationResult | None]:
         plan = self._read_current_json(idea.idea_id, "plan.json")
         wrapper = self._normalize_controller_runtime_artifacts(
             output_dir=output_dir,
@@ -2197,6 +2525,7 @@ class V2Controller:
             "errors": smoke_errors,
         }
         attempt.output_manifest = {
+            **attempt.output_manifest,
             **dict(result),
             "output_dir": str(output_dir),
         }
@@ -2274,10 +2603,6 @@ class V2Controller:
                     elapsed_sec=elapsed_sec,
                 )
             else:
-                idea.gpu_seconds_spent += allocated_gpus * max(
-                    0.0,
-                    elapsed_sec,
-                )
                 diagnostics = {
                     "failure_class": "runtime_contract_invalid",
                     "failure_code": "remote_smoke_validation_failed",
@@ -2304,31 +2629,14 @@ class V2Controller:
                         attempt_id=attempt.attempt_id,
                         fingerprint=diagnostics.get("fingerprint", ""),
                     )
-                idea.candidate[
-                    "_autoresearch_v2_last_implementation_failure"
-                ] = diagnostics
-                self._queue_build_repair(
-                    idea=idea,
-                    job=job,
-                    attempt=attempt,
-                    reason="remote_smoke_invalid",
-                    diagnostics=diagnostics,
+                return (
+                    JobOutcome(False, "retry", "", {}),
+                    _GPUFinalizationResult(
+                        build_repair_reason="remote_smoke_invalid",
+                        build_repair_diagnostics=diagnostics,
+                    ),
                 )
-                return
-        idea.gpu_seconds_spent += allocated_gpus * max(0.0, elapsed_sec)
-        self._apply_outcome(
-            idea,
-            job,
-            attempt,
-            JobOutcome(
-                outcome.success,
-                outcome.decision,
-                outcome.reason,
-                outcome.result,
-                tokens=outcome.tokens,
-                elapsed_sec=0.0,
-            ),
-        )
+        return outcome, None
 
     @staticmethod
     def _normalize_controller_runtime_artifacts(
@@ -3087,6 +3395,14 @@ class V2Controller:
             idea = self.store.get_idea(job.idea_id)
             if (
                 job.requires_gpu
+                and job.result.get("gpu_execution_complete")
+            ):
+                # The terminal GPU payload is already durable and its
+                # scientific finalizer was restored before this recovery pass.
+                # It needs neither GPU adoption nor attempt refund.
+                continue
+            if (
+                job.requires_gpu
                 and job.submitted_task_id
             ):
                 if self.gpu_broker is not None:
@@ -3324,6 +3640,7 @@ class V2Controller:
             if (
                 not job.requires_gpu
                 or not job.submitted_task_id
+                or job.result.get("gpu_execution_complete")
                 or job.job_id in broker.leases
             ):
                 continue
@@ -3798,6 +4115,7 @@ class V2Controller:
             "jobs_total": len(jobs),
             "jobs_by_status": jobs_by_status,
             "running_futures": len(self._running),
+            "gpu_finalizing": len(self._gpu_finalizing),
             "idea_generation_running": (
                 self._idea_generation is not None
             ),

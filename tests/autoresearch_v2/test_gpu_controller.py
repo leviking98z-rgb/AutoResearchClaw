@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from researchclaw.autoresearch_v2.config import V2Config
 from researchclaw.autoresearch_v2.controller import V2Controller
+from researchclaw.autoresearch_v2.gates import GateVerdict
 from researchclaw.autoresearch_v2.gpu import AdaptiveGPUScheduler, GPUBroker
 from researchclaw.autoresearch_v2.ideas import (
     StaticIdeaGenerator,
@@ -1767,6 +1771,8 @@ def test_runtime_contract_failure_with_raw_artifacts_returns_to_build(
     )
 
     controller._collect_gpu_finished()
+    controller._gpu_finalizing[job.job_id].future.result(timeout=2)
+    controller._collect_gpu_finalizations()
 
     durable_idea = store.get_idea(idea.idea_id)
     durable_job = store.get_job(job.job_id)
@@ -1779,5 +1785,269 @@ def test_runtime_contract_failure_with_raw_artifacts_returns_to_build(
     assert any(
         event["event_type"] == "gpu_implementation_returned_to_build"
         for event in store.list_events(limit=50)
+    )
+    controller.close()
+
+
+def _durable_pending_gpu_finalization(
+    *,
+    config: V2Config,
+    store: V2Store,
+    decision_gate,
+) -> tuple[V2Controller, JobRecord]:
+    controller = V2Controller(
+        config=config,
+        store=store,
+        generator=_NoopGenerator(),
+        executors={
+            JobKind.PILOT: SimpleNamespace(decision_gate=decision_gate),
+        },
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    idea = candidate_to_idea(_candidate(98))
+    idea.status = IdeaStatus.PILOTING
+    job = JobRecord(
+        job_id=f"{idea.idea_id}-pilot",
+        idea_id=idea.idea_id,
+        kind=JobKind.PILOT,
+        status=JobStatus.RUNNING,
+        attempt=1,
+        requires_gpu=True,
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+        result={
+            "allocated_gpus": 1,
+            "gpu_execution_complete": True,
+            "finalization_state": "pending",
+        },
+    )
+    attempt = store.create_attempt(
+        JobRecord(
+            job_id=job.job_id,
+            idea_id=job.idea_id,
+            kind=job.kind,
+        )
+    )
+    attempt.status = AttemptStatus.VALIDATING
+    job.attempt_id = attempt.attempt_id
+    idea.current_job_id = job.job_id
+    candidate = store.snapshot_current(attempt)
+    output_dir = candidate / "artifacts" / "pilot"
+    output_dir.mkdir(parents=True)
+    job.expected_output_dir = str(output_dir)
+    result_path = store.attempt_dir(attempt) / "pool_result.json"
+    store._atomic_json(
+        result_path,
+        {
+            "returncode": 0,
+            "elapsed_sec": 3.0,
+            "allocated_gpus": 1,
+            "pool_state": "finished",
+        },
+    )
+    job.result["pool_result_path"] = str(result_path)
+    store.save_idea(idea)
+    store.save_job(job)
+    store.save_attempt(attempt)
+    return controller, job
+
+
+def test_slow_gpu_decision_gate_does_not_block_controller_tick(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "researchclaw.autoresearch_v2.controller."
+        "_live_model_gateway_calls",
+        lambda: 0,
+    )
+
+    class BlockingGate:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def review_experiment(self, *args, **kwargs):
+            del args, kwargs
+            self.started.set()
+            assert self.release.wait(timeout=5)
+            return GateVerdict("promote", "measured signal", 0.9)
+
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "concurrency": {
+                    "max_llm_jobs": 2,
+                    "max_cpu_jobs": 2,
+                    "max_gpu_jobs": 1,
+                },
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
+                    "resource_manager": {"max_gpus": 1},
+                },
+            }
+        }
+    )
+    gate = BlockingGate()
+    controller, job = _durable_pending_gpu_finalization(
+        config=config,
+        store=V2Store(tmp_path),
+        decision_gate=gate,
+    )
+    validation = {
+        "ok": True,
+        "errors": [],
+        "metrics": {"decision": "promote"},
+        "runtime_evidence": {"gate_decision": "promote"},
+        "files": [],
+    }
+    monkeypatch.setattr(
+        "researchclaw.autoresearch_v2.controller."
+        "validate_experiment_artifacts",
+        lambda output: dict(validation),
+    )
+    monkeypatch.setattr(
+        "researchclaw.autoresearch_v2.controller."
+        "validate_runtime_against_contract",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        controller,
+        "_normalize_controller_runtime_artifacts",
+        lambda **kwargs: {"compiled": True},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_attest_gpu_execution",
+        lambda **kwargs: {"verified": True},
+    )
+
+    controller._start_pending_gpu_finalizations()
+    assert gate.started.wait(timeout=1)
+    started = time.monotonic()
+    snapshot = controller.tick()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.25
+    assert snapshot["gpu_finalizing"] == 1
+    assert controller._gpu_resource_demand() == {
+        "required_gpus": 0,
+        "pending_gpu_jobs": 0,
+        "running_gpu_jobs": 0,
+    }
+    gate.release.set()
+    controller._gpu_finalizing[job.job_id].future.result(timeout=2)
+    controller._collect_gpu_finalizations()
+    assert controller.store.get_job(job.job_id).status is JobStatus.SUCCEEDED
+    controller.close()
+
+
+def test_initialize_recovers_gpu_finalization_without_gpu_broker(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "researchclaw.autoresearch_v2.controller."
+        "_live_model_gateway_calls",
+        lambda: 0,
+    )
+
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "concurrency": {
+                    "max_llm_jobs": 2,
+                    "max_cpu_jobs": 2,
+                    "max_gpu_jobs": 1,
+                },
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
+                    "resource_manager": {"max_gpus": 1},
+                },
+            }
+        }
+    )
+    seed_store = V2Store(tmp_path)
+    seed_store.initialize()
+    gate = SimpleNamespace(
+        review_experiment=lambda *args, **kwargs: GateVerdict(
+            "promote",
+            "recovered measured signal",
+            0.9,
+        )
+    )
+    seed, job = _durable_pending_gpu_finalization(
+        config=config,
+        store=seed_store,
+        decision_gate=gate,
+    )
+    seed._gpu_finalizer_pool.shutdown(
+        wait=False,
+        cancel_futures=True,
+    )
+    seed._idea_pool.shutdown(wait=True)
+    seed._research_memory_pool.shutdown(wait=True)
+    seed._pool.shutdown(wait=True)
+    seed.store.release_writer_lock()
+
+    validation = {
+        "ok": True,
+        "errors": [],
+        "metrics": {"decision": "promote"},
+        "runtime_evidence": {"gate_decision": "promote"},
+        "files": [],
+    }
+    monkeypatch.setattr(
+        "researchclaw.autoresearch_v2.controller."
+        "validate_experiment_artifacts",
+        lambda output: dict(validation),
+    )
+    monkeypatch.setattr(
+        "researchclaw.autoresearch_v2.controller."
+        "validate_runtime_against_contract",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        V2Controller,
+        "_normalize_controller_runtime_artifacts",
+        staticmethod(lambda **kwargs: {"compiled": True}),
+    )
+    monkeypatch.setattr(
+        V2Controller,
+        "_attest_gpu_execution",
+        lambda self, **kwargs: {"verified": True},
+    )
+    controller = V2Controller(
+        config=config,
+        store=V2Store(tmp_path),
+        generator=_NoopGenerator(),
+        executors={
+            JobKind.PILOT: SimpleNamespace(decision_gate=gate),
+        },
+        gpu_broker=None,
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+
+    assert job.job_id in controller._gpu_finalizing
+    controller._gpu_finalizing[job.job_id].future.result(timeout=2)
+    controller._collect_gpu_finalizations()
+    durable = controller.store.get_job(job.job_id)
+    assert durable is not None
+    assert durable.status is JobStatus.SUCCEEDED
+    assert controller.gpu_broker is None
+    assert any(
+        event["event_type"] == "gpu_finalization_recovered"
+        for event in controller.store.list_events(limit=50)
     )
     controller.close()
