@@ -377,7 +377,7 @@ class ResourceManagedGPUManager:
                 broker.close()
             except Exception:  # noqa: BLE001, S110
                 pass
-        elif pool is not None:
+        if pool is not None:
             try:
                 pool.stop_keepalive()
             except Exception:  # noqa: BLE001, S110
@@ -605,12 +605,6 @@ class ResourceManagedGPUManager:
             # issued during its original preparation. Reassert the pause before
             # exposing the broker so daemon_gpu cannot consume otherwise idle
             # cards in the shared research pool.
-            # Older controllers may also have persisted a terminal legacy
-            # LeaseKeepalive failure. Stop it here so pool task probes/submits
-            # no longer consult stale per-node claim renewal health; the
-            # ResourceManagedGPUManager owns the authoritative allocation
-            # renewal in this mode.
-            pool.stop_keepalive()
             pool.pause_spin()
         broker = self.broker_factory(
             pool,
@@ -634,6 +628,12 @@ class ResourceManagedGPUManager:
             self._pool = pool
             self._broker = broker
             self._spin_paused_at = self._monotonic()
+        # Older controllers may have persisted a terminal legacy
+        # LeaseKeepalive failure. Stop it after publishing the broker: the
+        # central ResourceManagedGPUManager owns allocation renewal in this
+        # mode, and waiting for the legacy thread must not make attachment look
+        # unavailable during its join timeout.
+        pool.stop_keepalive()
 
     @staticmethod
     def _restore_allocated_pool_state(
