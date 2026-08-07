@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -757,6 +758,88 @@ def test_async_task_uses_ray_resource_reservation(tmp_path: Path) -> None:
     stdout_redirect = launch.index(f"{remote_task_dir}/stdout.log")
     assert command_group < stdout_redirect
     assert f"{remote_task_dir}/result.json" in launch
+    assert f"{remote_task_dir}/pid" in launch
+    assert f"{remote_task_dir}/launcher.log" in launch
+    assert str(task_dir / "pid") not in launch
+    assert str(task_dir / "launcher.log") not in launch
+
+
+def test_async_gpu_task_with_live_remote_pid_does_not_finish_lost(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    pool = ClusterBridgePool(
+        _config(tmp_path, node_count=1),
+        client=client,
+    )
+    pool.claim(start_keepalive=False)
+    pool._prepared = True
+    task_id = f"live-remote-pid-{tmp_path.name}"
+    remote_task_dir = (
+        Path("/tmp/researchclaw-autoresearch-v2")
+        / "test-pool"
+        / "tasks"
+        / task_id
+    )
+
+    def handler(node: ClusterNode, command: str) -> BridgeResult:
+        del node
+        if "nohup setsid --wait bash" in command:
+            return _result("77\n")
+        if "__RESEARCHCLAW_POOL_RESULT__" in command:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                executable="/bin/bash",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            return BridgeResult(
+                argv=("bash", "-lc", command),
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                elapsed_sec=0.01,
+            )
+        return _result()
+
+    client.run_handler = handler
+    try:
+        pool.submit_task(
+            "python train.py",
+            timeout_sec=30,
+            task_id=task_id,
+            num_gpus=1,
+            num_cpus=2,
+        )
+        launch = next(
+            call[2]
+            for call in client.calls
+            if call[0] == "run" and "nohup setsid --wait bash" in call[2]
+        )
+        assert f"rm -f {remote_task_dir}/result.json" in launch
+        assert f"{remote_task_dir}/pid" in launch
+        assert f"{remote_task_dir}/launcher.log" in launch
+
+        remote_task_dir.mkdir(parents=True, exist_ok=True)
+        (remote_task_dir / "pid").write_text(
+            f"{os.getpid()}\n",
+            encoding="utf-8",
+        )
+
+        probe = pool.probe_task(task_id)
+
+        assert probe.state == "running"
+        assert probe.returncode is None
+        assert not (
+            pool.state_dir / "tasks" / task_id / "summary.json"
+        ).exists()
+    finally:
+        subprocess.run(
+            ["rm", "-rf", str(remote_task_dir)],
+            check=False,
+        )
 
 
 def test_async_ray_task_returns_remote_trusted_gpu_evidence(

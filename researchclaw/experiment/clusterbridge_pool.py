@@ -932,8 +932,6 @@ class ClusterBridgePool:
                 "task_id must contain only letters, digits, '.', '_' or '-'"
             )
         task_dir = self._state_dir / "tasks" / task_id
-        result_path = task_dir / "result.json"
-        pid_path = task_dir / "pid"
 
         head = self.config.head_node
         ray_address = f"{head.ray_ip}:{self.config.ray.port}"
@@ -1167,6 +1165,8 @@ class ClusterBridgePool:
         execution_stdout_path = execution_root / "stdout.log"
         execution_stderr_path = execution_root / "stderr.log"
         execution_result_path = execution_root / "result.json"
+        execution_pid_path = execution_root / "pid"
+        execution_launcher_log_path = execution_root / "launcher.log"
         inner = (
             "set +e; "
             "trap '' HUP; "
@@ -1195,16 +1195,18 @@ class ClusterBridgePool:
             "set -euo pipefail; "
             f"mkdir -p {shlex.quote(str(task_dir))}; "
             f"{execution_root_setup}"
-            f"rm -f {shlex.quote(str(result_path))} "
-            f"{shlex.quote(str(pid_path))}; "
+            f"rm -f {shlex.quote(str(execution_result_path))} "
+            f"{shlex.quote(str(execution_pid_path))} "
+            f"{shlex.quote(str(execution_launcher_log_path))}; "
             # GNU setsid exits as soon as the launched program forks unless
             # --wait is requested. Ray's Python client may daemonize after it
             # connects, so tracking plain `setsid` can make a healthy GPU task
             # look lost before the remote result/evidence files are written.
             f"nohup setsid --wait bash -lc {shlex.quote(inner)} </dev/null "
-            f"> {shlex.quote(str(task_dir / 'launcher.log'))} 2>&1 & "
+            f"> {shlex.quote(str(execution_launcher_log_path))} 2>&1 & "
             "pid=$!; "
-            f"printf '%s\\n' \"$pid\" > {shlex.quote(str(pid_path))}; "
+            f"printf '%s\\n' \"$pid\" > "
+            f"{shlex.quote(str(execution_pid_path))}; "
             "printf '%s\\n' \"$pid\""
         )
 
