@@ -13,6 +13,7 @@ from researchclaw.autoresearch_v2.ideas import (
 )
 from researchclaw.autoresearch_v2.jobs import SimulatedJobExecutor
 from researchclaw.autoresearch_v2.models import (
+    AttemptStatus,
     IdeaStatus,
     JobKind,
     JobRecord,
@@ -1153,3 +1154,147 @@ def test_missing_gpu_artifacts_retry_without_mutating_current(
         store.current_dir(idea.idea_id) / "artifacts" / "pilot"
     ).exists()
     controller._pool.shutdown(wait=True)
+
+
+def test_runtime_contract_failure_with_raw_artifacts_returns_to_build(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "execution": {
+                    "smoke_environment": "local",
+                },
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
+                },
+            }
+        }
+    )
+    class ContractFailurePool(_Pool):
+        def collect_task(self, task_id: str):
+            del task_id
+            return {
+                "returncode": 1,
+                "elapsed_sec": 1.0,
+                "stdout": "",
+                "stderr": "runtime contract failed",
+            }
+
+    store = V2Store(tmp_path)
+    pool = ContractFailurePool()
+    controller = V2Controller(
+        config=config,
+        store=store,
+        generator=_NoopGenerator(),
+        gpu_broker=GPUBroker(
+            pool=pool,
+            scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        ),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    idea = candidate_to_idea(_candidate(0))
+    idea.status = IdeaStatus.PILOTING
+    current = store.current_dir(idea.idea_id)
+    current.mkdir(parents=True, exist_ok=True)
+    (current / "plan.json").write_text(
+        json.dumps({"required_runtime_evidence": []}),
+        encoding="utf-8",
+    )
+    (current / "main.py").write_text("print('pilot')\n", encoding="utf-8")
+    (current / "build.json").write_text(
+        json.dumps(
+            {
+                "files": {"main.py": "print('pilot')\n"},
+                "commands": {
+                    "smoke": ["python", "main.py"],
+                    "pilot": ["python", "main.py"],
+                    "scale": ["python", "main.py"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    job = JobRecord(
+        job_id=f"{idea.idea_id}-pilot",
+        idea_id=idea.idea_id,
+        kind=JobKind.PILOT,
+        status=JobStatus.RUNNING,
+        requires_gpu=True,
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+        result={"allocated_gpus": 1},
+    )
+    attempt = store.create_attempt(job)
+    attempt.status = AttemptStatus.RUNNING
+    job.attempt = attempt.number
+    job.attempt_id = attempt.attempt_id
+    idea.current_job_id = job.job_id
+    candidate = store.snapshot_current(attempt)
+    output_dir = candidate / "artifacts" / "pilot"
+    raw_dir = output_dir / "_raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "metrics.json").write_text("{}\n", encoding="utf-8")
+    (raw_dir / "runtime_evidence.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    job.expected_output_dir = str(output_dir)
+    store.save_idea(idea)
+    store.save_job(job)
+    store.save_attempt(attempt)
+    job.submitted_task_id = "task-runtime-contract"
+    store.save_job(job)
+    controller.gpu_broker.adopt(
+        job,
+        task_id="task-runtime-contract",
+        allocated_gpus=1,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_normalize_controller_runtime_artifacts",
+        lambda **kwargs: {"error": "deterministic runtime contract failure"},
+    )
+    monkeypatch.setattr(
+        "researchclaw.autoresearch_v2.controller.validate_experiment_artifacts",
+        lambda output: {
+            "ok": False,
+            "errors": ["missing canonical runtime"],
+            "metrics": {},
+            "runtime_evidence": {},
+            "files": [],
+        },
+    )
+    monkeypatch.setattr(
+        controller,
+        "_attest_gpu_execution",
+        lambda **kwargs: {"errors": []},
+    )
+    monkeypatch.setattr(
+        "researchclaw.autoresearch_v2.controller."
+        "validate_runtime_against_contract",
+        lambda **kwargs: [],
+    )
+
+    controller._collect_gpu_finished()
+
+    durable_idea = store.get_idea(idea.idea_id)
+    durable_job = store.get_job(job.job_id)
+    assert durable_idea is not None
+    assert durable_job is not None
+    assert durable_idea.status is IdeaStatus.BUILDING
+    assert durable_job.status is JobStatus.FAILED
+    assert durable_job.result["decision"] == "repair_build"
+    assert durable_job.result["reason"] == "pilot_runtime_contract_invalid"
+    assert any(
+        event["event_type"] == "gpu_implementation_returned_to_build"
+        for event in store.list_events(limit=50)
+    )
+    controller.close()

@@ -25,7 +25,7 @@ from typing import Any
 
 WRAPPER_FILENAME = "_autoresearch_runtime.py"
 WRAPPER_SCHEMA = "autoresearch_v2.controller_runtime"
-WRAPPER_VERSION = 5
+WRAPPER_VERSION = 6
 RAW_DIRNAME = "_raw"
 
 
@@ -158,6 +158,12 @@ def normalize_runtime_artifacts(
         metrics=metrics,
         mode=mode,
     )
+    if uncertainty:
+        _synchronize_uncertainty_metrics(
+            plan=plan,
+            uncertainty=uncertainty,
+            metrics=metrics,
+        )
 
     model_loaded, model_metadata = _normalize_model_loaded(
         raw_runtime.get("model_loaded")
@@ -595,6 +601,10 @@ def _compile_uncertainty_evidence(
     configured = plan.get("uncertainty")
     if not isinstance(configured, Mapping):
         return {}
+    gate = plan.get("gate_statistic")
+    gate_name = str(
+        gate.get("name", "") if isinstance(gate, Mapping) else ""
+    )
     raw = raw_runtime.get("uncertainty")
     if isinstance(raw, Mapping):
         supplied = dict(raw)
@@ -603,12 +613,42 @@ def _compile_uncertainty_evidence(
             "confidence_level",
             configured.get("confidence_level"),
         )
+        supplied.setdefault("resamples", configured.get("resamples"))
+        supplied.setdefault("rng_seed", configured.get("rng_seed"))
+        supplied["interval"] = configured.get("interval")
+        supplied.setdefault(
+            "undefined_resample_policy",
+            configured.get("undefined_resample_policy"),
+        )
         supplied.setdefault("decision_role", "descriptive")
+        supplied.setdefault("metric", gate_name)
+        supplied.setdefault("point_estimate", metrics.get(gate_name))
+        aggregation, recomputed_lower, recomputed_upper = (
+            _validate_uncertainty_evidence(
+                configured=configured,
+                supplied=supplied,
+                gate_name=gate_name,
+                gate_value=metrics.get(gate_name),
+            )
+        )
+        supplied["aggregation"] = aggregation
+        supplied["point_estimate"] = metrics.get(gate_name)
+        supplied["lower"] = recomputed_lower
+        supplied["upper"] = recomputed_upper
+        supplied["interval_bounds_source"] = "controller_recomputed"
+        supplied.pop("ci_lower", None)
+        supplied.pop("ci_upper", None)
+        supplied.pop("interval_lower", None)
+        supplied.pop("interval_upper", None)
+        supplied.pop("primary_effect_ci_lower", None)
+        supplied.pop("primary_effect_ci_upper", None)
         return supplied
-    gate = plan.get("gate_statistic")
-    gate_name = str(
-        gate.get("name", "") if isinstance(gate, Mapping) else ""
-    )
+    if _uncertainty_is_decision_relevant(plan):
+        raise RuntimeArtifactError(
+            "runtime_evidence.uncertainty with auditable item-level or "
+            "cluster-level observations is required because a promotion "
+            "criterion references an uncertainty metric"
+        )
     return {
         "available": False,
         "method": configured.get("method"),
@@ -626,6 +666,270 @@ def _compile_uncertainty_evidence(
         "point_estimate": metrics.get(gate_name),
         "reason": "item_level_paired_observations_not_emitted",
     }
+
+
+def _validate_uncertainty_evidence(
+    *,
+    configured: Mapping[str, Any],
+    supplied: Mapping[str, Any],
+    gate_name: str,
+    gate_value: Any,
+) -> tuple[str, float, float]:
+    if supplied.get("available") is not True:
+        raise RuntimeArtifactError(
+            "runtime_evidence.uncertainty.available must be true when "
+            "uncertainty affects promotion"
+        )
+    method = str(supplied.get("method", "") or "")
+    expected_method = str(configured.get("method", "") or "")
+    if expected_method and method != expected_method:
+        raise RuntimeArtifactError(
+            "runtime_evidence.uncertainty.method disagrees with plan"
+        )
+    if not _numbers_close(
+        supplied.get("confidence_level"),
+        configured.get("confidence_level"),
+    ):
+        raise RuntimeArtifactError(
+            "runtime_evidence.uncertainty.confidence_level disagrees with plan"
+        )
+    if "bootstrap" in method:
+        if supplied.get("resamples") != configured.get("resamples"):
+            raise RuntimeArtifactError(
+                "runtime_evidence.uncertainty.resamples disagrees with plan"
+            )
+        if supplied.get("rng_seed") != configured.get("rng_seed"):
+            raise RuntimeArtifactError(
+                "runtime_evidence.uncertainty.rng_seed disagrees with plan"
+            )
+    reported_metric = str(supplied.get("metric", "") or "")
+    if gate_name and reported_metric != gate_name:
+        raise RuntimeArtifactError(
+            "runtime_evidence.uncertainty.metric disagrees with "
+            "gate_statistic.name"
+        )
+    observations = supplied.get("observations")
+    if not isinstance(observations, list) or not observations:
+        raise RuntimeArtifactError(
+            "runtime_evidence.uncertainty.observations must contain the "
+            "frozen item-level or cluster-level resampling values"
+        )
+    if any(not _finite_number(value) for value in observations):
+        raise RuntimeArtifactError(
+            "runtime_evidence.uncertainty.observations must be finite numbers"
+        )
+    numeric_observations = [float(value) for value in observations]
+    aggregation = _infer_observation_aggregation(
+        numeric_observations,
+        point_estimate=gate_value,
+        reported=supplied.get("aggregation"),
+    )
+    point_estimate = _aggregate_observations(
+        numeric_observations,
+        aggregation=aggregation,
+    )
+    if not _numbers_close(point_estimate, gate_value):
+        raise RuntimeArtifactError(
+            "runtime_evidence.uncertainty observations do not reproduce "
+            f"gate metric {gate_name!r}"
+        )
+    if "bootstrap" not in method:
+        raise RuntimeArtifactError(
+            "decision-relevant uncertainty currently requires an auditable "
+            "bootstrap method"
+        )
+    lower, upper = _bootstrap_percentile_interval(
+        numeric_observations,
+        aggregation=aggregation,
+        resamples=int(supplied.get("resamples", 0) or 0),
+        rng_seed=int(supplied.get("rng_seed", 0) or 0),
+        lower_quantile=float(
+            configured.get("lower_quantile", 0.025) or 0.025
+        ),
+        upper_quantile=float(
+            configured.get("upper_quantile", 0.975) or 0.975
+        ),
+    )
+    return aggregation, lower, upper
+
+
+def _infer_observation_aggregation(
+    observations: list[float],
+    *,
+    point_estimate: Any,
+    reported: Any = None,
+) -> str:
+    candidates = {
+        "sum": sum(observations),
+        "mean": sum(observations) / len(observations),
+    }
+    matches = [
+        name
+        for name, candidate in candidates.items()
+        if _numbers_close(candidate, point_estimate)
+    ]
+    reported_name = str(reported or "").strip().casefold()
+    if reported_name:
+        if reported_name not in candidates:
+            raise RuntimeArtifactError(
+                "runtime_evidence.uncertainty.aggregation must be sum or mean"
+            )
+        if reported_name not in matches:
+            raise RuntimeArtifactError(
+                "runtime_evidence.uncertainty.aggregation does not reproduce "
+                "the gate metric"
+            )
+        return reported_name
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise RuntimeArtifactError(
+            "runtime_evidence.uncertainty observations reproduce neither the "
+            "sum nor the mean of the gate metric"
+        )
+    # Sum and mean are numerically identical for a single observation or an
+    # all-zero sample. Either produces the same interval, so choose the
+    # normalized representation deterministically.
+    return "mean"
+
+
+def _aggregate_observations(
+    observations: list[float],
+    *,
+    aggregation: str,
+) -> float:
+    total = sum(observations)
+    if aggregation == "sum":
+        return total
+    if aggregation == "mean":
+        return total / len(observations)
+    raise RuntimeArtifactError(
+        f"unsupported uncertainty aggregation: {aggregation!r}"
+    )
+
+
+def _synchronize_uncertainty_metrics(
+    *,
+    plan: Mapping[str, Any],
+    uncertainty: Mapping[str, Any],
+    metrics: dict[str, float | int],
+) -> None:
+    if not _uncertainty_is_decision_relevant(plan):
+        return
+    lower = _uncertainty_bound(uncertainty, "lower")
+    upper = _uncertainty_bound(uncertainty, "upper")
+    for criterion in plan.get("promotion_criteria", ()):
+        if not isinstance(criterion, Mapping):
+            continue
+        metric = str(criterion.get("metric", "") or "")
+        if "ci_lower" in metric.casefold() and _finite_number(lower):
+            metrics[metric] = lower
+        elif "ci_upper" in metric.casefold() and _finite_number(upper):
+            metrics[metric] = upper
+
+
+def _uncertainty_bound(
+    supplied: Mapping[str, Any],
+    side: str,
+) -> Any:
+    direct = supplied.get(side)
+    if _finite_number(direct):
+        return direct
+    for name in (
+        f"ci_{side}",
+        f"interval_{side}",
+        f"primary_effect_ci_{side}",
+    ):
+        value = supplied.get(name)
+        if _finite_number(value):
+            return value
+    interval = supplied.get("interval")
+    if isinstance(interval, Mapping):
+        value = interval.get(side)
+        if _finite_number(value):
+            return value
+    return None
+
+
+def _bootstrap_percentile_interval(
+    observations: list[float],
+    *,
+    aggregation: str,
+    resamples: int,
+    rng_seed: int,
+    lower_quantile: float,
+    upper_quantile: float,
+) -> tuple[float, float]:
+    import random
+
+    if not observations or resamples <= 0:
+        raise RuntimeArtifactError(
+            "bootstrap uncertainty requires observations and resamples"
+        )
+    rng = random.Random(rng_seed)
+    n = len(observations)
+    values = [
+        _aggregate_observations(
+            [observations[rng.randrange(n)] for _ in range(n)],
+            aggregation=aggregation,
+        )
+        for _ in range(resamples)
+    ]
+    values.sort()
+    return (
+        _linear_quantile(values, lower_quantile),
+        _linear_quantile(values, upper_quantile),
+    )
+
+
+def _linear_quantile(values: list[float], quantile: float) -> float:
+    position = float(quantile) * (len(values) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(values) - 1)
+    fraction = position - lower
+    return values[lower] + (values[upper] - values[lower]) * fraction
+
+
+def _numbers_close(left: Any, right: Any) -> bool:
+    if not _finite_number(left) or not _finite_number(right):
+        return False
+    return math.isclose(
+        float(left),
+        float(right),
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    )
+
+
+def _uncertainty_is_decision_relevant(plan: Mapping[str, Any]) -> bool:
+    promotion = plan.get("promotion_criteria")
+    if not isinstance(promotion, list):
+        return False
+    return any(
+        isinstance(item, Mapping)
+        and (
+            "uncertainty" in str(item.get("id", "") or "").casefold()
+            or _is_uncertainty_metric(
+                str(item.get("metric", "") or "")
+            )
+        )
+        for item in promotion
+    )
+
+
+def _is_uncertainty_metric(name: str) -> bool:
+    value = str(name or "").casefold()
+    return any(
+        marker in value
+        for marker in (
+            "ci_lower",
+            "ci_upper",
+            "confidence_interval",
+            "standard_error",
+            "stderr",
+            "p_value",
+        )
+    )
 
 
 def _normalize_call_counts(value: Any) -> dict[str, int]:

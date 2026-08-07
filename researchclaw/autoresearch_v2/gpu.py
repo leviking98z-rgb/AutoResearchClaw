@@ -215,9 +215,11 @@ class GPUBroker:
         lease_heartbeat_interval_sec: float | None = None,
         task_env: Mapping[str, str] | None = None,
         task_namespace: str = "",
+        manage_pool_keepalive: bool = True,
     ) -> None:
         self.pool = pool
         self.scheduler = scheduler
+        self.manage_pool_keepalive = bool(manage_pool_keepalive)
         self.probe_failure_threshold = max(
             1,
             int(probe_failure_threshold),
@@ -257,7 +259,10 @@ class GPUBroker:
             1,
             min(32, int(getattr(scheduler, "total_gpus", 1) or 1)),
         )
-        if hasattr(self.pool, "start_keepalive"):
+        if self.manage_pool_keepalive and hasattr(
+            self.pool,
+            "start_keepalive",
+        ):
             self.pool.start_keepalive()
 
     def submit(
@@ -554,7 +559,10 @@ class GPUBroker:
             self.lease_registry.close_owner(self.owner_id)
         # v2 adopts but does not release the physical pool. It does own the
         # keepalive thread it started for the lifetime of this controller.
-        if hasattr(self.pool, "stop_keepalive"):
+        if self.manage_pool_keepalive and hasattr(
+            self.pool,
+            "stop_keepalive",
+        ):
             self.pool.stop_keepalive()
 
     def cancel(self, job_id: str) -> None:
@@ -698,6 +706,7 @@ def build_clusterbridge_broker_from_pool(
     task_env: Mapping[str, str] | None = None,
     lease_registry_path: str | Path | None = None,
     task_namespace: str = "",
+    manage_pool_keepalive: bool = True,
 ) -> GPUBroker:
     """Build a broker around an already claimed and prepared pool object."""
 
@@ -743,6 +752,7 @@ def build_clusterbridge_broker_from_pool(
         lease_registry=lease_registry,
         task_env=task_env,
         task_namespace=task_namespace,
+        manage_pool_keepalive=manage_pool_keepalive,
     )
 
 

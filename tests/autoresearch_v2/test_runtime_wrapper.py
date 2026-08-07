@@ -106,7 +106,34 @@ def _write_raw(
 
 def test_runtime_wrapper_compiles_and_is_idempotent(tmp_path: Path) -> None:
     output_dir = tmp_path / "artifacts" / "pilot"
-    _write_raw(output_dir)
+    _write_raw(
+        output_dir,
+        runtime={
+            "model_loaded": "Qwen/Qwen2.5-1.5B-Instruct",
+            "datasets_loaded": ["GSM8K"],
+            "examples_processed": 4,
+            "seed": 7,
+            "examples_by_role": {
+                "development": 2,
+                "screening": 4,
+            },
+            "call_counts": {
+                "adaptation": 8,
+                "final_evaluation": 16,
+            },
+            "uncertainty": {
+                "available": True,
+                "method": "paired_bootstrap",
+                "confidence_level": 0.9,
+                "resamples": 1000,
+                "rng_seed": 1729,
+                "metric": "paired_accuracy_difference",
+                "observations": [1, 0, 0, -0.2],
+                "lower": 999.0,
+                "upper": 1000.0,
+            },
+        },
+    )
 
     first = normalize_runtime_artifacts(
         output_dir=output_dir,
@@ -139,6 +166,13 @@ def test_runtime_wrapper_compiles_and_is_idempotent(tmp_path: Path) -> None:
         "completed_examples": {"value": 4, "passed": True},
         "primary_effect": {"value": 0.20, "passed": True},
     }
+    assert runtime["uncertainty"]["aggregation"] == "mean"
+    assert runtime["uncertainty"]["point_estimate"] == pytest.approx(0.2)
+    assert runtime["uncertainty"]["interval_bounds_source"] == (
+        "controller_recomputed"
+    )
+    assert runtime["uncertainty"]["lower"] != 999.0
+    assert runtime["uncertainty"]["upper"] != 1000.0
     assert runtime["gate_decision"] == "promote"
     assert second["already_compiled"] is True
     assert second["runtime_evidence"] == runtime
@@ -251,6 +285,242 @@ def test_runtime_wrapper_normalizes_legacy_all_role_example_total(
         "point_estimate": 0.2,
         "reason": "item_level_paired_observations_not_emitted",
     }
+
+
+def test_runtime_wrapper_requires_auditable_uncertainty_for_promotion(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "artifacts" / "pilot"
+    plan = _plan()
+    plan["promotion_criteria"].append(
+        {
+            "id": "uncertainty_support",
+            "metric": "primary_effect_ci_lower",
+            "operator": ">",
+            "value": 0.0,
+        }
+    )
+    _write_raw(
+        output_dir,
+        metrics={
+            "completed_examples": 4,
+            "paired_accuracy_difference": 0.20,
+            "primary_effect_ci_lower": 0.05,
+        },
+    )
+
+    with pytest.raises(
+        RuntimeArtifactError,
+        match="auditable item-level or cluster-level observations",
+    ):
+        normalize_runtime_artifacts(
+            output_dir=output_dir,
+            plan=plan,
+            mode="pilot",
+            allocated_gpus=1,
+            cwd=tmp_path,
+        )
+
+
+def test_runtime_wrapper_recomputes_count_bootstrap_for_ci_gate(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "artifacts" / "pilot"
+    plan = _plan()
+    plan["gate_statistic"] = {"name": "paired_correct_count_difference"}
+    plan["promotion_criteria"] = [
+        {
+            "id": "primary_effect",
+            "metric": "paired_correct_count_difference",
+            "operator": ">=",
+            "value": 2,
+        },
+        {
+            "id": "uncertainty_support",
+            "metric": "primary_effect_ci_lower",
+            "operator": ">",
+            "value": 0.0,
+        },
+    ]
+    _write_raw(
+        output_dir,
+        metrics={
+            "completed_examples": 4,
+            "paired_correct_count_difference": 2,
+            "primary_effect_ci_lower": 999,
+        },
+        runtime={
+            "model_loaded": "Qwen/Qwen2.5-1.5B-Instruct",
+            "datasets_loaded": ["GSM8K"],
+            "examples_processed": 4,
+            "seed": 7,
+            "examples_by_role": {
+                "development": 2,
+                "screening": 4,
+            },
+            "call_counts": {
+                "adaptation": 8,
+                "final_evaluation": 16,
+            },
+            "uncertainty": {
+                "available": True,
+                "method": "paired_bootstrap",
+                "confidence_level": 0.9,
+                "resamples": 1000,
+                "rng_seed": 1729,
+                "metric": "paired_correct_count_difference",
+                "observations": [1, 1, 0, 0],
+                "lower": 999,
+                "upper": 1000,
+            },
+        },
+    )
+
+    value = normalize_runtime_artifacts(
+        output_dir=output_dir,
+        plan=plan,
+        mode="pilot",
+        allocated_gpus=1,
+        cwd=tmp_path,
+    )
+
+    runtime = value["runtime_evidence"]
+    assert runtime["uncertainty"]["aggregation"] == "sum"
+    assert runtime["uncertainty"]["point_estimate"] == 2
+    assert runtime["uncertainty"]["lower"] == pytest.approx(0.0)
+    assert runtime["uncertainty"]["upper"] == pytest.approx(4.0)
+    assert runtime["metrics"]["primary_effect_ci_lower"] == pytest.approx(0.0)
+    assert runtime["criterion_results"]["uncertainty_support"] == {
+        "value": pytest.approx(0.0),
+        "passed": False,
+    }
+    assert runtime["gate_decision"] == "reject"
+
+
+def test_runtime_wrapper_recomputes_proportion_bootstrap_for_ci_gate(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "artifacts" / "pilot"
+    plan = _plan()
+    plan["promotion_criteria"].append(
+        {
+            "id": "uncertainty_support",
+            "metric": "primary_effect_ci_lower",
+            "operator": ">",
+            "value": 0.0,
+        }
+    )
+    _write_raw(
+        output_dir,
+        metrics={
+            "completed_examples": 4,
+            "paired_accuracy_difference": 0.5,
+            "primary_effect_ci_lower": 999,
+        },
+        runtime={
+            "model_loaded": "Qwen/Qwen2.5-1.5B-Instruct",
+            "datasets_loaded": ["GSM8K"],
+            "examples_processed": 4,
+            "seed": 7,
+            "examples_by_role": {
+                "development": 2,
+                "screening": 4,
+            },
+            "call_counts": {
+                "adaptation": 8,
+                "final_evaluation": 16,
+            },
+            "uncertainty": {
+                "available": True,
+                "method": "paired_bootstrap",
+                "confidence_level": 0.9,
+                "resamples": 1000,
+                "rng_seed": 1729,
+                "metric": "paired_accuracy_difference",
+                "observations": [1, 1, 0, 0],
+                "lower": 999,
+                "upper": 1000,
+            },
+        },
+    )
+
+    value = normalize_runtime_artifacts(
+        output_dir=output_dir,
+        plan=plan,
+        mode="pilot",
+        allocated_gpus=1,
+        cwd=tmp_path,
+    )
+
+    runtime = value["runtime_evidence"]
+    assert runtime["uncertainty"]["aggregation"] == "mean"
+    assert runtime["uncertainty"]["point_estimate"] == pytest.approx(0.5)
+    assert runtime["uncertainty"]["lower"] == pytest.approx(0.0)
+    assert runtime["uncertainty"]["upper"] == pytest.approx(1.0)
+    assert runtime["metrics"]["primary_effect_ci_lower"] == pytest.approx(0.0)
+    assert runtime["criterion_results"]["uncertainty_support"] == {
+        "value": pytest.approx(0.0),
+        "passed": False,
+    }
+    assert runtime["gate_decision"] == "reject"
+
+
+def test_runtime_wrapper_rejects_observations_that_do_not_match_gate(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "artifacts" / "pilot"
+    plan = _plan()
+    plan["promotion_criteria"].append(
+        {
+            "id": "uncertainty_support",
+            "metric": "primary_effect_ci_lower",
+            "operator": ">",
+            "value": 0.0,
+        }
+    )
+    _write_raw(
+        output_dir,
+        metrics={
+            "completed_examples": 4,
+            "paired_accuracy_difference": 0.2,
+            "primary_effect_ci_lower": 0.1,
+        },
+        runtime={
+            "model_loaded": "Qwen/Qwen2.5-1.5B-Instruct",
+            "datasets_loaded": ["GSM8K"],
+            "examples_processed": 4,
+            "seed": 7,
+            "examples_by_role": {
+                "development": 2,
+                "screening": 4,
+            },
+            "call_counts": {
+                "adaptation": 8,
+                "final_evaluation": 16,
+            },
+            "uncertainty": {
+                "available": True,
+                "method": "paired_bootstrap",
+                "confidence_level": 0.9,
+                "resamples": 1000,
+                "rng_seed": 1729,
+                "metric": "paired_accuracy_difference",
+                "observations": [1, 1, 0, 0],
+            },
+        },
+    )
+
+    with pytest.raises(
+        RuntimeArtifactError,
+        match="reproduce neither the sum nor the mean",
+    ):
+        normalize_runtime_artifacts(
+            output_dir=output_dir,
+            plan=plan,
+            mode="pilot",
+            allocated_gpus=1,
+            cwd=tmp_path,
+        )
 
 
 def test_runtime_wrapper_normalizes_structured_resource_evidence(

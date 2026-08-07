@@ -101,6 +101,30 @@ def test_broker_owns_keepalive_but_never_releases_adopted_pool() -> None:
     assert pool.released == 0
 
 
+def test_broker_can_defer_pool_keepalive_to_resource_manager() -> None:
+    class Pool:
+        def __init__(self) -> None:
+            self.started = 0
+            self.stopped = 0
+
+        def start_keepalive(self) -> None:
+            self.started += 1
+
+        def stop_keepalive(self) -> None:
+            self.stopped += 1
+
+    pool = Pool()
+    broker = GPUBroker(
+        pool=pool,
+        scheduler=AdaptiveGPUScheduler(total_gpus=8),
+        manage_pool_keepalive=False,
+    )
+
+    assert pool.started == 0
+    broker.close()
+    assert pool.stopped == 0
+
+
 def test_broker_forwards_trusted_task_environment() -> None:
     class Pool:
         def __init__(self) -> None:

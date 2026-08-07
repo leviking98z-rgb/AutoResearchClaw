@@ -135,6 +135,8 @@ class _FakePool:
         self.adopted = 0
         self.prepared_calls = 0
         self.restored = 0
+        self.pause_spin_calls = 0
+        self.stop_keepalive_calls = 0
 
     def adopt_claimed_lease(self) -> None:
         self.adopted += 1
@@ -152,6 +154,12 @@ class _FakePool:
         self.restored += 1
         self.claimed = bool(data.get("claimed"))
         self.prepared = bool(data.get("prepared"))
+
+    def pause_spin(self) -> None:
+        self.pause_spin_calls += 1
+
+    def stop_keepalive(self) -> None:
+        self.stop_keepalive_calls += 1
 
 
 class _FakeBroker:
@@ -307,6 +315,7 @@ def test_resource_manager_passes_task_namespace_to_broker(
     manager.bootstrap()
 
     assert brokers.calls[0]["task_namespace"] == "rsi-canary-seven"
+    assert brokers.calls[0]["manage_pool_keepalive"] is False
 
 
 def test_resource_manager_can_pin_exact_allocation(tmp_path: Path) -> None:
@@ -507,7 +516,39 @@ def test_existing_allocated_pool_state_skips_per_node_claim_restore(
     assert pool.restored == 1
     assert pool.adopted == 0
     assert pool.prepared_calls == 0
+    assert pool.stop_keepalive_calls == 1
+    assert pool.pause_spin_calls == 1
     assert manager.broker is brokers.brokers[0]
+
+
+def test_attached_pool_refreshes_spin_pause_before_daemon_timeout(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    client = _FakeResourceClient()
+    client.allocations = [_allocation()]
+    clock = [0.0]
+    manager, pools, _ = _manager(
+        config.gpu,
+        client=client,
+        clock=clock,
+    )
+
+    manager.bootstrap()
+    pool = pools.pools[0]
+    assert pool.pause_spin_calls == 0
+
+    clock[0] = 91.0
+    manager.reconcile()
+    assert pool.pause_spin_calls == 1
+
+    clock[0] = 120.0
+    manager.reconcile()
+    assert pool.pause_spin_calls == 1
+
+    clock[0] = 181.0
+    manager.reconcile()
+    assert pool.pause_spin_calls == 2
 
 
 def test_renewal_does_not_block_reconcile(tmp_path: Path) -> None:

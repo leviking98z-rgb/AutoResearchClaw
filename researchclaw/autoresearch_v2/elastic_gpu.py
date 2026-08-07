@@ -182,6 +182,7 @@ class ResourceManagedGPUManager:
         self._last_error = ""
         self._state = "starting"
         self._closed = False
+        self._spin_paused_at = 0.0
         self._prepare_thread: threading.Thread | None = None
         self._renew_thread: threading.Thread | None = None
         self._reconcile_thread: threading.Thread | None = None
@@ -315,6 +316,8 @@ class ResourceManagedGPUManager:
                         self._start_renew(allocation_id)
                     if self._broker is None:
                         self._start_attach(allocation)
+                    elif now >= self._next_spin_pause_at():
+                        self._start_spin_pause()
                     if self._broker is not None:
                         self._state = "ready"
                     self._last_error = ""
@@ -430,6 +433,35 @@ class ResourceManagedGPUManager:
                     self._monotonic()
                     + self.elastic.reconcile_interval_sec,
                 )
+
+    def _next_spin_pause_at(self) -> float:
+        """Return when the running Ray pool needs its keepalive paused again."""
+
+        if self._spin_paused_at <= 0.0:
+            return 0.0
+        # ``node_spin.sh pause`` currently suppresses the daemon for 60
+        # minutes. Refresh comfortably before that deadline while the
+        # allocation remains attached to a live Ray broker.
+        return self._spin_paused_at + min(
+            45.0 * 60.0,
+            max(
+                60.0,
+                float(self.elastic.renew_interval_sec) * 3.0,
+            ),
+        )
+
+    def _start_spin_pause(self) -> None:
+        """Pause the GPU keepalive while this manager owns a prepared pool."""
+
+        pool = self._pool
+        if pool is None:
+            return
+        try:
+            pool.pause_spin()
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            return
+        self._spin_paused_at = self._monotonic()
 
     def _select_allocation(
         self,
@@ -568,6 +600,18 @@ class ResourceManagedGPUManager:
             # records. Adopt those records rather than issuing a second request.
             pool.adopt_claimed_lease()
             pool.prepare()
+        else:
+            # A restored Ray cluster may have outlived the 60-minute pause
+            # issued during its original preparation. Reassert the pause before
+            # exposing the broker so daemon_gpu cannot consume otherwise idle
+            # cards in the shared research pool.
+            # Older controllers may also have persisted a terminal legacy
+            # LeaseKeepalive failure. Stop it here so pool task probes/submits
+            # no longer consult stale per-node claim renewal health; the
+            # ResourceManagedGPUManager owns the authoritative allocation
+            # renewal in this mode.
+            pool.stop_keepalive()
+            pool.pause_spin()
         broker = self.broker_factory(
             pool,
             total_gpus=total,
@@ -577,6 +621,7 @@ class ResourceManagedGPUManager:
             probe_failure_threshold=self.config.probe_failure_threshold,
             task_env=self.task_env,
             task_namespace=self.task_namespace,
+            manage_pool_keepalive=False,
             lease_registry_path=(
                 Path("/root/.local/state/autoresearch-v2/gpu-leases")
                 / f"{pool_id}.sqlite3"
@@ -588,6 +633,7 @@ class ResourceManagedGPUManager:
                 return
             self._pool = pool
             self._broker = broker
+            self._spin_paused_at = self._monotonic()
 
     @staticmethod
     def _restore_allocated_pool_state(
@@ -663,6 +709,7 @@ class ResourceManagedGPUManager:
         broker = self._broker
         self._broker = None
         self._pool = None
+        self._spin_paused_at = 0.0
         return broker
 
     def _broker_has_running_tasks(self) -> bool:

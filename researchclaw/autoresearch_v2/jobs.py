@@ -996,6 +996,14 @@ Requirements:
 - Emit measured values for every metric referenced by validity_criteria and
   promotion_criteria. The Controller mechanically applies the compiled
   operators, thresholds, and retry/promote/reject decision table.
+- If any promotion criterion references an uncertainty metric (for example a
+  confidence-interval bound), runtime_evidence must include an ``uncertainty``
+  object with the configured method, confidence level, resamples, RNG seed,
+  and the frozen item/cluster-level observations used to resample. The
+  observations must reproduce gate_statistic.name as either their sum
+  (absolute-count effects) or mean (proportion effects). The Controller owns
+  and recomputes interval bounds; aggregate counts or precomputed CI scalars
+  alone are not auditable and will fail the deterministic runtime contract.
 - The metric named by gate_statistic.name must be emitted in both metrics
   artifacts. Do not derive promotion direction from primary_metric or
   metric_direction.
