@@ -93,7 +93,7 @@ autoresearch_v2:
       allow_cross_cluster: true
       gpu_type: H20
       priority: normal
-      release_on_shutdown: true
+      release_on_shutdown: false
       # Optional exact allocation pin for controlled canaries. When set, the
       # manager never attaches or releases another matching project allocation.
       preferred_allocation_id: ""

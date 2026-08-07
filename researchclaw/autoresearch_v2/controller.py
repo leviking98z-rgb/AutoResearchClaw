@@ -337,6 +337,11 @@ class V2Controller:
         self._tick_count += 1
         if self.store.control_requested("stop"):
             self.request_stop(reason="control_stop")
+        # Resource-manager reconciliation happens on a background thread and
+        # may replace or close the Broker between ticks. Refresh the pointer
+        # before touching GPU tasks so a stale, already-closed Broker is never
+        # asked to schedule new futures.
+        self._sync_gpu_broker_from_manager()
         # Collect durable terminal GPU tasks before calculating allocation
         # demand. Otherwise a just-finished lease can retain capacity for
         # another resource-manager interval.
@@ -398,11 +403,7 @@ class V2Controller:
         demand = self._gpu_resource_demand()
         prior = self.gpu_broker
         changed = manager.reconcile(**demand)
-        self.gpu_broker = manager.broker
-        self.configured_gpu_capacity = max(
-            0,
-            int(manager.configured_capacity),
-        )
+        self._sync_gpu_broker_from_manager()
         if not changed and prior is self.gpu_broker:
             return
         state = manager.snapshot()
@@ -414,6 +415,16 @@ class V2Controller:
         )
         if self.gpu_broker is not None:
             self._adopt_interrupted_gpu_jobs()
+
+    def _sync_gpu_broker_from_manager(self) -> None:
+        manager = self.gpu_manager
+        if manager is None:
+            return
+        self.gpu_broker = manager.broker
+        self.configured_gpu_capacity = max(
+            0,
+            int(manager.configured_capacity),
+        )
 
     def _gpu_resource_demand(self) -> dict[str, int]:
         """Return durable useful-work demand for the elastic GPU manager."""
@@ -1057,8 +1068,9 @@ class V2Controller:
         if broker is None or not job.submitted_task_id:
             return False
         try:
-            if job.job_id not in broker.leases:
-                broker.adopt(
+            if (
+                job.job_id not in broker.leases
+                and not broker.adopt(
                     job,
                     task_id=job.submitted_task_id,
                     allocated_gpus=int(
@@ -1069,6 +1081,8 @@ class V2Controller:
                         or 1
                     ),
                 )
+            ):
+                return True
             broker.cancel(job.job_id)
         except Exception as exc:  # noqa: BLE001
             self.store.event(
@@ -1362,6 +1376,13 @@ class V2Controller:
                 "submitted_at": utc_now(),
                 "task_id": decision.task_id,
                 "output_dir": str(output_dir),
+                "submission_state": decision.reason,
+                "allocation_id": str(
+                    getattr(self.gpu_broker, "allocation_id", "") or ""
+                ),
+                "pool_id": str(
+                    getattr(self.gpu_broker, "pool_id", "") or ""
+                ),
             }
             self.store.save_job(job)
             running_gpu += 1
@@ -1374,6 +1395,9 @@ class V2Controller:
                 allocated_gpus=decision.allocated_gpus,
                 task_id=decision.task_id,
                 output_dir=str(output_dir),
+                submission_state=decision.reason,
+                allocation_id=job.result["allocation_id"],
+                pool_id=job.result["pool_id"],
             )
 
         for job in cpu_ready:
@@ -1695,6 +1719,7 @@ class V2Controller:
             attempt_dir = self.store.attempt_dir(attempt)
             stdout_path = attempt_dir / "stdout.log"
             stderr_path = attempt_dir / "stderr.log"
+            attempt_dir.mkdir(parents=True, exist_ok=True)
             stdout_path.write_text(
                 str(result.get("stdout", "") or ""),
                 encoding="utf-8",
@@ -1712,6 +1737,27 @@ class V2Controller:
                 )
                 or 0
             )
+            if str(result.get("pool_state", "")) == "submission_failed":
+                attempt.status = AttemptStatus.FAILED
+                attempt.error = str(
+                    result.get("error", "GPU submission failed")
+                )
+                attempt.finished_at = utc_now()
+                self.store.save_attempt(attempt)
+                outcome = JobOutcome(
+                    False,
+                    "retry",
+                    "gpu_submission_failed",
+                    {
+                        **dict(result),
+                        "failure_class": "infrastructure_transient",
+                        "consume_attempt": False,
+                    },
+                    elapsed_sec=elapsed_sec,
+                )
+                job.attempt = max(job.attempt, attempt.number)
+                self._apply_outcome(idea, job, attempt, outcome)
+                continue
             output_dir = (
                 Path(job.expected_output_dir)
                 if job.expected_output_dir
@@ -2950,10 +2996,31 @@ class V2Controller:
                 ).isoformat(timespec="milliseconds")
                 idea.status = _STATUS_FOR_KIND[job.kind]
             else:
-                job.status = JobStatus.FAILED
-                idea.status = IdeaStatus.QUARANTINED
-                idea.exit_reason = outcome.reason
-                idea.current_job_id = ""
+                if consume_attempt is False:
+                    # Infrastructure retries are not scientific attempts. Keep
+                    # the Job retryable even after the bounded attempt-limit
+                    # extension window; liveness budgets and operator controls
+                    # remain the outer guard against an endless outage.
+                    job.status = JobStatus.RETRY_WAIT
+                    delay_sec = (
+                        0.0
+                        if self._simulation_mode
+                        else min(
+                            300.0,
+                            2.0 ** min(8, max(0, infrastructure_retries - 1))
+                            + random.uniform(0.0, 1.0),
+                        )
+                    )
+                    job.retry_not_before = (
+                        datetime.now(UTC)
+                        + timedelta(seconds=delay_sec)
+                    ).isoformat(timespec="milliseconds")
+                    idea.status = _STATUS_FOR_KIND[job.kind]
+                else:
+                    job.status = JobStatus.FAILED
+                    idea.status = IdeaStatus.QUARANTINED
+                    idea.exit_reason = outcome.reason
+                    idea.current_job_id = ""
         else:
             job.status = JobStatus.SUCCEEDED
             job.retry_not_before = ""
@@ -3015,21 +3082,22 @@ class V2Controller:
                 and job.submitted_task_id
             ):
                 if self.gpu_broker is not None:
-                    self.gpu_broker.adopt(
+                    adopted = self.gpu_broker.adopt(
                         job,
                         task_id=job.submitted_task_id,
                         allocated_gpus=int(
                             job.result.get("allocated_gpus", job.min_gpus) or 1
                         ),
                     )
-                    self.store.event(
-                        "gpu_job_adopted",
-                        idea_id=job.idea_id,
-                        job_id=job.job_id,
-                        attempt_id=job.attempt_id,
-                        task_id=job.submitted_task_id,
-                    )
-                    continue
+                    if adopted:
+                        self.store.event(
+                            "gpu_job_adopted",
+                            idea_id=job.idea_id,
+                            job_id=job.job_id,
+                            attempt_id=job.attempt_id,
+                            task_id=job.submitted_task_id,
+                        )
+                        continue
                 if self.gpu_manager is not None:
                     self.store.event(
                         "gpu_job_adoption_deferred",
@@ -3232,30 +3300,172 @@ class V2Controller:
     def _adopt_interrupted_gpu_jobs(self) -> None:
         """Adopt only durable remote tasks when an elastic broker appears."""
 
-        if self.gpu_broker is None:
+        broker = self.gpu_broker
+        if broker is None:
             return
-        for job in self.store.list_jobs(statuses={JobStatus.RUNNING}):
+        all_running = self.store.list_jobs(statuses={JobStatus.RUNNING})
+        legacy_candidates = [
+            job
+            for job in all_running
+            if job.requires_gpu
+            and job.submitted_task_id
+            and not str(job.result.get("allocation_id", "") or "")
+            and not str(job.result.get("pool_id", "") or "")
+        ]
+        for job in all_running:
             if (
                 not job.requires_gpu
                 or not job.submitted_task_id
-                or job.job_id in self.gpu_broker.leases
+                or job.job_id in broker.leases
             ):
                 continue
-            self.gpu_broker.adopt(
-                job,
-                task_id=job.submitted_task_id,
-                allocated_gpus=int(
-                    job.result.get("allocated_gpus", job.min_gpus) or 1
-                ),
+            recorded_allocation = str(
+                job.result.get("allocation_id", "") or ""
             )
+            recorded_pool = str(job.result.get("pool_id", "") or "")
+            broker_allocation = str(
+                getattr(broker, "allocation_id", "") or ""
+            )
+            broker_pool = str(getattr(broker, "pool_id", "") or "")
+            legacy_identity_unknown = (
+                not recorded_allocation and not recorded_pool
+            )
+            identity_matches = (
+                (not recorded_allocation or not broker_allocation)
+                or recorded_allocation == broker_allocation
+            ) and (
+                (not recorded_pool or not broker_pool)
+                or recorded_pool == broker_pool
+            )
+            adopted = False
+            # Jobs created before allocation identity was persisted can only be
+            # adopted when their task metadata exists in the currently attached
+            # pool. If exactly one legacy task is missing, classify it as an
+            # allocation rollover instead of leaving it probe-degraded forever.
+            if (
+                legacy_identity_unknown
+                and len(legacy_candidates) == 1
+                and not broker.task_exists(job.submitted_task_id)
+            ):
+                identity_matches = False
+            if identity_matches:
+                adopted = broker.adopt(
+                    job,
+                    task_id=job.submitted_task_id,
+                    allocated_gpus=int(
+                        job.result.get("allocated_gpus", job.min_gpus) or 1
+                    ),
+                )
+            if not adopted:
+                self._recover_gpu_allocation_interruption(
+                    job,
+                    previous_allocation_id=recorded_allocation,
+                    previous_pool_id=recorded_pool,
+                    current_allocation_id=broker_allocation,
+                    current_pool_id=broker_pool,
+                    reason=(
+                        "allocation_identity_changed"
+                        if not identity_matches
+                        else "remote_task_metadata_missing"
+                    ),
+                )
+                continue
+            job.result = {
+                **job.result,
+                "allocation_id": broker_allocation or recorded_allocation,
+                "pool_id": broker_pool or recorded_pool,
+            }
+            self.store.save_job(job)
             self.store.event(
                 "gpu_job_adopted",
                 idea_id=job.idea_id,
                 job_id=job.job_id,
                 attempt_id=job.attempt_id,
                 task_id=job.submitted_task_id,
+                allocation_id=job.result.get("allocation_id", ""),
+                pool_id=job.result.get("pool_id", ""),
                 reconnect=True,
             )
+
+    def _recover_gpu_allocation_interruption(
+        self,
+        job: JobRecord,
+        *,
+        previous_allocation_id: str,
+        previous_pool_id: str,
+        current_allocation_id: str,
+        current_pool_id: str,
+        reason: str,
+    ) -> None:
+        """Refund a GPU attempt whose physical pool can no longer own it."""
+
+        idea = self.store.get_idea(job.idea_id)
+        interrupted_attempt_id = job.attempt_id
+        refunded = False
+        attempt = (
+            self.store.get_attempt(job.attempt_id)
+            if job.attempt_id
+            else None
+        )
+        if (
+            attempt is not None
+            and attempt.status
+            in {
+                AttemptStatus.CREATED,
+                AttemptStatus.RUNNING,
+                AttemptStatus.VALIDATING,
+            }
+        ):
+            attempt.status = AttemptStatus.FAILED
+            attempt.error = f"gpu_allocation_interrupted:{reason}"
+            attempt.finished_at = utc_now()
+            self.store.save_attempt(attempt)
+            if job.attempt == attempt.number:
+                job.attempt = max(0, job.attempt - 1)
+                refunded = True
+            shutil.rmtree(
+                self.store.attempt_dir(attempt) / "candidate",
+                ignore_errors=True,
+            )
+        old_task_id = job.submitted_task_id
+        job.status = JobStatus.RETRY_WAIT
+        job.retry_not_before = datetime.now(UTC).isoformat(
+            timespec="milliseconds"
+        )
+        job.attempt_id = ""
+        job.submitted_task_id = ""
+        job.result = {
+            **job.result,
+            "failure_class": "infrastructure_transient",
+            "consume_attempt": False,
+            "infrastructure_interruption": reason,
+            "interrupted_attempt_id": interrupted_attempt_id,
+            "interrupted_task_id": old_task_id,
+            "attempt_refunded": refunded,
+            "previous_allocation_id": previous_allocation_id,
+            "previous_pool_id": previous_pool_id,
+            "current_allocation_id": current_allocation_id,
+            "current_pool_id": current_pool_id,
+        }
+        self.store.save_job(job)
+        if idea is not None:
+            idea.status = _STATUS_FOR_KIND[job.kind]
+            idea.exit_reason = ""
+            idea.last_progress_at = utc_now()
+            self.store.save_idea(idea)
+        self.store.event(
+            "gpu_allocation_interruption_recovered",
+            idea_id=job.idea_id,
+            job_id=job.job_id,
+            attempt_id=interrupted_attempt_id,
+            task_id=old_task_id,
+            reason=reason,
+            attempt_refunded=refunded,
+            previous_allocation_id=previous_allocation_id,
+            previous_pool_id=previous_pool_id,
+            current_allocation_id=current_allocation_id,
+            current_pool_id=current_pool_id,
+        )
 
     def _budget_block_reason(
         self,

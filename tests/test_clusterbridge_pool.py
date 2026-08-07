@@ -445,7 +445,12 @@ def test_prepare_cache_is_idempotent_and_node_local(tmp_path: Path) -> None:
     assert sorted(results) == sorted(pool.node_addresses)
     commands = [call[2] for call in client.calls if call[0] == "run"]
     assert len(commands) == len(config.nodes)
-    assert all("sha256sum \"$archive\"" in command for command in commands)
+    assert all(
+        "digest_file=" in command
+        and "flock 9" in command
+        and "sha256sum \"$archive\"" in command
+        for command in commands
+    )
     assert all("cache-ready" in command for command in commands)
     assert all("tar -xf \"$archive\"" in command for command in commands)
 

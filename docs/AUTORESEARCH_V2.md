@@ -161,6 +161,10 @@ The scheduler applies:
 - concurrent Pilot/Scale tasks from independent Ideas.
 - bounded tolerance for transient pool probe failures.
 - crash-safe global leases with heartbeat, task-probe recovery, and adoption.
+- durable Job metadata records both allocation and pool identity; a task is
+  adopted only when the active pool still owns its local metadata.
+- ClusterBridge task submission runs in background workers, so a slow control
+  plane cannot stall the Controller heartbeat.
 
 ### Elastic resource-manager configuration
 
@@ -183,7 +187,7 @@ gpu:
     allow_cross_cluster: true
     gpu_type: H20
     priority: normal
-    release_on_shutdown: true
+    release_on_shutdown: false
     log_root: /root/shared/.clusters/.tmp/autoresearch-v2/elastic-pools
 ```
 
@@ -202,14 +206,20 @@ AutoResearch does not manage cluster GPU spin. A granted allocation is treated
 as in use throughout cache preparation, Ray startup, and experiment execution.
 After release, the cluster owns any automatic spin/idle behavior.
 
+Immutable cache archives may include an adjacent `<archive>.sha256` sidecar.
+Pool preparation reads that digest without scanning the full archive on every
+allocation and serializes extraction per node with `flock`.
+
 `owner` must be a stable ClusterBridge owner identity for the unattended
 service. `project`, `purpose`, `gpu_type`, `priority`, and
 `allow_cross_cluster` are passed to the central resource request. `log_root`
 holds generated per-allocation pool state and task logs.
 
-`release_on_shutdown: true` is recommended for scale-to-zero services so a
-stopped Controller never strands capacity. Running GPU tasks remain governed
-by the durable Job and global GPU-lease recovery rules.
+`release_on_shutdown: false` is recommended for unattended services. A normal
+zero-demand reconciliation still returns the allocation immediately, while a
+brief Controller restart preserves the allocation long enough to adopt live
+durable GPU tasks instead of interrupting them. Operators may set it to `true`
+for intentionally terminal, scale-to-zero deployments.
 
 The public manager contract is intentionally small:
 
@@ -466,7 +476,8 @@ The v2 suite covers:
 - strict Scale expansion and untouched confirmatory-split checks;
 - accepted-attempt and interrupted-attempt restart reconciliation;
 - transient GPU probe fault tolerance;
-- non-blocking GPU probes, bounded per-tick submission, and safe orphan leases;
+- non-blocking GPU probes and submissions, allocation-aware adoption, and safe
+  orphan leases;
 - bounded `max_ticks` behavior;
 - dashboard data and controls;
 - architecture guard preventing legacy control-plane imports.

@@ -707,6 +707,35 @@ def test_idle_allocation_releases_immediately(
     assert manager.snapshot()["state"] == "idle"
 
 
+def test_durable_running_gpu_job_prevents_idle_release(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    client = _FakeResourceClient()
+    client.allocations = [_allocation()]
+    clock = [0.0]
+    manager, _, _ = _manager(
+        config.gpu,
+        client=client,
+        clock=clock,
+    )
+    manager.bootstrap(required_gpus=1)
+    broker = manager.broker
+
+    clock[0] = 2.0
+    manager.reconcile(
+        required_gpus=0,
+        pending_gpu_jobs=0,
+        running_gpu_jobs=1,
+    )
+
+    assert broker is not None
+    assert manager.broker is broker
+    assert broker.closed == 0
+    assert client.releases == []
+    assert manager.snapshot()["running_gpu_jobs"] == 1
+
+
 def test_renewal_does_not_block_reconcile(tmp_path: Path) -> None:
     config = _config(tmp_path)
     started = threading.Event()

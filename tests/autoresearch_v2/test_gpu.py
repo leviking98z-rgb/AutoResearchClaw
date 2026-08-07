@@ -154,6 +154,85 @@ def test_broker_forwards_trusted_task_environment() -> None:
     assert environment["AUTORESEARCH_V2_IDEA_ID"] == "idea-env"
 
 
+def test_submit_returns_before_slow_pool_submission() -> None:
+    gate = threading.Event()
+    started = threading.Event()
+
+    class Pool:
+        def submit_task(self, command: str, **kwargs):
+            del command, kwargs
+            started.set()
+            gate.wait(timeout=2)
+
+        def probe_task(self, task_id: str):
+            del task_id
+            return {"state": "running"}
+
+    broker = GPUBroker(
+        pool=Pool(),
+        scheduler=AdaptiveGPUScheduler(total_gpus=1),
+    )
+    job = _job("idea-async-submit", (1, 1, 1))
+    job.command = "true"
+
+    began = time.monotonic()
+    decision = broker.submit(job, priorities={})
+
+    assert decision.admitted
+    assert decision.reason == "submitting"
+    assert time.monotonic() - began < 0.25
+    assert started.wait(timeout=1)
+    assert broker.leases[job.job_id].state == "reserved"
+    gate.set()
+    deadline = time.monotonic() + 2
+    while (
+        not broker._submit_futures[job.job_id].done()
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+    assert broker.reconcile() == []
+    assert broker.leases[job.job_id].state in {
+        "submitted",
+        "probe_pending",
+        "running",
+    }
+    broker.close()
+
+
+def test_async_submission_failure_is_collected_as_infrastructure_result() -> None:
+    class Pool:
+        def submit_task(self, command: str, **kwargs):
+            del command, kwargs
+            raise RuntimeError("bridge unavailable")
+
+        def probe_task(self, task_id: str):
+            del task_id
+            raise RuntimeError("task was never created")
+
+    broker = GPUBroker(
+        pool=Pool(),
+        scheduler=AdaptiveGPUScheduler(total_gpus=1),
+    )
+    job = _job("idea-async-failure", (1, 1, 1))
+    job.command = "true"
+    decision = broker.submit(job, priorities={})
+    assert decision.admitted
+
+    deadline = time.monotonic() + 2
+    completed = []
+    while not completed and time.monotonic() < deadline:
+        completed = broker.reconcile()
+        if not completed:
+            time.sleep(0.01)
+
+    assert completed[0][0] == job.job_id
+    assert completed[0][1]["pool_state"] == "submission_failed"
+    assert completed[0][1]["failure_class"] == "infrastructure_transient"
+    assert completed[0][1]["consume_attempt"] is False
+    assert broker.leases == {}
+    broker.close()
+
+
 def test_task_namespace_isolates_identical_jobs_between_runs() -> None:
     pool = _SharedPool()
     first = GPUBroker(
@@ -227,6 +306,31 @@ def test_explicit_attempt_number_produces_distinct_task_ids() -> None:
     assert first != second
     assert first.endswith("-attempt-01")
     assert second.endswith("-attempt-02")
+
+
+def test_adopt_returns_false_when_task_metadata_is_missing() -> None:
+    class Pool:
+        @staticmethod
+        def task_exists(task_id: str) -> bool:
+            del task_id
+            return False
+
+    broker = GPUBroker(
+        pool=Pool(),
+        scheduler=AdaptiveGPUScheduler(total_gpus=1),
+    )
+    job = _job("idea-missing-task", (1, 1, 1))
+
+    assert (
+        broker.adopt(
+            job,
+            task_id="missing-task",
+            allocated_gpus=1,
+        )
+        is False
+    )
+    assert broker.leases == {}
+    broker.close()
 
 
 def test_transient_probe_failure_keeps_lease() -> None:
@@ -541,7 +645,13 @@ def test_reconcile_releases_global_capacity_for_another_controller(
     assert broker_a.submit(first, priorities={}).admitted
     assert not broker_b.submit(second, priorities={}).admitted
     pool.states["idea-a-pilot-attempt-01"] = "finished"
-    assert broker_a.reconcile()[0][0] == first.job_id
+    completed = []
+    deadline = time.monotonic() + 2
+    while not completed and time.monotonic() < deadline:
+        completed = broker_a.reconcile()
+        if not completed:
+            time.sleep(0.01)
+    assert completed[0][0] == first.job_id
     assert broker_b.submit(second, priorities={}).admitted
 
 

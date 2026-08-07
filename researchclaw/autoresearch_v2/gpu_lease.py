@@ -14,6 +14,7 @@ from typing import Any
 _ACTIVE_TASK_STATES = {
     "reserved",
     "submitted",
+    "probe_pending",
     "running",
     "probe_degraded",
     "orphaned",

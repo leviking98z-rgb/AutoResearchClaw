@@ -735,6 +735,8 @@ class ResourceManagedGPUManager:
                 / f"{pool_id}.sqlite3"
             ),
         )
+        broker.allocation_id = str(allocation["id"])
+        broker.pool_id = pool_id
         with self._lock:
             if self._closed:
                 broker.close()
@@ -826,4 +828,7 @@ class ResourceManagedGPUManager:
 
     def _broker_has_running_tasks(self) -> bool:
         broker = self._broker
-        return bool(broker is not None and broker.leases)
+        return bool(
+            self._running_gpu_jobs > 0
+            or (broker is not None and broker.leases)
+        )

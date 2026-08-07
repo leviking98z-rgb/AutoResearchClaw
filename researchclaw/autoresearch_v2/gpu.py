@@ -227,9 +227,16 @@ class GPUBroker:
         manage_pool_keepalive: bool = True,
         reconcile_timeout_sec: float = 0.0,
         probe_interval_sec: float = 0.0,
+        allocation_id: str = "",
+        pool_id: str = "",
     ) -> None:
         self.pool = pool
         self.scheduler = scheduler
+        config = getattr(pool, "config", None)
+        self.allocation_id = str(allocation_id or "").strip()
+        self.pool_id = str(
+            pool_id or getattr(config, "pool_id", "") or ""
+        ).strip()
         self.manage_pool_keepalive = bool(manage_pool_keepalive)
         self.probe_failure_threshold = max(
             1,
@@ -287,6 +294,15 @@ class GPUBroker:
             concurrent.futures.Future[Any],
         ] = {}
         self._probe_not_before: dict[str, float] = {}
+        self._submit_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self._probe_workers,
+            thread_name_prefix="autoresearch-v2-gpu-submit",
+        )
+        self._submit_futures: dict[
+            str,
+            concurrent.futures.Future[None],
+        ] = {}
+        self._closed = False
         if self.manage_pool_keepalive and hasattr(
             self.pool,
             "start_keepalive",
@@ -300,6 +316,8 @@ class GPUBroker:
         priorities: Mapping[str, float],
     ) -> AllocationDecision:
         del priorities
+        if self._closed:
+            raise RuntimeError("GPU broker is closed")
         if not job.command:
             return AllocationDecision(False, 0, "command_missing")
         existing = self.leases.get(job.job_id)
@@ -339,12 +357,43 @@ class GPUBroker:
             )
         if not decision.admitted:
             return decision
+        lease = GPULease(
+            task_id=task_id,
+            idea_id=job.idea_id,
+            job_id=job.job_id,
+            allocated_gpus=decision.allocated_gpus,
+            state="reserved",
+        )
+        self.leases[job.job_id] = lease
+        try:
+            self._submit_futures[job.job_id] = self._submit_executor.submit(
+                self._submit_reserved_task,
+                job,
+                lease,
+            )
+        except Exception:
+            self.leases.pop(job.job_id, None)
+            if self.lease_registry is not None:
+                self.lease_registry.release(self.owner_id, task_id)
+            raise
+        return AllocationDecision(
+            True,
+            decision.allocated_gpus,
+            "submitting",
+            task_id,
+        )
+
+    def _submit_reserved_task(
+        self,
+        job: JobRecord,
+        lease: GPULease,
+    ) -> None:
         try:
             self.pool.submit_task(
                 job.command,
                 timeout_sec=job.timeout_sec,
-                task_id=task_id,
-                num_gpus=decision.allocated_gpus,
+                task_id=lease.task_id,
+                num_gpus=lease.allocated_gpus,
                 num_cpus=2,
                 env={
                     **self.task_env,
@@ -352,7 +401,7 @@ class GPUBroker:
                     "AUTORESEARCH_V2_JOB_ID": job.job_id,
                     "AUTORESEARCH_V2_ATTEMPT_ID": job.attempt_id,
                     "AUTORESEARCH_V2_GPU_COUNT": str(
-                        decision.allocated_gpus
+                        lease.allocated_gpus
                     ),
                     "AUTORESEARCH_V2_OUTPUT_DIR": job.expected_output_dir,
                 },
@@ -361,10 +410,8 @@ class GPUBroker:
             # submit_task uses deterministic IDs. A transport error may occur
             # after durable creation, so probe before permitting a duplicate.
             try:
-                probe = self.pool.probe_task(task_id)
+                probe = self.pool.probe_task(lease.task_id)
             except Exception:  # noqa: BLE001
-                if self.lease_registry is not None:
-                    self.lease_registry.detach(self.owner_id, task_id)
                 raise submit_error
             state = str(_value(probe, "state", "unknown"))
             if state not in {
@@ -374,28 +421,13 @@ class GPUBroker:
                 "timed_out",
                 "lost",
             }:
-                if self.lease_registry is not None:
-                    self.lease_registry.release(self.owner_id, task_id)
                 raise
         if self.lease_registry is not None:
             self.lease_registry.mark_state(
                 self.owner_id,
-                task_id,
+                lease.task_id,
                 "submitted",
             )
-        self.leases[job.job_id] = GPULease(
-            task_id=task_id,
-            idea_id=job.idea_id,
-            job_id=job.job_id,
-            allocated_gpus=decision.allocated_gpus,
-            state="submitted",
-        )
-        return AllocationDecision(
-            True,
-            decision.allocated_gpus,
-            "admitted",
-            task_id,
-        )
 
     def task_id_for(
         self,
@@ -411,15 +443,32 @@ class GPUBroker:
             attempt_number=attempt_number,
         )
 
+    def task_exists(self, task_id: str) -> bool:
+        """Return transport-free evidence that this pool owns ``task_id``."""
+
+        if not task_id:
+            return False
+        task_exists = getattr(self.pool, "task_exists", None)
+        if not callable(task_exists):
+            # Legacy/test pools cannot prove absence. Preserve the historical
+            # adoption behavior rather than turning uncertainty into loss.
+            return True
+        try:
+            return bool(task_exists(task_id))
+        except Exception:  # noqa: BLE001
+            return False
+
     def adopt(
         self,
         job: JobRecord,
         *,
         task_id: str,
         allocated_gpus: int,
-    ) -> None:
+    ) -> bool:
         if not task_id:
             raise ValueError("cannot adopt a GPU job without a task id")
+        if not self.task_exists(task_id):
+            return False
         if self.lease_registry is not None:
             self.lease_registry.adopt(
                 owner_id=self.owner_id,
@@ -435,8 +484,11 @@ class GPUBroker:
             allocated_gpus=max(1, int(allocated_gpus)),
             state="running",
         )
+        return True
 
     def reconcile(self) -> list[tuple[str, dict[str, Any]]]:
+        if self._closed:
+            return []
         self._refresh_global_leases()
         completed: list[tuple[str, dict[str, Any]]] = []
         leases = list(self.leases.items())
@@ -446,6 +498,35 @@ class GPUBroker:
         ] = {}
         terminal_jobs: set[str] = set()
         for job_id, lease in leases:
+            submit_future = self._submit_futures.get(job_id)
+            if submit_future is not None:
+                if not submit_future.done():
+                    continue
+                self._submit_futures.pop(job_id, None)
+                try:
+                    submit_future.result()
+                except Exception as exc:  # noqa: BLE001
+                    completed.append(
+                        (
+                            job_id,
+                            self._complete_payload(
+                                {
+                                    "returncode": -1,
+                                    "elapsed_sec": 0.0,
+                                    "pool_state": "submission_failed",
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                    "failure_class": "infrastructure_transient",
+                                    "consume_attempt": False,
+                                },
+                                lease,
+                                "submission_failed",
+                            ),
+                        )
+                    )
+                    terminal_jobs.add(job_id)
+                    self._release_lease(job_id, lease)
+                    continue
+                lease.state = "submitted"
             cached = self._collect_cached_task(lease.task_id)
             if cached is not None:
                 completed.append(
@@ -456,6 +537,8 @@ class GPUBroker:
                 )
                 terminal_jobs.add(job_id)
                 self._release_lease(job_id, lease)
+                continue
+            if lease.state == "reserved":
                 continue
             future = self._probe_futures.get(job_id)
             if future is not None and not future.done():
@@ -573,13 +656,34 @@ class GPUBroker:
         return completed
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._lease_stop.set()
         if self._lease_thread is not None:
             self._lease_thread.join(timeout=5.0)
+        self._submit_executor.shutdown(wait=False, cancel_futures=False)
         self._probe_executor.shutdown(wait=False, cancel_futures=True)
-        self._detach_probe_workers_for_process_exit()
+        self._detach_workers_for_process_exit(self._submit_executor)
+        self._detach_workers_for_process_exit(self._probe_executor)
         if self.lease_registry is not None:
             for lease in self.leases.values():
+                submit_future = self._submit_futures.get(lease.job_id)
+                if submit_future is not None:
+                    if not submit_future.done():
+                        self.lease_registry.detach(
+                            self.owner_id,
+                            lease.task_id,
+                        )
+                        continue
+                    try:
+                        submit_future.result()
+                    except Exception:  # noqa: BLE001
+                        self.lease_registry.release(
+                            self.owner_id,
+                            lease.task_id,
+                        )
+                        continue
                 cached = self._collect_cached_task(lease.task_id)
                 if cached is not None:
                     state = "finished"
@@ -624,11 +728,38 @@ class GPUBroker:
 
     def cancel(self, job_id: str) -> None:
         lease = self.leases.pop(job_id, None)
+        submit_future = self._submit_futures.pop(job_id, None)
         future = self._probe_futures.pop(job_id, None)
         self._probe_not_before.pop(job_id, None)
         if future is not None:
             future.cancel()
         if lease is not None:
+            if submit_future is not None and not submit_future.done():
+                cancelled = submit_future.cancel()
+                if not cancelled:
+                    try:
+                        submit_future.result(timeout=0.05)
+                    except concurrent.futures.TimeoutError:
+                        pass
+                    except Exception:  # noqa: BLE001
+                        cancelled = True
+                if not submit_future.done():
+                    if self.lease_registry is not None:
+                        self.lease_registry.detach(
+                            self.owner_id,
+                            lease.task_id,
+                        )
+                    return
+            if submit_future is not None:
+                try:
+                    submit_future.result()
+                except Exception:  # noqa: BLE001
+                    if self.lease_registry is not None:
+                        self.lease_registry.release(
+                            self.owner_id,
+                            lease.task_id,
+                        )
+                    return
             try:
                 self.pool.cancel_task(lease.task_id)
             except Exception:
@@ -679,6 +810,8 @@ class GPUBroker:
                 pending=bool(pending_jobs)
             ),
             "pending_jobs": max(0, int(pending_jobs)),
+            "allocation_id": self.allocation_id,
+            "pool_id": self.pool_id,
             "leases": [
                 {
                     "task_id": lease.task_id,
@@ -788,6 +921,7 @@ class GPUBroker:
         )
 
     def _release_lease(self, job_id: str, lease: GPULease) -> None:
+        self._submit_futures.pop(job_id, None)
         future = self._probe_futures.pop(job_id, None)
         self._probe_not_before.pop(job_id, None)
         if future is not None:
@@ -799,14 +933,17 @@ class GPUBroker:
             )
         self.leases.pop(job_id, None)
 
-    def _detach_probe_workers_for_process_exit(self) -> None:
+    @staticmethod
+    def _detach_workers_for_process_exit(
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> None:
         """Do not let slow ClusterBridge probes pin interpreter shutdown."""
 
         try:
             from concurrent.futures import thread as thread_module
         except ImportError:
             return
-        for worker in tuple(self._probe_executor._threads):
+        for worker in tuple(executor._threads):
             thread_module._threads_queues.pop(worker, None)
 
     def _lease_heartbeat_loop(self, interval_sec: float) -> None:
@@ -932,6 +1069,7 @@ def build_clusterbridge_broker_from_pool(
         manage_pool_keepalive=manage_pool_keepalive,
         reconcile_timeout_sec=reconcile_timeout_sec,
         probe_interval_sec=probe_interval_sec,
+        pool_id=str(getattr(config, "pool_id", "") or ""),
     )
 
 
