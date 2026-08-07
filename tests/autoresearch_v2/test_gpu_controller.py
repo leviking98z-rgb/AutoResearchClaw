@@ -8,14 +8,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from researchclaw.autoresearch_v2.config import V2Config
-from researchclaw.autoresearch_v2.controller import V2Controller
+from researchclaw.autoresearch_v2.controller import (
+    V2Controller,
+    _GPUFinalizationResult,
+)
 from researchclaw.autoresearch_v2.gates import GateVerdict
 from researchclaw.autoresearch_v2.gpu import AdaptiveGPUScheduler, GPUBroker
 from researchclaw.autoresearch_v2.ideas import (
     StaticIdeaGenerator,
     candidate_to_idea,
 )
-from researchclaw.autoresearch_v2.jobs import SimulatedJobExecutor
+from researchclaw.autoresearch_v2.jobs import JobOutcome, SimulatedJobExecutor
 from researchclaw.autoresearch_v2.models import (
     AttemptStatus,
     IdeaStatus,
@@ -1942,6 +1945,62 @@ def test_slow_gpu_decision_gate_does_not_block_controller_tick(
         "running_gpu_jobs": 0,
     }
     gate.release.set()
+    controller._gpu_finalizing[job.job_id].future.result(timeout=2)
+    controller._collect_gpu_finalizations()
+    assert controller.store.get_job(job.job_id).status is JobStatus.SUCCEEDED
+    controller.close()
+
+
+def test_pending_gpu_finalization_gets_one_priority_llm_slot(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "researchclaw.autoresearch_v2.controller."
+        "_live_model_gateway_calls",
+        lambda: 2,
+    )
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "concurrency": {
+                    "max_llm_jobs": 2,
+                    "max_cpu_jobs": 2,
+                    "max_gpu_jobs": 1,
+                },
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
+                    "resource_manager": {"max_gpus": 1},
+                },
+            }
+        }
+    )
+    controller, job = _durable_pending_gpu_finalization(
+        config=config,
+        store=V2Store(tmp_path),
+        decision_gate=SimpleNamespace(
+            review_experiment=lambda *args, **kwargs: GateVerdict(
+                "promote",
+                "measured signal",
+                0.9,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_finalize_gpu_execution",
+        lambda *_args: _GPUFinalizationResult(
+            outcome=JobOutcome(True, "promote", "done", {})
+        ),
+    )
+
+    controller._start_pending_gpu_finalizations()
+
+    assert job.job_id in controller._gpu_finalizing
     controller._gpu_finalizing[job.job_id].future.result(timeout=2)
     controller._collect_gpu_finalizations()
     assert controller.store.get_job(job.job_id).status is JobStatus.SUCCEEDED

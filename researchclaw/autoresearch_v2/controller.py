@@ -886,6 +886,17 @@ class V2Controller:
     def _gpu_finalizer_capacity_available(self) -> bool:
         if self._simulation_mode:
             return True
+        # A harvested GPU result is already holding a durable RUNNING Job and
+        # cannot make scientific progress until finalization. Give one
+        # finalizer priority over newly dispatched LLM work even when all
+        # configured slots are occupied; otherwise a steady stream of build
+        # jobs can starve finalization indefinitely. The bounded executor and
+        # the one-slot allowance cap the temporary oversubscription.
+        if not self._gpu_finalizing:
+            return (
+                self._running_llm_count()
+                <= self.config.concurrency.max_llm_jobs
+            )
         return (
             self._running_llm_count()
             < self.config.concurrency.max_llm_jobs
