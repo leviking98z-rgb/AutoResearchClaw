@@ -1239,9 +1239,10 @@ class V2Controller:
             job.command = command
             job.expected_output_dir = str(output_dir)
             job.attempt_id = attempt.attempt_id
-            job.submitted_task_id = (
-                f"{job.job_id}-attempt-{attempt.number:02d}"
-            )
+            # Leave new task-id construction to GPUBroker so it can include the
+            # controller namespace. A non-empty value is only recovery evidence
+            # for a task that was durably submitted by an earlier process.
+            job.submitted_task_id = ""
             self.store.save_attempt(attempt)
             try:
                 decision = self.gpu_broker.submit(

@@ -845,6 +845,7 @@ def test_controller_submits_multiple_gpu_ideas_into_one_pool(
             total_gpus=6,
             max_share_per_idea=0.5,
         ),
+        task_namespace="controller-namespace-test",
     )
     controller = V2Controller(
         config=config,
@@ -873,6 +874,7 @@ def test_controller_submits_multiple_gpu_ideas_into_one_pool(
         if "-pilot-attempt-" in task_id
     }
     assert len(pilot_requests) == 3
+    assert all(task_id.startswith("con-") for task_id in pilot_requests)
     assert sum(
         int(request["num_gpus"]) for request in pilot_requests.values()
     ) == 6
