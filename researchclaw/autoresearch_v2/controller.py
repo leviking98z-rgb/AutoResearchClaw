@@ -1216,10 +1216,16 @@ class V2Controller:
             )
         )
         # Dispatch GPU jobs first. They do not consume local CPU worker slots.
+        gpu_submissions = 0
         for job in gpu_ready:
             if not self.config.gpu.enabled:
                 continue
             if running_gpu >= self.config.concurrency.max_gpu_jobs:
+                break
+            if (
+                gpu_submissions
+                >= self.config.concurrency.max_gpu_submissions_per_tick
+            ):
                 break
             idea = self.store.get_idea(job.idea_id)
             if idea is None:
@@ -1359,6 +1365,7 @@ class V2Controller:
             }
             self.store.save_job(job)
             running_gpu += 1
+            gpu_submissions += 1
             self.store.event(
                 "gpu_job_submitted",
                 idea_id=job.idea_id,

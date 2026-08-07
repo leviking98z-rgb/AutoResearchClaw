@@ -245,6 +245,8 @@ def test_transient_probe_failure_keeps_lease() -> None:
         pool=Pool(),
         scheduler=AdaptiveGPUScheduler(total_gpus=2),
         probe_failure_threshold=2,
+        reconcile_timeout_sec=0.5,
+        probe_interval_sec=0,
     )
     broker.leases["job"] = GPULease(
         "task",
@@ -308,7 +310,7 @@ def test_reconcile_returns_before_slow_probe_and_reuses_inflight_future() -> Non
     assert broker.reconcile() == []
     assert time.monotonic() - started < 0.5
     assert pool.calls == 1
-    assert broker.leases["job"].state == "probe_degraded"
+    assert broker.leases["job"].state == "running"
 
     assert broker.reconcile() == []
     assert pool.calls == 1
@@ -319,6 +321,57 @@ def test_reconcile_returns_before_slow_probe_and_reuses_inflight_future() -> Non
         time.sleep(0.01)
     assert broker.reconcile() == []
     assert broker.leases["job"].state == "running"
+    broker.close()
+
+
+def test_default_reconcile_never_waits_for_slow_probe() -> None:
+    gate = threading.Event()
+
+    class Pool:
+        def probe_task(self, task_id: str):
+            del task_id
+            gate.wait(timeout=2)
+            return {"state": "running"}
+
+    broker = GPUBroker(
+        pool=Pool(),
+        scheduler=AdaptiveGPUScheduler(total_gpus=1),
+    )
+    broker.leases["job"] = GPULease("task", "idea", "job", 1)
+
+    started = time.monotonic()
+    assert broker.reconcile() == []
+    assert time.monotonic() - started < 0.25
+    assert broker.leases["job"].state == "running"
+
+    gate.set()
+    broker.close()
+
+
+def test_probe_interval_avoids_transport_call_on_every_tick() -> None:
+    class Pool:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def probe_task(self, task_id: str):
+            del task_id
+            self.calls += 1
+            return {"state": "running"}
+
+    pool = Pool()
+    broker = GPUBroker(
+        pool=pool,
+        scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        reconcile_timeout_sec=0.5,
+        probe_interval_sec=60,
+    )
+    broker.leases["job"] = GPULease("task", "idea", "job", 1)
+
+    assert broker.reconcile() == []
+    assert pool.calls == 1
+    for _ in range(5):
+        assert broker.reconcile() == []
+    assert pool.calls == 1
     broker.close()
 
 
@@ -386,6 +439,7 @@ def test_repeated_probe_failures_do_not_complete_scientific_job() -> None:
         scheduler=AdaptiveGPUScheduler(total_gpus=1),
         probe_failure_threshold=2,
         reconcile_timeout_sec=0.5,
+        probe_interval_sec=0,
     )
     broker.leases["job"] = GPULease("task", "idea", "job", 1)
 
@@ -693,6 +747,87 @@ def test_heartbeat_prunes_expired_orphan_without_new_reservation(
     registry.heartbeat("controller")
 
     assert registry.list_leases() == []
+
+
+def test_broker_preserves_unverified_expired_orphan_with_durable_task(
+    tmp_path: Path,
+) -> None:
+    now = [100.0]
+    registry = _registry(
+        tmp_path / "leases.sqlite3",
+        clock=lambda: now[0],
+    )
+    assert registry.reserve(
+        owner_id="crashed",
+        task_id="known-task",
+        idea_id="idea-a",
+        job_id="job-a",
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+    ).admitted
+    registry.detach("crashed", "known-task")
+    now[0] = 111.0
+
+    class Pool:
+        @staticmethod
+        def task_exists(task_id: str) -> bool:
+            return task_id == "known-task"
+
+    broker = GPUBroker(
+        pool=Pool(),
+        scheduler=AdaptiveGPUScheduler(total_gpus=4),
+        lease_registry=registry,
+        owner_id="controller",
+        lease_heartbeat_interval_sec=0,
+    )
+
+    broker._refresh_global_leases()
+
+    assert [lease.task_id for lease in registry.list_leases()] == [
+        "known-task"
+    ]
+    broker.close()
+
+
+def test_broker_reaps_expired_reservation_without_durable_task(
+    tmp_path: Path,
+) -> None:
+    now = [100.0]
+    registry = _registry(
+        tmp_path / "leases.sqlite3",
+        clock=lambda: now[0],
+    )
+    assert registry.reserve(
+        owner_id="crashed",
+        task_id="missing-task",
+        idea_id="idea-a",
+        job_id="job-a",
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+    ).admitted
+    registry.detach("crashed", "missing-task")
+    now[0] = 111.0
+
+    class Pool:
+        @staticmethod
+        def task_exists(task_id: str) -> bool:
+            del task_id
+            return False
+
+    broker = GPUBroker(
+        pool=Pool(),
+        scheduler=AdaptiveGPUScheduler(total_gpus=4),
+        lease_registry=registry,
+        owner_id="controller",
+        lease_heartbeat_interval_sec=0,
+    )
+
+    broker._refresh_global_leases()
+
+    assert registry.list_leases() == []
+    broker.close()
 
 
 def test_registry_rejects_capacity_mismatch(tmp_path: Path) -> None:

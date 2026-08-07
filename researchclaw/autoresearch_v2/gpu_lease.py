@@ -194,11 +194,17 @@ class SharedGPULeaseRegistry:
                     f"{self.total_gpus} total/{self.reserved_gpus} reserved"
                 )
 
-    def heartbeat(self, owner_id: str) -> None:
+    def heartbeat(
+        self,
+        owner_id: str,
+        *,
+        prune_expired_orphans: bool = True,
+    ) -> None:
         now = self.clock()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            self._prune_expired_orphans(connection, now)
+            if prune_expired_orphans:
+                self._prune_expired_orphans(connection, now)
             self._touch_owner(connection, owner_id, now)
             connection.execute(
                 """
@@ -225,6 +231,7 @@ class SharedGPULeaseRegistry:
         min_gpus: int,
         preferred_gpus: int,
         max_gpus: int,
+        prune_expired_orphans: bool = True,
     ) -> LeaseReservation:
         now = self.clock()
         minimum = max(0, int(min_gpus))
@@ -236,7 +243,8 @@ class SharedGPULeaseRegistry:
             # and must not strand capacity when no matching pool task exists.
             # Active orphaned tasks are extended by ``reap_stale`` before
             # callers reserve through GPUBroker.
-            self._prune_expired_orphans(connection, now)
+            if prune_expired_orphans:
+                self._prune_expired_orphans(connection, now)
             self._touch_owner(connection, owner_id, now)
             existing = connection.execute(
                 """
@@ -470,8 +478,20 @@ class SharedGPULeaseRegistry:
             for row in rows
         ]
 
-    def reap_stale(self, probe_task: Callable[[str], Any]) -> list[str]:
-        """Reclaim stale-owner leases only after terminal probe or expired TTL."""
+    def reap_stale(
+        self,
+        probe_task: Callable[[str], Any],
+        *,
+        release_unverified_expired: bool = True,
+    ) -> list[str]:
+        """Reclaim stale-owner leases after terminal evidence.
+
+        ``release_unverified_expired`` preserves the legacy registry API for
+        explicit maintenance callers. Live Brokers disable it: a TTL proves
+        that the Controller owner disappeared, not that the detached remote
+        GPU process stopped, so deleting an unverified lease could permit a
+        duplicate submission.
+        """
 
         now = self.clock()
         cutoff = now - self.owner_ttl_sec
@@ -502,7 +522,10 @@ class SharedGPULeaseRegistry:
             try:
                 state = _state(probe_task(task_id))
             except Exception:  # noqa: BLE001
-                if float(row["expires_at"]) <= now:
+                if (
+                    release_unverified_expired
+                    and float(row["expires_at"]) <= now
+                ):
                     self.release("", task_id, force=True)
                     reclaimed.append(task_id)
                 continue
@@ -511,7 +534,10 @@ class SharedGPULeaseRegistry:
                 reclaimed.append(task_id)
             elif state in _ACTIVE_TASK_STATES:
                 self._extend_orphan(task_id, state, now)
-            elif float(row["expires_at"]) <= now:
+            elif (
+                release_unverified_expired
+                and float(row["expires_at"]) <= now
+            ):
                 self.release("", task_id, force=True)
                 reclaimed.append(task_id)
         return reclaimed

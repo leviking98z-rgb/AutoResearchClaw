@@ -285,9 +285,12 @@ execution it writes a controller-side HMAC-signed
 stdout/stderr hashes, and the complete artifact manifest. Generated code cannot
 self-sign this evidence because the key never enters its environment.
 
-`max_gpu_jobs`, GPU-hour budgets, wall-clock/no-progress limits,
-allocated-GPU-time accounting, pool utilization, and per-Idea fair share are
-enforced by the v2 Controller.
+`max_gpu_jobs`, `max_gpu_submissions_per_tick`, GPU-hour budgets,
+wall-clock/no-progress limits, allocated-GPU-time accounting, pool utilization,
+and per-Idea fair share are enforced by the v2 Controller. Detached GPU result
+probes run asynchronously with a transport cooldown; a slow ClusterBridge probe
+does not block the Controller heartbeat and is not reported as a scientific
+failure.
 
 ## Decision policy
 
@@ -463,6 +466,7 @@ The v2 suite covers:
 - strict Scale expansion and untouched confirmatory-split checks;
 - accepted-attempt and interrupted-attempt restart reconciliation;
 - transient GPU probe fault tolerance;
+- non-blocking GPU probes, bounded per-tick submission, and safe orphan leases;
 - bounded `max_ticks` behavior;
 - dashboard data and controls;
 - architecture guard preventing legacy control-plane imports.

@@ -24,6 +24,7 @@ def test_config_accepts_parallel_defaults() -> None:
     )
     assert config.population.active_idea_target == 6
     assert config.concurrency.max_gpu_jobs == 6
+    assert config.concurrency.max_gpu_submissions_per_tick == 2
     assert config.budgets.max_job_attempts == 3
     assert config.budgets.max_design_revisions == 2
     assert config.research_memory.enabled is True
@@ -32,6 +33,31 @@ def test_config_accepts_parallel_defaults() -> None:
     assert config.usage_monitoring.history_hours == 168
     assert config.database_path == config.root / "autoresearch.db"
     assert config.database_backup_path is None
+
+
+def test_config_accepts_gpu_submission_tick_limit() -> None:
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "concurrency": {
+                    "max_gpu_submissions_per_tick": 3,
+                }
+            }
+        }
+    )
+
+    assert config.concurrency.max_gpu_submissions_per_tick == 3
+
+    with pytest.raises(ValueError, match="concurrency limits"):
+        V2Config.from_mapping(
+            {
+                "autoresearch_v2": {
+                    "concurrency": {
+                        "max_gpu_submissions_per_tick": 0,
+                    }
+                }
+            }
+        )
 
 
 def test_config_accepts_local_database_and_shared_backup(tmp_path) -> None:

@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import threading
+import time
 import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -134,6 +135,7 @@ class AdaptiveGPUScheduler:
             in {
                 "reserved",
                 "submitted",
+                "probe_pending",
                 "running",
                 "probe_degraded",
                 "orphaned",
@@ -169,7 +171,14 @@ class AdaptiveGPUScheduler:
             lease.allocated_gpus
             for lease in current
             if lease.idea_id == job.idea_id
-            and lease.state in {"submitted", "running"}
+            and lease.state
+            in {
+                "submitted",
+                "probe_pending",
+                "running",
+                "probe_degraded",
+                "orphaned",
+            }
         )
         cap = min(
             available,
@@ -216,7 +225,8 @@ class GPUBroker:
         task_env: Mapping[str, str] | None = None,
         task_namespace: str = "",
         manage_pool_keepalive: bool = True,
-        reconcile_timeout_sec: float = 2.0,
+        reconcile_timeout_sec: float = 0.0,
+        probe_interval_sec: float = 0.0,
     ) -> None:
         self.pool = pool
         self.scheduler = scheduler
@@ -231,10 +241,11 @@ class GPUBroker:
         }
         self.task_namespace = stable_task_namespace(task_namespace)
         self.leases: dict[str, GPULease] = {}
-        self.reconcile_timeout_sec = max(
-            0.05,
-            float(reconcile_timeout_sec),
-        )
+        # Reconciliation runs on the Controller heartbeat thread. Keep it
+        # strictly non-blocking by default: background probes are harvested on
+        # later ticks instead of making every tick wait for ClusterBridge.
+        self.reconcile_timeout_sec = max(0.0, float(reconcile_timeout_sec))
+        self.probe_interval_sec = max(0.0, float(probe_interval_sec))
         self.lease_registry = lease_registry
         self.owner_id = owner_id or (
             f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
@@ -242,7 +253,10 @@ class GPUBroker:
         self._lease_stop = threading.Event()
         self._lease_thread: threading.Thread | None = None
         if self.lease_registry is not None:
-            self.lease_registry.heartbeat(self.owner_id)
+            self.lease_registry.heartbeat(
+                self.owner_id,
+                prune_expired_orphans=False,
+            )
             interval = lease_heartbeat_interval_sec
             if interval is None:
                 interval = min(
@@ -272,6 +286,7 @@ class GPUBroker:
             str,
             concurrent.futures.Future[Any],
         ] = {}
+        self._probe_not_before: dict[str, float] = {}
         if self.manage_pool_keepalive and hasattr(
             self.pool,
             "start_keepalive",
@@ -309,6 +324,7 @@ class GPUBroker:
                 min_gpus=job.min_gpus,
                 preferred_gpus=job.preferred_gpus,
                 max_gpus=job.max_gpus,
+                prune_expired_orphans=False,
             )
             decision = AllocationDecision(
                 reservation.admitted,
@@ -442,7 +458,12 @@ class GPUBroker:
                 self._release_lease(job_id, lease)
                 continue
             future = self._probe_futures.get(job_id)
+            if future is not None and not future.done():
+                probes[job_id] = future
+                continue
             if future is None:
+                if time.monotonic() < self._probe_not_before.get(job_id, 0.0):
+                    continue
                 future = self._probe_executor.submit(
                     self.pool.probe_task,
                     lease.task_id,
@@ -454,7 +475,7 @@ class GPUBroker:
             for future in probes.values()
             if not future.done()
         ]
-        if unfinished:
+        if unfinished and self.reconcile_timeout_sec > 0:
             concurrent.futures.wait(
                 tuple(unfinished),
                 timeout=self.reconcile_timeout_sec,
@@ -465,15 +486,16 @@ class GPUBroker:
                 continue
             future = probes.get(job_id)
             if future is None or not future.done():
-                lease.state = "probe_degraded"
-                if self.lease_registry is not None:
-                    self.lease_registry.mark_state(
-                        self.owner_id,
-                        lease.task_id,
-                        lease.state,
-                    )
+                # A healthy in-flight probe is not degradation. Preserve the
+                # last confirmed task state and expose "probe_pending" only for
+                # a never-confirmed reservation/submission.
+                if lease.state in {"reserved", "submitted"}:
+                    lease.state = "probe_pending"
                 continue
             self._probe_futures.pop(job_id, None)
+            self._probe_not_before[job_id] = (
+                time.monotonic() + self.probe_interval_sec
+            )
             try:
                 probe = future.result()
             except Exception:  # noqa: BLE001
@@ -603,6 +625,7 @@ class GPUBroker:
     def cancel(self, job_id: str) -> None:
         lease = self.leases.pop(job_id, None)
         future = self._probe_futures.pop(job_id, None)
+        self._probe_not_before.pop(job_id, None)
         if future is not None:
             future.cancel()
         if lease is not None:
@@ -672,8 +695,17 @@ class GPUBroker:
     def _refresh_global_leases(self) -> None:
         if self.lease_registry is None:
             return
-        self.lease_registry.heartbeat(self.owner_id)
-        self.lease_registry.reap_stale(self._reap_probe_task)
+        self.lease_registry.heartbeat(
+            self.owner_id,
+            prune_expired_orphans=False,
+        )
+        # Stale owners are inspected using only cached/asynchronous evidence.
+        # Unknown expired work remains reserved rather than being deleted and
+        # accidentally submitted twice while a remote GPU task is still alive.
+        self.lease_registry.reap_stale(
+            self._reap_probe_task,
+            release_unverified_expired=False,
+        )
 
     def _collect_cached_task(self, task_id: str) -> Any | None:
         collect_cached = getattr(self.pool, "collect_cached_task", None)
@@ -695,10 +727,14 @@ class GPUBroker:
             if future is not None and future.done():
                 return future.result()
             break
+        task_exists = getattr(self.pool, "task_exists", None)
+        if callable(task_exists) and not task_exists(task_id):
+            # No durable task metadata means this was an abandoned reservation,
+            # not a detached remote task that still needs protection.
+            return {"state": "lost"}
         # Shared lease reaping runs on the Controller heartbeat path. Never
-        # perform a new ClusterBridge RPC here: expired orphans are already
-        # eligible for forced cleanup, while non-expired uncertain work stays
-        # reserved until its TTL or an asynchronous Broker probe resolves it.
+        # perform a new ClusterBridge RPC here: uncertain work stays reserved
+        # until a cached or asynchronous Broker probe resolves it.
         raise TimeoutError("no cached asynchronous GPU probe result")
 
     @staticmethod
@@ -753,6 +789,7 @@ class GPUBroker:
 
     def _release_lease(self, job_id: str, lease: GPULease) -> None:
         future = self._probe_futures.pop(job_id, None)
+        self._probe_not_before.pop(job_id, None)
         if future is not None:
             future.cancel()
         if self.lease_registry is not None:
@@ -776,7 +813,10 @@ class GPUBroker:
         while not self._lease_stop.wait(interval_sec):
             try:
                 if self.lease_registry is not None:
-                    self.lease_registry.heartbeat(self.owner_id)
+                    self.lease_registry.heartbeat(
+                        self.owner_id,
+                        prune_expired_orphans=False,
+                    )
             except Exception:  # noqa: BLE001, S112
                 # Scheduling paths retry the heartbeat synchronously and fail
                 # closed if the shared registry remains unavailable.
@@ -842,7 +882,8 @@ def build_clusterbridge_broker_from_pool(
     lease_registry_path: str | Path | None = None,
     task_namespace: str = "",
     manage_pool_keepalive: bool = True,
-    reconcile_timeout_sec: float = 2.0,
+    reconcile_timeout_sec: float = 0.0,
+    probe_interval_sec: float = 0.0,
 ) -> GPUBroker:
     """Build a broker around an already claimed and prepared pool object."""
 
@@ -890,6 +931,7 @@ def build_clusterbridge_broker_from_pool(
         task_namespace=task_namespace,
         manage_pool_keepalive=manage_pool_keepalive,
         reconcile_timeout_sec=reconcile_timeout_sec,
+        probe_interval_sec=probe_interval_sec,
     )
 
 

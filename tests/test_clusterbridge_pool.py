@@ -732,6 +732,25 @@ def test_probe_and_collect_use_cached_terminal_summary_without_transport(
     assert len(client.calls) == before
 
 
+def test_task_exists_uses_only_local_durable_metadata(tmp_path: Path) -> None:
+    client = FakeClient()
+    pool = ClusterBridgePool(
+        _config(tmp_path, node_count=1),
+        client=client,
+    )
+    pool.claim(start_keepalive=False)
+    pool._prepared = True
+    task_dir = pool.state_dir / "tasks" / "known-task"
+    task_dir.mkdir(parents=True)
+    (task_dir / "request.json").write_text("{}", encoding="utf-8")
+    before = len(client.calls)
+
+    assert pool.task_exists("known-task") is True
+    assert pool.task_exists("missing-task") is False
+    assert pool.task_exists("../invalid") is False
+    assert len(client.calls) == before
+
+
 def test_async_task_id_conflict_fails_closed(tmp_path: Path) -> None:
     client = FakeClient()
     pool = ClusterBridgePool(

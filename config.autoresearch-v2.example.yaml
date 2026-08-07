@@ -24,6 +24,9 @@ autoresearch_v2:
     max_llm_jobs: 4
     max_cpu_jobs: 8
     max_gpu_jobs: 8
+    # Bound synchronous ClusterBridge launch work in one heartbeat. Remaining
+    # ready GPU jobs are submitted on later ticks.
+    max_gpu_submissions_per_tick: 2
     poll_interval_sec: 2
 
   budgets:

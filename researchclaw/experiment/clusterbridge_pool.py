@@ -1456,6 +1456,22 @@ class ClusterBridgePool:
         summary = _read_json_mapping(task_dir / "summary.json")
         return PoolTaskResult(**summary) if summary else None
 
+    def task_exists(self, task_id: str) -> bool:
+        """Return whether durable local metadata exists for ``task_id``.
+
+        This is deliberately transport-free and is used to distinguish an
+        orphaned lease for a known detached task from a reservation that never
+        made it through submission.
+        """
+
+        if not _safe_task_id(task_id):
+            return False
+        task_dir = self._state_dir / "tasks" / task_id
+        return (
+            task_dir.is_dir()
+            and (task_dir / "request.json").is_file()
+        )
+
     def _task_startup_grace_sec(self) -> float:
         """Bound false-loss protection to a short launch/adoption window."""
 

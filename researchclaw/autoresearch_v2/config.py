@@ -41,6 +41,7 @@ class ConcurrencyConfig:
     max_llm_jobs: int = 4
     max_cpu_jobs: int = 8
     max_gpu_jobs: int = 8
+    max_gpu_submissions_per_tick: int = 2
     poll_interval_sec: float = 2.0
 
 
@@ -291,6 +292,9 @@ class V2Config:
             max_llm_jobs=int(concurrency_raw.get("max_llm_jobs", 4)),
             max_cpu_jobs=int(concurrency_raw.get("max_cpu_jobs", 8)),
             max_gpu_jobs=int(concurrency_raw.get("max_gpu_jobs", 8)),
+            max_gpu_submissions_per_tick=int(
+                concurrency_raw.get("max_gpu_submissions_per_tick", 2)
+            ),
             poll_interval_sec=float(
                 concurrency_raw.get("poll_interval_sec", 2.0)
             ),
@@ -731,6 +735,7 @@ class V2Config:
             self.concurrency.max_llm_jobs,
             self.concurrency.max_cpu_jobs,
             self.concurrency.max_gpu_jobs,
+            self.concurrency.max_gpu_submissions_per_tick,
         ) < 1:
             raise ValueError("concurrency limits must be positive")
         if not 0 < self.gpu.target_utilization <= 1:

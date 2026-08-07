@@ -729,6 +729,7 @@ class ResourceManagedGPUManager:
             task_env=self.task_env,
             task_namespace=self.task_namespace,
             manage_pool_keepalive=False,
+            probe_interval_sec=5.0,
             lease_registry_path=(
                 Path("/root/.local/state/autoresearch-v2/gpu-leases")
                 / f"{pool_id}.sqlite3"
