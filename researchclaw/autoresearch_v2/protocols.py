@@ -329,8 +329,9 @@ def compile_screening_protocol(
         "evidence_valid",
         "gate_statistic_defined",
         "criterion_results",
-        "mechanism_activation",
     ]
+    if plan["mechanism_activation_gate"]["required"]:
+        plan["required_runtime_evidence"].append("mechanism_activation")
     plan["compiler"] = {
         "name": "autoresearch_v2_protocol_compiler",
         "version": 3,
