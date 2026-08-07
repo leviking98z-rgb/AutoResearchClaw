@@ -71,6 +71,24 @@ class V2Store:
         # as crash debris while a worker is committing it.
         self._commit_lock = threading.Lock()
 
+    @staticmethod
+    def _snapshot_ignore(directory: str, names: list[str]) -> set[str]:
+        """Exclude non-scientific cache residue from snapshots.
+
+        Runtime artifacts are handled explicitly by ``snapshot_current``:
+        downstream Pilot/Scale/Report jobs need them, while Build repairs do
+        not. Python bytecode and test caches are never scientific inputs and
+        can always be omitted.
+        """
+
+        return {
+            name
+            for name in names
+            if name == "__pycache__"
+            or name.endswith((".pyc", ".pyo"))
+            or name == ".pytest_cache"
+        }
+
     def initialize(self, *, recover_filesystem: bool = True) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.ideas_root.mkdir(parents=True, exist_ok=True)
@@ -1203,16 +1221,38 @@ class V2Store:
         )
         return current
 
-    def snapshot_current(self, attempt: AttemptRecord) -> Path:
-        """Copy accepted current state into a new immutable candidate."""
+    def snapshot_current(
+        self,
+        attempt: AttemptRecord,
+        *,
+        include_artifacts: bool = True,
+    ) -> Path:
+        """Copy accepted current state into a new immutable candidate.
+
+        Build jobs should pass ``include_artifacts=False`` so iterative source
+        repairs do not recursively copy prior smoke/pilot/scale outputs over
+        CephFS. Downstream jobs keep the default because accepted artifacts are
+        part of their scientific input and reporting history.
+        """
 
         candidate = self.prepare_candidate(attempt)
         current = self.current_dir(attempt.idea_id)
         if current.is_dir():
             for child in current.iterdir():
+                if child.name == "artifacts" and not include_artifacts:
+                    continue
+                if child.name in self._snapshot_ignore(
+                    str(current),
+                    [child.name],
+                ):
+                    continue
                 target = candidate / child.name
                 if child.is_dir():
-                    shutil.copytree(child, target)
+                    shutil.copytree(
+                        child,
+                        target,
+                        ignore=self._snapshot_ignore,
+                    )
                 else:
                     shutil.copy2(child, target)
         return candidate

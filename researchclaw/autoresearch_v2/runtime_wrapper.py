@@ -13,6 +13,7 @@ same source is copied into candidate workspaces and executed on GPU nodes.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 import os
@@ -59,6 +60,11 @@ def compile_build_output(
         core = _command_argv(commands.get(mode))
         _validate_core_argv(core, mode=mode)
         core = _bind_mode_output(core, mode=mode)
+        _validate_entrypoint_argv(
+            files=files,
+            argv=core,
+            mode=mode,
+        )
         output = f"artifacts/{mode}"
         core_commands[mode] = core
         wrapped_commands[mode] = [
@@ -155,6 +161,7 @@ def normalize_runtime_artifacts(
     uncertainty = _compile_uncertainty_evidence(
         plan=plan,
         raw_runtime=raw_runtime,
+        raw_metrics=raw_metrics,
         metrics=metrics,
         mode=mode,
     )
@@ -327,6 +334,19 @@ def _numeric_metrics(
         candidates.update(nested)
     else:
         candidates.update(raw_metrics)
+    # Generated workers often mirror provenance objects beside scalar metrics.
+    # They are useful diagnostics, but must not be interpreted as malformed
+    # numeric measurements.
+    structured_diagnostics = {
+        "call_counts",
+        "uncertainty",
+        "datasets_loaded",
+        "dataset_roles",
+        "split_identifiers",
+        "criterion_results",
+        "examples_by_role",
+        "model_loaded",
+    }
 
     metrics: dict[str, float | int] = {}
     diagnostics: dict[str, Any] = {}
@@ -342,6 +362,9 @@ def _numeric_metrics(
     for raw_name, value in candidates.items():
         name = str(raw_name)
         if name in reserved:
+            continue
+        if name in structured_diagnostics:
+            diagnostics[name] = value
             continue
         if _finite_number(value):
             metrics[name] = value
@@ -376,7 +399,7 @@ def _compile_criterion_results(
             if not identifier:
                 continue
             row = raw_results.get(identifier, {})
-            value = row.get("value")
+            value = row.get("value", row.get("measured_value"))
             if not _finite_number(value):
                 value = metrics.get(metric_name)
             if not _finite_number(value):
@@ -585,6 +608,7 @@ def _compile_uncertainty_evidence(
     *,
     plan: Mapping[str, Any],
     raw_runtime: Mapping[str, Any],
+    raw_metrics: Mapping[str, Any],
     metrics: Mapping[str, float | int],
     mode: str,
 ) -> dict[str, Any]:
@@ -607,8 +631,19 @@ def _compile_uncertainty_evidence(
         gate.get("name", "") if isinstance(gate, Mapping) else ""
     )
     raw = raw_runtime.get("uncertainty")
+    if not isinstance(raw, Mapping):
+        nested_metrics = raw_runtime.get("metrics")
+        if isinstance(nested_metrics, Mapping):
+            raw = nested_metrics.get("uncertainty")
+    if not isinstance(raw, Mapping):
+        raw = raw_metrics.get("uncertainty")
+    if not isinstance(raw, Mapping):
+        nested_metrics = raw_metrics.get("metrics")
+        if isinstance(nested_metrics, Mapping):
+            raw = nested_metrics.get("uncertainty")
     if isinstance(raw, Mapping):
         supplied = dict(raw)
+        supplied.setdefault("available", True)
         supplied.setdefault("method", configured.get("method"))
         supplied.setdefault(
             "confidence_level",
@@ -978,6 +1013,8 @@ def _validate_call_counts(
 
 def _normalize_seeds(runtime: Mapping[str, Any]) -> list[Any]:
     raw = runtime.get("seeds")
+    if raw is None and "seeds_used" in runtime:
+        raw = runtime["seeds_used"]
     if raw is None and "seed" in runtime:
         raw = [runtime["seed"]]
     if not isinstance(raw, list) or not raw:
@@ -1189,6 +1226,78 @@ def _bind_mode_output(argv: list[str], *, mode: str) -> list[str]:
     _replace_option(bound, "--mode", mode)
     _replace_option(bound, "--output", f"artifacts/{mode}")
     return bound
+
+
+def _validate_entrypoint_argv(
+    *,
+    files: Mapping[str, Any],
+    argv: list[str],
+    mode: str,
+) -> None:
+    """Reject obvious command/parser mismatches before a GPU is consumed.
+
+    Generated entrypoints normally use ``argparse``. Required options can be
+    determined statically when their flags are string literals, so a command
+    that omits ``--mode`` or ``--output`` should be repaired during Build
+    rather than discovered after model loading on the cluster.
+    """
+
+    source = files.get(argv[1])
+    if not isinstance(source, str):
+        raise RuntimeArtifactError(
+            f"commands.{mode} entrypoint {argv[1]!r} is not in files"
+        )
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return
+    required_options: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if not (
+            isinstance(function, ast.Attribute)
+            and function.attr == "add_argument"
+        ):
+            continue
+        option = next(
+            (
+                str(argument.value)
+                for argument in node.args
+                if isinstance(argument, ast.Constant)
+                and isinstance(argument.value, str)
+                and argument.value.startswith("--")
+            ),
+            "",
+        )
+        if not option:
+            continue
+        required = any(
+            keyword.arg == "required"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in node.keywords
+        )
+        if required:
+            required_options.add(option)
+    missing = sorted(
+        option
+        for option in required_options
+        if not _argv_has_option(argv, option)
+    )
+    if missing:
+        raise RuntimeArtifactError(
+            f"commands.{mode} missing required entrypoint options: "
+            + ", ".join(missing)
+        )
+
+
+def _argv_has_option(argv: list[str], option: str) -> bool:
+    return any(
+        argument == option or argument.startswith(option + "=")
+        for argument in argv[2:]
+    )
 
 
 def _replace_option(argv: list[str], option: str, value: str) -> None:

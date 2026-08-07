@@ -147,6 +147,77 @@ def test_failed_candidate_never_mutates_current(tmp_path: Path) -> None:
     )
 
 
+def test_source_only_snapshot_skips_artifacts_and_cache(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="idea-test-build",
+        idea_id=idea.idea_id,
+        kind=JobKind.BUILD,
+    )
+    store.save_job(job)
+
+    first = store.create_attempt(job)
+    candidate = store.prepare_candidate(first)
+    (candidate / "main.py").write_text("print('accepted')\n", encoding="utf-8")
+    (candidate / "plan.json").write_text("{}\n", encoding="utf-8")
+    (candidate / "artifacts" / "pilot").mkdir(parents=True)
+    (candidate / "artifacts" / "pilot" / "metrics.json").write_text(
+        '{"result_valid": true}\n',
+        encoding="utf-8",
+    )
+    (candidate / "__pycache__").mkdir()
+    (candidate / "__pycache__" / "main.cpython-311.pyc").write_bytes(b"cache")
+    store.commit_candidate(first)
+
+    job.attempt = 1
+    second = store.create_attempt(job)
+    snapshot = store.snapshot_current(second, include_artifacts=False)
+
+    assert (snapshot / "main.py").is_file()
+    assert (snapshot / "plan.json").is_file()
+    assert not (snapshot / "artifacts").exists()
+    assert not (snapshot / "__pycache__").exists()
+
+
+def test_snapshot_current_preserves_artifacts_by_default(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="idea-test-pilot",
+        idea_id=idea.idea_id,
+        kind=JobKind.PILOT,
+    )
+    store.save_job(job)
+
+    first = store.create_attempt(job)
+    candidate = store.prepare_candidate(first)
+    (candidate / "main.py").write_text("print('accepted')\n", encoding="utf-8")
+    (candidate / "artifacts" / "pilot").mkdir(parents=True)
+    (candidate / "artifacts" / "pilot" / "metrics.json").write_text(
+        '{"result_valid": true}\n',
+        encoding="utf-8",
+    )
+    (candidate / "__pycache__").mkdir()
+    (candidate / "__pycache__" / "main.cpython-311.pyc").write_bytes(b"cache")
+    store.commit_candidate(first)
+
+    job.attempt = 1
+    second = store.create_attempt(job)
+    snapshot = store.snapshot_current(second)
+
+    assert (snapshot / "artifacts" / "pilot" / "metrics.json").is_file()
+    assert not (snapshot / "__pycache__").exists()
+
+
 def test_create_attempt_is_not_durable_until_saved(tmp_path: Path) -> None:
     store = V2Store(tmp_path)
     store.initialize()

@@ -740,7 +740,10 @@ class BuildJobExecutor:
         started = time.monotonic()
         current = store.current_dir(idea.idea_id)
         plan = json.loads((current / "plan.json").read_text(encoding="utf-8"))
-        candidate = store.snapshot_current(attempt)
+        candidate = store.snapshot_current(
+            attempt,
+            include_artifacts=False,
+        )
         result = self.role.call(
             self._prompt(idea, plan, prior_failure=job.result),
             # Build is a small executable scaffold, not a generated framework.
@@ -789,7 +792,10 @@ class BuildJobExecutor:
             repair = getattr(self.role, "repair", None)
             if repair_errors and callable(repair):
                 shutil.rmtree(candidate, ignore_errors=True)
-                candidate = store.snapshot_current(attempt)
+                candidate = store.snapshot_current(
+                    attempt,
+                    include_artifacts=False,
+                )
                 result = repair(
                     output,
                     repair_errors,

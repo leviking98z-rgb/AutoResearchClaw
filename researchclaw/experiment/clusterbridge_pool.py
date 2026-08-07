@@ -1011,10 +1011,89 @@ class ClusterBridgePool:
         )
         payload_path = task_dir / "ray_task.json"
         task_script = task_dir / "ray_task.py"
+        experiment_supervisor = (
+            "import ctypes, os, signal, subprocess, sys\n"
+            "command=sys.argv[1]\n"
+            "expected_parent_pid=int(sys.argv[2])\n"
+            "grace_sec=float(sys.argv[3])\n"
+            "child=None\n"
+            "cancel_signal=None\n"
+            "def terminate_child(signum):\n"
+            "    process=child\n"
+            "    if process is None or process.poll() is not None:\n"
+            "        return\n"
+            "    try:\n"
+            "        os.killpg(process.pid, signum)\n"
+            "    except ProcessLookupError:\n"
+            "        pass\n"
+            "def stop_child(signum):\n"
+            "    process=child\n"
+            "    terminate_child(signum)\n"
+            "    if process is None or process.poll() is not None:\n"
+            "        return\n"
+            "    try:\n"
+            "        process.wait(timeout=grace_sec)\n"
+            "    except subprocess.TimeoutExpired:\n"
+            "        terminate_child(signal.SIGKILL)\n"
+            "        try:\n"
+            "            process.wait(timeout=grace_sec)\n"
+            "        except subprocess.TimeoutExpired:\n"
+            "            pass\n"
+            "def handle_signal(signum, _frame):\n"
+            "    global cancel_signal\n"
+            "    cancel_signal=signum\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "    signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+            "    stop_child(signum)\n"
+            "signal.signal(signal.SIGTERM, handle_signal)\n"
+            "signal.signal(signal.SIGINT, handle_signal)\n"
+            "if sys.platform.startswith('linux'):\n"
+            "    try:\n"
+            "        ctypes.CDLL(None, use_errno=True).prctl("
+            "1, int(signal.SIGTERM))\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "if os.getppid() != expected_parent_pid:\n"
+            "    handle_signal(signal.SIGTERM, None)\n"
+            "if cancel_signal is None:\n"
+            "    child=subprocess.Popen(command, shell=True, "
+            "executable='/bin/bash', env=os.environ.copy(), "
+            "start_new_session=True)\n"
+            "    if cancel_signal is not None:\n"
+            "        stop_child(cancel_signal)\n"
+            "    try:\n"
+            "        returncode=int(child.wait())\n"
+            "    finally:\n"
+            "        if child.poll() is None:\n"
+            "            stop_child(signal.SIGTERM)\n"
+            "else:\n"
+            "    returncode=128+int(cancel_signal)\n"
+            "if cancel_signal is not None:\n"
+            "    returncode=128+int(cancel_signal)\n"
+            "sys.exit(returncode)\n"
+        )
         ray_wrapper = (
-            "import json, os, pathlib, subprocess, sys, threading, time\n"
+            "import json, os, pathlib, signal, subprocess, sys, threading, time\n"
             "import ray\n"
             "payload=json.load(open(sys.argv[1], encoding='utf-8'))\n"
+            f"_EXPERIMENT_SUPERVISOR={experiment_supervisor!r}\n"
+            "driver_pid_path=pathlib.Path(payload['driver_pid_path'])\n"
+            "driver_pid_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "driver_pid_tmp=driver_pid_path.with_name("
+            "driver_pid_path.name+'.tmp')\n"
+            "driver_pid_tmp.write_text(str(os.getpid())+'\\n', "
+            "encoding='utf-8')\n"
+            "os.replace(driver_pid_tmp, driver_pid_path)\n"
+            "task_ref=None\n"
+            "def cancel_remote_task(signum, _frame):\n"
+            "    ref=task_ref\n"
+            "    try:\n"
+            "        if ref is not None:\n"
+            "            ray.cancel(ref, force=True)\n"
+            "    finally:\n"
+            "        raise SystemExit(128+int(signum))\n"
+            "signal.signal(signal.SIGTERM, cancel_remote_task)\n"
+            "signal.signal(signal.SIGINT, cancel_remote_task)\n"
             "ray.init(address=os.environ.get('RAY_ADDRESS', 'auto'))\n"
             "@ray.remote(num_gpus=payload['num_gpus'], "
             "num_cpus=payload['num_cpus'])\n"
@@ -1054,9 +1133,27 @@ class ClusterBridgePool:
             "    sampler.start()\n"
             "    started=time.time()\n"
             "    try:\n"
-            "        completed=subprocess.run(command, shell=True, "
-            "executable='/bin/bash', env=child_env)\n"
-            "        returncode=int(completed.returncode)\n"
+            "        supervisor=subprocess.Popen([sys.executable, '-c', "
+            "_EXPERIMENT_SUPERVISOR, command, str(os.getpid()), "
+            "str(payload['kill_grace_sec'])], env=child_env, "
+            "start_new_session=True)\n"
+            "        try:\n"
+            "            returncode=int(supervisor.wait())\n"
+            "        except BaseException as exc:\n"
+            "            if supervisor.poll() is None:\n"
+            "                try:\n"
+            "                    supervisor.send_signal(signal.SIGTERM)\n"
+            "                    supervisor.wait("
+            "timeout=float(payload['kill_grace_sec']))\n"
+            "                except subprocess.TimeoutExpired:\n"
+            "                    supervisor.kill()\n"
+            "                    supervisor.wait()\n"
+            "                except ProcessLookupError:\n"
+            "                    pass\n"
+            "            if isinstance(exc, SystemExit):\n"
+            "                returncode=int(exc.code or 1)\n"
+            "            else:\n"
+            "                raise\n"
             "    finally:\n"
             "        stop.set(); sampler.join(timeout=6)\n"
             "    if not samples:\n"
@@ -1100,7 +1197,8 @@ class ClusterBridgePool:
             "'peak_gpu_utilization_percent': max(["
             "row['utilization_gpu_percent'] for row in rows] or [0.0])}\n"
             "    return {'returncode': returncode, 'evidence': evidence}\n"
-            "result=ray.get(run.remote(payload['command'], payload['env']))\n"
+            "task_ref=run.remote(payload['command'], payload['env'])\n"
+            "result=ray.get(task_ref)\n"
             "evidence_path=pathlib.Path(payload['evidence_path'])\n"
             "evidence_path.parent.mkdir(parents=True, exist_ok=True)\n"
             "temporary=evidence_path.with_name(evidence_path.name+'.tmp')\n"
@@ -1118,6 +1216,7 @@ class ClusterBridgePool:
             remote_trusted_gpu_evidence_path = (
                 remote_task_dir / "trusted_gpu_evidence.json"
             )
+            remote_driver_pid_path = remote_task_dir / "driver.pid"
             _atomic_json_write(
                 payload_path,
                 {
@@ -1128,6 +1227,10 @@ class ClusterBridgePool:
                     "num_cpus": int(num_cpus),
                     "evidence_path": str(
                         remote_trusted_gpu_evidence_path
+                    ),
+                    "driver_pid_path": str(remote_driver_pid_path),
+                    "kill_grace_sec": float(
+                        self.config.task_kill_grace_sec
                     ),
                 },
             )
@@ -1633,23 +1736,44 @@ class ClusterBridgePool:
         )
         command = (
             "set -euo pipefail; "
-            f"pid=$(cat {shlex.quote(str(remote_task_dir / 'pid'))} "
+            f"driver_pid=$(cat "
+            f"{shlex.quote(str(remote_task_dir / 'driver.pid'))} "
             "2>/dev/null || true); "
-            "if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then "
-            "kill -TERM -- \"-$pid\" 2>/dev/null || "
-            "kill -TERM \"$pid\" 2>/dev/null || true; "
+            f"launcher_pid=$(cat "
+            f"{shlex.quote(str(remote_task_dir / 'pid'))} "
+            "2>/dev/null || true); "
+            "target_pid=\"$driver_pid\"; "
+            "if [ -z \"$target_pid\" ]; then target_pid=\"$launcher_pid\"; fi; "
+            "if [ -n \"$target_pid\" ] && "
+            "kill -0 \"$target_pid\" 2>/dev/null; then "
+            # Signal the Ray driver itself first. Its handler owns the
+            # ObjectRef and asks Ray to cancel only that remote task.
+            "kill -TERM \"$target_pid\" 2>/dev/null || true; "
             f"deadline=$((SECONDS+{grace})); "
-            "while kill -0 \"$pid\" 2>/dev/null && "
+            "while kill -0 \"$target_pid\" 2>/dev/null && "
             "[ \"$SECONDS\" -lt \"$deadline\" ]; do sleep 1; done; "
-            "if kill -0 \"$pid\" 2>/dev/null; then "
-            "kill -KILL -- \"-$pid\" 2>/dev/null || "
-            "kill -KILL \"$pid\" 2>/dev/null || true; fi; "
+            "if kill -0 \"$target_pid\" 2>/dev/null; then "
+            "kill -KILL \"$target_pid\" 2>/dev/null || true; fi; "
+            "fi; "
+            # The detached launcher normally exits after the driver and writes
+            # result.json. If it does not, terminate that exact PID only; never
+            # target a process group that could belong to Ray itself.
+            "if [ -n \"$launcher_pid\" ] && "
+            "[ \"$launcher_pid\" != \"$target_pid\" ] && "
+            "kill -0 \"$launcher_pid\" 2>/dev/null; then "
+            f"deadline=$((SECONDS+{grace})); "
+            "while kill -0 \"$launcher_pid\" 2>/dev/null && "
+            f"[ ! -f {shlex.quote(str(remote_task_dir / 'result.json'))} ] && "
+            "[ \"$SECONDS\" -lt \"$deadline\" ]; do sleep 1; done; "
+            "if kill -0 \"$launcher_pid\" 2>/dev/null && "
+            f"[ ! -f {shlex.quote(str(remote_task_dir / 'result.json'))} ]; "
+            "then kill -TERM \"$launcher_pid\" 2>/dev/null || true; fi; "
             "fi"
         )
         self.client.run_node(
             node,
             command,
-            timeout_sec=grace + self.config.command_timeout_sec,
+            timeout_sec=(2 * grace) + self.config.command_timeout_sec,
         )
 
     def _finish_task_result(

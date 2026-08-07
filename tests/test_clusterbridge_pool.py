@@ -735,8 +735,17 @@ def test_async_task_uses_ray_resource_reservation(tmp_path: Path) -> None:
     assert payload["env"]["EXAMPLE"] == "value"
     assert payload["task_id"] == "ray-reserved"
     assert payload["evidence_path"].endswith("trusted_gpu_evidence.json")
+    assert payload["driver_pid_path"].endswith("driver.pid")
+    assert payload["kill_grace_sec"] > 0
     assert "@ray.remote(num_gpus=payload['num_gpus']" in script
-    assert "ray.get(run.remote" in script
+    assert "task_ref=run.remote" in script
+    assert "result=ray.get(task_ref)" in script
+    assert "ray.cancel(ref, force=True)" in script
+    assert "signal.signal(signal.SIGTERM, cancel_remote_task)" in script
+    assert "signal.signal(signal.SIGINT, cancel_remote_task)" in script
+    assert "driver_pid_path=pathlib.Path(payload['driver_pid_path'])" in script
+    assert "start_new_session=True" in script
+    assert "os.killpg(process.pid, signum)" in script
     assert "nvidia-smi" in script
     assert "CUDA_VISIBLE_DEVICES" in script
     assert "ray_task_id" in script
@@ -1101,11 +1110,21 @@ def test_background_task_timeout_sends_term_and_kill(tmp_path: Path) -> None:
     assert any("kill -TERM" in command for command in commands)
     assert any(
         "/tmp/researchclaw-autoresearch-v2/test-pool/tasks/"
-        "timeout-task/pid" in command
+        "timeout-task/driver.pid" in command
         for command in commands
         if "kill -TERM" in command
     )
     assert any("kill -KILL" in command for command in commands)
+    termination = next(
+        command
+        for command in commands
+        if "timeout-task/driver.pid" in command
+        and "kill -TERM" in command
+    )
+    assert 'kill -TERM "$target_pid"' in termination
+    assert 'kill -KILL "$target_pid"' in termination
+    assert 'kill -TERM -- "-$' not in termination
+    assert 'kill -KILL -- "-$' not in termination
 
 
 def test_cancel_task_terminates_running_detached_task(tmp_path: Path) -> None:
@@ -1146,12 +1165,23 @@ def test_cancel_task_terminates_running_detached_task(tmp_path: Path) -> None:
     assert pool.cancel_task("cancel-me") == result
     commands = [call[2] for call in client.calls if call[0] == "run"]
     assert any("kill -TERM" in command for command in commands)
-    assert any(
-        "/tmp/researchclaw-autoresearch-v2/test-pool/tasks/cancel-me/pid"
-        in command
+    termination = next(
+        command
         for command in commands
-        if "kill -TERM" in command
+        if "/tmp/researchclaw-autoresearch-v2/test-pool/tasks/"
+        "cancel-me/driver.pid" in command
+        and "kill -TERM" in command
     )
+    assert (
+        "/tmp/researchclaw-autoresearch-v2/test-pool/tasks/cancel-me/pid"
+        in termination
+    )
+    assert 'target_pid="$driver_pid"' in termination
+    assert 'kill -TERM "$target_pid"' in termination
+    assert 'kill -TERM -- "-$pid"' not in termination
+    assert 'kill -KILL -- "-$pid"' not in termination
+    assert 'kill -TERM -- "-$target_pid"' not in termination
+    assert 'kill -KILL -- "-$target_pid"' not in termination
 
 
 def test_keepalive_renews_and_reports_terminal_failure() -> None:

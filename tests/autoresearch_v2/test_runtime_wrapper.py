@@ -10,6 +10,7 @@ from researchclaw.autoresearch_v2.runtime_wrapper import (
     WRAPPER_SCHEMA,
     WRAPPER_VERSION,
     RuntimeArtifactError,
+    compile_build_output,
     normalize_runtime_artifacts,
 )
 
@@ -102,6 +103,33 @@ def _write_raw(
         ),
         encoding="utf-8",
     )
+
+
+def test_compile_build_output_rejects_required_cli_option_mismatch() -> None:
+    worker_output = {
+        "files": {
+            "main.py": "\n".join(
+                [
+                    "import argparse",
+                    "parser = argparse.ArgumentParser()",
+                    "parser.add_argument('--mode', required=True)",
+                    "parser.add_argument('--output', required=True)",
+                    "args = parser.parse_args()",
+                ]
+            )
+        },
+        "commands": {
+            "smoke": "python main.py --mode smoke --output artifacts/smoke",
+            "pilot": "python main.py",
+            "scale": "python main.py --mode scale --output artifacts/scale",
+        },
+    }
+
+    with pytest.raises(
+        RuntimeArtifactError,
+        match="commands.pilot missing required entrypoint options",
+    ):
+        compile_build_output(worker_output)
 
 
 def test_runtime_wrapper_compiles_and_is_idempotent(tmp_path: Path) -> None:
@@ -639,6 +667,130 @@ def test_runtime_wrapper_normalizes_structured_resource_evidence(
         "num_parameters": 1_543_714_304,
     }
     assert runtime["datasets_loaded"] == ["openai/gsm8k"]
+
+
+def test_runtime_wrapper_normalizes_generated_negative_result_shapes(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "artifacts" / "pilot"
+    plan = _plan()
+    plan["promotion_criteria"].append(
+        {
+            "id": "uncertainty_support",
+            "metric": "primary_effect_ci_lower",
+            "operator": ">",
+            "value": 0.0,
+        }
+    )
+    _write_raw(
+        output_dir,
+        metrics={
+            "completed_examples": 4,
+            "paired_accuracy_difference": 0.0,
+            "primary_effect_ci_lower": 0.0,
+            "call_counts": {
+                "adaptation": 8,
+                "final_evaluation": 16,
+            },
+            "uncertainty": {
+                "method": "paired_bootstrap",
+                "confidence_level": 0.9,
+                "resamples": 1000,
+                "rng_seed": 1729,
+                "observations": [0, 0, 0, 0],
+            },
+        },
+        runtime={
+            "model_loaded": {
+                "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+                "device": "cuda",
+            },
+            "datasets_loaded": [
+                {
+                    "resource_id": "openai/gsm8k",
+                    "split_role": "development",
+                    "split_id": "gsm8k-dev-v1",
+                },
+                {
+                    "resource_id": "openai/gsm8k",
+                    "split_role": "screening",
+                    "split_id": "gsm8k-screen-v1",
+                },
+            ],
+            "examples_processed": 4,
+            "examples_by_role": {
+                "development": 2,
+                "screening": 4,
+            },
+            "seeds_used": [7],
+            "call_counts": {
+                "adaptation": 8,
+                "final_evaluation": 16,
+            },
+            "metrics": {
+                "completed_examples": 4,
+                "paired_accuracy_difference": 0.0,
+                "primary_effect_ci_lower": 0.0,
+                "call_counts": {
+                    "adaptation": 8,
+                    "final_evaluation": 16,
+                },
+                "uncertainty": {
+                    "method": "paired_bootstrap",
+                    "confidence_level": 0.9,
+                    "resamples": 1000,
+                    "rng_seed": 1729,
+                    "observations": [0, 0, 0, 0],
+                },
+            },
+            "criterion_results": [
+                {
+                    "id": "completed_examples",
+                    "measured_value": 4,
+                    "passed": True,
+                },
+                {
+                    "id": "primary_effect",
+                    "measured_value": 0.0,
+                    "passed": False,
+                },
+                {
+                    "id": "uncertainty_support",
+                    "measured_value": 0.0,
+                    "passed": False,
+                },
+            ],
+        },
+    )
+
+    value = normalize_runtime_artifacts(
+        output_dir=output_dir,
+        plan=plan,
+        mode="pilot",
+        allocated_gpus=1,
+        cwd=tmp_path,
+    )
+
+    runtime = value["runtime_evidence"]
+    assert runtime["seeds"] == [7]
+    assert runtime["model_loaded"] == "Qwen/Qwen2.5-1.5B-Instruct"
+    assert runtime["datasets_loaded"] == ["openai/gsm8k"]
+    assert runtime["uncertainty"]["available"] is True
+    assert runtime["criterion_results"]["completed_examples"] == {
+        "value": 4,
+        "passed": True,
+    }
+    assert runtime["criterion_results"]["primary_effect"] == {
+        "value": 0.0,
+        "passed": False,
+    }
+    assert runtime["criterion_results"]["uncertainty_support"] == {
+        "value": pytest.approx(0.0),
+        "passed": False,
+    }
+    assert runtime["gate_decision"] == "reject"
+    assert "call_counts" not in runtime["metrics"]
+    assert "uncertainty" not in runtime["metrics"]
 
 
 def test_runtime_wrapper_rejects_inconsistent_example_accounting(
