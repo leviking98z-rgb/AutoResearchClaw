@@ -231,6 +231,19 @@ class SharedGPULeaseRegistry:
         maximum = max(minimum, int(max_gpus or preferred or minimum))
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            # Expired orphan reservations no longer protect a running owner
+            # and must not strand capacity when no matching pool task exists.
+            # Active orphaned tasks are extended by ``reap_stale`` before
+            # callers reserve through GPUBroker.
+            connection.execute(
+                """
+                DELETE FROM leases
+                WHERE pool_id=?
+                  AND state='orphaned'
+                  AND expires_at <= ?
+                """,
+                (self.pool_id, now),
+            )
             self._touch_owner(connection, owner_id, now)
             existing = connection.execute(
                 """
