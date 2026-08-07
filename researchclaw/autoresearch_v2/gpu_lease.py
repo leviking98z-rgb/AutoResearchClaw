@@ -198,6 +198,7 @@ class SharedGPULeaseRegistry:
         now = self.clock()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._prune_expired_orphans(connection, now)
             self._touch_owner(connection, owner_id, now)
             connection.execute(
                 """
@@ -235,15 +236,7 @@ class SharedGPULeaseRegistry:
             # and must not strand capacity when no matching pool task exists.
             # Active orphaned tasks are extended by ``reap_stale`` before
             # callers reserve through GPUBroker.
-            connection.execute(
-                """
-                DELETE FROM leases
-                WHERE pool_id=?
-                  AND state='orphaned'
-                  AND expires_at <= ?
-                """,
-                (self.pool_id, now),
-            )
+            self._prune_expired_orphans(connection, now)
             self._touch_owner(connection, owner_id, now)
             existing = connection.execute(
                 """
@@ -555,6 +548,21 @@ class SharedGPULeaseRegistry:
                 status='active'
             """,
             (self.pool_id, owner_id, now),
+        )
+
+    def _prune_expired_orphans(
+        self,
+        connection: sqlite3.Connection,
+        now: float,
+    ) -> None:
+        connection.execute(
+            """
+            DELETE FROM leases
+            WHERE pool_id=?
+              AND state='orphaned'
+              AND expires_at <= ?
+            """,
+            (self.pool_id, now),
         )
 
 

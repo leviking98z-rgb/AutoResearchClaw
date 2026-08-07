@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -256,6 +257,7 @@ def test_transient_probe_failure_keeps_lease() -> None:
     assert broker.leases["job"].probe_failures == 1
     assert broker.reconcile() == []
     assert broker.leases["job"].probe_failures == 0
+    broker.close()
 
 
 def test_reconcile_probes_multiple_gpu_jobs_concurrently() -> None:
@@ -278,6 +280,122 @@ def test_reconcile_probes_multiple_gpu_jobs_concurrently() -> None:
 
     assert broker.reconcile() == []
     assert set(broker.leases) == {"job-a", "job-b"}
+    broker.close()
+
+
+def test_reconcile_returns_before_slow_probe_and_reuses_inflight_future() -> None:
+    gate = threading.Event()
+
+    class Pool:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def probe_task(self, task_id: str):
+            del task_id
+            self.calls += 1
+            gate.wait(timeout=2)
+            return {"state": "running"}
+
+    pool = Pool()
+    broker = GPUBroker(
+        pool=pool,
+        scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        reconcile_timeout_sec=0.02,
+    )
+    broker.leases["job"] = GPULease("task", "idea", "job", 1)
+
+    started = time.monotonic()
+    assert broker.reconcile() == []
+    assert time.monotonic() - started < 0.5
+    assert pool.calls == 1
+    assert broker.leases["job"].state == "probe_degraded"
+
+    assert broker.reconcile() == []
+    assert pool.calls == 1
+
+    gate.set()
+    deadline = time.monotonic() + 2
+    while broker._probe_futures["job"].running() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert broker.reconcile() == []
+    assert broker.leases["job"].state == "running"
+    broker.close()
+
+
+def test_reconcile_prefers_cached_terminal_result_without_probe() -> None:
+    class Pool:
+        def __init__(self) -> None:
+            self.probes = 0
+
+        def collect_cached_task(self, task_id: str):
+            assert task_id == "task"
+            return {
+                "returncode": 0,
+                "elapsed_sec": 1.25,
+                "stdout": "done\n",
+                "stderr": "",
+            }
+
+        def probe_task(self, task_id: str):
+            del task_id
+            self.probes += 1
+            raise AssertionError("cached terminal result must bypass probe")
+
+    pool = Pool()
+    broker = GPUBroker(
+        pool=pool,
+        scheduler=AdaptiveGPUScheduler(total_gpus=1),
+    )
+    broker.leases["job"] = GPULease("task", "idea", "job", 1)
+
+    completed = broker.reconcile()
+
+    assert completed == [
+        (
+            "job",
+            {
+                "returncode": 0,
+                "elapsed_sec": 1.25,
+                "stdout": "done\n",
+                "stderr": "",
+                "stdout_path": "",
+                "stderr_path": "",
+                "result_path": "",
+                "remote_dir": "",
+                "timed_out": False,
+                "trusted_gpu_evidence": None,
+                "task_id": "task",
+                "allocated_gpus": 1,
+                "pool_state": "finished",
+            },
+        )
+    ]
+    assert pool.probes == 0
+    assert broker.leases == {}
+    broker.close()
+
+
+def test_repeated_probe_failures_do_not_complete_scientific_job() -> None:
+    class Pool:
+        def probe_task(self, task_id: str):
+            del task_id
+            raise TimeoutError("bridge queue is congested")
+
+    broker = GPUBroker(
+        pool=Pool(),
+        scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        probe_failure_threshold=2,
+        reconcile_timeout_sec=0.5,
+    )
+    broker.leases["job"] = GPULease("task", "idea", "job", 1)
+
+    assert broker.reconcile() == []
+    assert broker.reconcile() == []
+    assert broker.reconcile() == []
+    assert "job" in broker.leases
+    assert broker.leases["job"].state == "probe_degraded"
+    assert broker.leases["job"].probe_failures == 3
+    broker.close()
 
 
 class _SharedPool:
@@ -479,9 +597,7 @@ def test_orphaned_reservation_expires_even_if_owner_is_still_heartbeating(
     now[0] = 111.0
     registry.heartbeat("controller")
 
-    assert registry.reap_stale(lambda _: {"state": "lost"}) == [
-        "uncertain-submit"
-    ]
+    assert registry.reap_stale(lambda _: {"state": "lost"}) == []
     assert registry.list_leases() == []
 
 
@@ -552,6 +668,31 @@ def test_expired_orphan_is_pruned_before_capacity_accounting(
     assert reservation.admitted
     assert reservation.allocated_gpus == 4
     assert [lease.task_id for lease in registry.list_leases()] == ["task-b"]
+
+
+def test_heartbeat_prunes_expired_orphan_without_new_reservation(
+    tmp_path: Path,
+) -> None:
+    now = [100.0]
+    registry = _registry(
+        tmp_path / "leases.sqlite3",
+        clock=lambda: now[0],
+    )
+    assert registry.reserve(
+        owner_id="controller",
+        task_id="orphan-task",
+        idea_id="idea-a",
+        job_id="job-a",
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+    ).admitted
+    registry.detach("controller", "orphan-task")
+    now[0] = 111.0
+
+    registry.heartbeat("controller")
+
+    assert registry.list_leases() == []
 
 
 def test_registry_rejects_capacity_mismatch(tmp_path: Path) -> None:

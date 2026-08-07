@@ -689,6 +689,49 @@ def test_async_submit_probe_collect_and_idempotent_adoption(
     assert result.stdout == "done\n"
 
 
+def test_probe_and_collect_use_cached_terminal_summary_without_transport(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    pool = ClusterBridgePool(
+        _config(tmp_path, node_count=1),
+        client=client,
+    )
+    pool.claim(start_keepalive=False)
+    pool._prepared = True
+    task_dir = pool.state_dir / "tasks" / "cached-terminal"
+    task_dir.mkdir(parents=True)
+    summary = {
+        "task_id": "cached-terminal",
+        "returncode": 0,
+        "stdout": "done\n",
+        "stderr": "",
+        "elapsed_sec": 2.5,
+        "timed_out": False,
+        "remote_dir": str(task_dir),
+        "stdout_path": str(task_dir / "stdout.log"),
+        "stderr_path": str(task_dir / "stderr.log"),
+        "result_path": str(task_dir / "result.json"),
+        "pid": 77,
+        "trusted_gpu_evidence": None,
+    }
+    (task_dir / "summary.json").write_text(
+        json.dumps(summary),
+        encoding="utf-8",
+    )
+    before = len(client.calls)
+
+    probe = pool.probe_task("cached-terminal")
+    result = pool.collect_cached_task("cached-terminal")
+    collected = pool.collect_task("cached-terminal")
+
+    assert probe.state == "finished"
+    assert probe.returncode == 0
+    assert result is not None and result.stdout == "done\n"
+    assert collected.returncode == 0
+    assert len(client.calls) == before
+
+
 def test_async_task_id_conflict_fails_closed(tmp_path: Path) -> None:
     client = FakeClient()
     pool = ClusterBridgePool(

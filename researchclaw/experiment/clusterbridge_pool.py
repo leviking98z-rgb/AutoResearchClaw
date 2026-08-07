@@ -1359,6 +1359,9 @@ class ClusterBridgePool:
             handle.get("submitted_at") or request.get("submitted_at") or ""
         )
         elapsed = _elapsed_since(submitted_at)
+        summary = _read_json_mapping(task_dir / "summary.json")
+        if summary:
+            return self._probe_from_summary(task_id, summary)
         head = self.config.head_node
         remote = self.client.run_node(
             head,
@@ -1433,6 +1436,26 @@ class ClusterBridgePool:
             remote_dir=str(task_dir),
         )
 
+    def collect_cached_task(self, task_id: str) -> PoolTaskResult | None:
+        """Collect a result using local/shared durable files only.
+
+        ``probe_task`` intentionally reaches the execution node to distinguish
+        a live PID from a lost task. The terminal summary, however, is written
+        into the controller-visible pool state directory. Checking it first
+        gives the Broker a zero-transport completion path and prevents a slow
+        ClusterBridge queue from delaying results that were already collected.
+        """
+
+        if not _safe_task_id(task_id):
+            raise ValueError(
+                "task_id must contain only letters, digits, '.', '_' or '-'"
+            )
+        task_dir = self._state_dir / "tasks" / task_id
+        if not task_dir.is_dir():
+            return None
+        summary = _read_json_mapping(task_dir / "summary.json")
+        return PoolTaskResult(**summary) if summary else None
+
     def _task_startup_grace_sec(self) -> float:
         """Bound false-loss protection to a short launch/adoption window."""
 
@@ -1440,14 +1463,10 @@ class ClusterBridgePool:
 
     def collect_task(self, task_id: str) -> PoolTaskResult:
         """Collect a terminal task result without blocking."""
-        if not _safe_task_id(task_id):
-            raise ValueError(
-                "task_id must contain only letters, digits, '.', '_' or '-'"
-            )
+        cached = self.collect_cached_task(task_id)
+        if cached is not None:
+            return cached
         task_dir = self._state_dir / "tasks" / task_id
-        summary = _read_json_mapping(task_dir / "summary.json")
-        if summary:
-            return PoolTaskResult(**summary)
         probe = self.probe_task(task_id)
         if probe.state == "running":
             raise PoolTaskNotFinished(f"task {task_id} is still running")
@@ -1725,6 +1744,29 @@ class ClusterBridgePool:
         """
 
         return max(3.0, min(10.0, float(self.config.command_timeout_sec)))
+
+    def _probe_from_summary(
+        self,
+        task_id: str,
+        summary: Mapping[str, Any],
+    ) -> PoolTaskProbe:
+        """Project a durable terminal summary into the lightweight probe API."""
+
+        return PoolTaskProbe(
+            task_id=task_id,
+            state=(
+                "timed_out"
+                if bool(summary.get("timed_out", False))
+                else "finished"
+            ),
+            pid=_optional_int(summary.get("pid")),
+            returncode=_optional_int(summary.get("returncode")),
+            elapsed_sec=float(summary.get("elapsed_sec", 0.0) or 0.0),
+            timed_out=bool(summary.get("timed_out", False)),
+            stdout=str(summary.get("stdout", "") or ""),
+            stderr=str(summary.get("stderr", "") or ""),
+            remote_dir=str(summary.get("remote_dir", "") or ""),
+        )
 
     def _terminate_task(self, node: ClusterNode, task_dir: Path) -> None:
         grace = self.config.task_kill_grace_sec
