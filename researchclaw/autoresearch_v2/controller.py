@@ -1258,7 +1258,11 @@ class V2Controller:
                     False,
                     "retry",
                     "gpu_submission_failed",
-                    {"error": attempt.error},
+                    {
+                        "error": attempt.error,
+                        "failure_class": "infrastructure_transient",
+                        "consume_attempt": False,
+                    },
                 )
                 job.attempt = attempt.number
                 self._apply_outcome(idea, job, attempt, outcome)

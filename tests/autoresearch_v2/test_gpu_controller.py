@@ -1156,6 +1156,90 @@ def test_missing_gpu_artifacts_retry_without_mutating_current(
     controller._pool.shutdown(wait=True)
 
 
+def test_gpu_submission_failure_does_not_exhaust_scientific_attempts(
+    tmp_path: Path,
+) -> None:
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "population": {
+                    "reservoir_low_watermark": 1,
+                    "reservoir_target": 1,
+                    "generation_batch_size": 1,
+                    "active_idea_target": 1,
+                    "max_active_ideas": 1,
+                    "max_same_family": 2,
+                },
+                "execution": {
+                    "smoke_environment": "local",
+                },
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
+                },
+                "budgets": {
+                    "max_job_attempts": 1,
+                },
+            }
+        }
+    )
+
+    class SubmissionFailurePool(_Pool):
+        def submit_task(self, command: str, **kwargs):
+            del command, kwargs
+            raise RuntimeError("temporary resource-manager outage")
+
+        def probe_task(self, task_id: str):
+            del task_id
+            raise RuntimeError("task was never created")
+
+    store = V2Store(tmp_path)
+    controller = V2Controller(
+        config=config,
+        store=store,
+        generator=StaticIdeaGenerator([_candidate(0)]),
+        executors={
+            JobKind.DESIGN: SimulatedJobExecutor(),
+            JobKind.BUILD: SimulatedJobExecutor(),
+            JobKind.REPORT: SimulatedJobExecutor(),
+        },
+        gpu_broker=GPUBroker(
+            pool=SubmissionFailurePool(),
+            scheduler=AdaptiveGPUScheduler(total_gpus=1),
+        ),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    import time
+
+    for _ in range(100):
+        controller.tick()
+        time.sleep(0.002)
+        gpu_jobs = [
+            job for job in store.list_jobs() if job.requires_gpu
+        ]
+        if (
+            gpu_jobs
+            and gpu_jobs[0].status is JobStatus.RETRY_WAIT
+            and gpu_jobs[0].result.get("reason") == "gpu_submission_failed"
+        ):
+            break
+
+    job = next(item for item in store.list_jobs() if item.requires_gpu)
+    idea = store.get_idea(job.idea_id)
+    assert idea is not None
+    assert job.status is JobStatus.RETRY_WAIT
+    assert idea.status is IdeaStatus.PILOTING
+    assert job.result["failure_class"] == "infrastructure_transient"
+    assert job.result["consume_attempt"] is False
+    assert job.result["infrastructure_retries"] == 1
+    assert job.attempt_limit == 2
+    controller.close()
+
+
 def test_runtime_contract_failure_with_raw_artifacts_returns_to_build(
     tmp_path: Path,
     monkeypatch,
