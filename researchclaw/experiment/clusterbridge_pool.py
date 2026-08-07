@@ -1264,6 +1264,23 @@ class ClusterBridgePool:
         )
         payload = _extract_prefixed_json(remote.stdout)
         state = str(payload.get("state", "unknown"))
+        summary_exists = (task_dir / "summary.json").is_file()
+        terminal_grace = False
+        if (
+            state == "lost"
+            and not summary_exists
+            and elapsed < self._task_startup_grace_sec()
+        ):
+            # Detached GPU launch has two independently observable hand-offs:
+            # ClusterBridge returns the launch PID, then the remote shell writes
+            # ``pid``/``result.json`` under node-local ``/tmp``. A controller
+            # can probe in that narrow window (or adopt an old task whose PID
+            # was written by a pre-fix launcher). Treat the first apparent
+            # loss as an indeterminate startup state rather than durably
+            # committing returncode=-1. A real loss is still finalized after
+            # the bounded grace period.
+            state = "running"
+            terminal_grace = True
         timed_out = (
             state == "running"
             and timeout_sec > 0
@@ -1289,18 +1306,18 @@ class ClusterBridgePool:
             )
             self._event("task_timed_out", task_id=task_id)
         elif state in {"finished", "lost"}:
+            if state == "lost":
+                payload = {**payload, "returncode": -1}
             self._finish_task_result(
                 task_id=task_id,
                 task_dir=task_dir,
-                payload=(
-                    payload
-                    if state == "finished"
-                    else {**payload, "returncode": -1}
-                ),
+                payload=payload,
                 elapsed_sec=elapsed,
                 timed_out=False,
                 pid=_optional_int(handle.get("pid") or payload.get("pid")),
             )
+        if terminal_grace:
+            payload["state"] = "running"
         return PoolTaskProbe(
             task_id=task_id,
             state=state,
@@ -1312,6 +1329,11 @@ class ClusterBridgePool:
             stderr=str(payload.get("stderr.log", "")),
             remote_dir=str(task_dir),
         )
+
+    def _task_startup_grace_sec(self) -> float:
+        """Bound false-loss protection to a short launch/adoption window."""
+
+        return max(30.0, min(120.0, self._task_probe_timeout_sec() * 6.0))
 
     def collect_task(self, task_id: str) -> PoolTaskResult:
         """Collect a terminal task result without blocking."""

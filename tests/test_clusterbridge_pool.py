@@ -842,6 +842,107 @@ def test_async_gpu_task_with_live_remote_pid_does_not_finish_lost(
         )
 
 
+def test_apparent_lost_task_is_not_finalized_during_startup_grace(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    pool = ClusterBridgePool(
+        _config(tmp_path, node_count=1),
+        client=client,
+    )
+    pool.claim(start_keepalive=False)
+    pool._prepared = True
+
+    def handler(node: ClusterNode, command: str) -> BridgeResult:
+        del node
+        if "nohup setsid --wait bash" in command:
+            return _result("77\n")
+        if "__RESEARCHCLAW_POOL_RESULT__" in command:
+            return _result(
+                "__RESEARCHCLAW_POOL_RESULT__="
+                '{"state":"lost","pid":null,'
+                '"stdout.log":"","stderr.log":""}\n'
+            )
+        return _result()
+
+    client.run_handler = handler
+    pool.submit_task(
+        "python train.py",
+        timeout_sec=30,
+        task_id="startup-grace",
+        num_gpus=1,
+        num_cpus=2,
+    )
+
+    probe = pool.probe_task("startup-grace")
+
+    assert probe.state == "running"
+    assert probe.returncode is None
+    assert not (
+        pool.state_dir / "tasks" / "startup-grace" / "summary.json"
+    ).exists()
+
+
+def test_apparent_lost_task_is_finalized_after_startup_grace(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    pool = ClusterBridgePool(
+        _config(tmp_path, node_count=1),
+        client=client,
+    )
+    pool.claim(start_keepalive=False)
+    pool._prepared = True
+
+    def handler(node: ClusterNode, command: str) -> BridgeResult:
+        del node
+        if "nohup setsid --wait bash" in command:
+            return _result("77\n")
+        if "__RESEARCHCLAW_POOL_RESULT__" in command:
+            return _result(
+                "__RESEARCHCLAW_POOL_RESULT__="
+                '{"state":"lost","pid":null,'
+                '"stdout.log":"","stderr.log":""}\n'
+            )
+        return _result()
+
+    client.run_handler = handler
+    pool.submit_task(
+        "python train.py",
+        timeout_sec=300,
+        task_id="expired-startup-grace",
+        num_gpus=1,
+        num_cpus=2,
+    )
+    request_path = (
+        pool.state_dir
+        / "tasks"
+        / "expired-startup-grace"
+        / "request.json"
+    )
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    request["submitted_at"] = "2000-01-01T00:00:00+00:00"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    handle_path = request_path.with_name("handle.json")
+    handle = json.loads(handle_path.read_text(encoding="utf-8"))
+    handle["submitted_at"] = "2000-01-01T00:00:00+00:00"
+    handle_path.write_text(json.dumps(handle), encoding="utf-8")
+
+    probe = pool.probe_task("expired-startup-grace")
+
+    assert probe.state == "lost"
+    assert probe.returncode == -1
+    summary = json.loads(
+        (
+            pool.state_dir
+            / "tasks"
+            / "expired-startup-grace"
+            / "summary.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert summary["returncode"] == -1
+
+
 def test_async_ray_task_returns_remote_trusted_gpu_evidence(
     tmp_path: Path,
 ) -> None:
