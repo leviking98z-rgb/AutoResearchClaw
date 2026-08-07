@@ -182,6 +182,72 @@ def test_runtime_wrapper_compiles_and_is_idempotent(tmp_path: Path) -> None:
     }
 
 
+def test_runtime_wrapper_migrates_boolean_loader_with_model_id(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "artifacts" / "smoke"
+    _write_raw(
+        output_dir,
+        metrics={
+            "completed_examples": 1,
+            "paired_accuracy_difference": 0.0,
+        },
+        runtime={
+            "model_loaded": True,
+            "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+            "datasets_loaded": ["openai/gsm8k"],
+            "examples_processed": 1,
+            "examples_by_role": {"screening": 1},
+            "seeds": [7],
+            "call_counts": {
+                "adaptation": 1,
+                "final_evaluation": 1,
+            },
+        },
+    )
+
+    value = normalize_runtime_artifacts(
+        output_dir=output_dir,
+        plan=_plan(),
+        mode="smoke",
+        allocated_gpus=1,
+        cwd=tmp_path,
+    )
+
+    runtime = value["runtime_evidence"]
+    assert runtime["model_loaded"] == "Qwen/Qwen2.5-1.5B-Instruct"
+    assert runtime["model_metadata"] == {"loaded": True}
+    assert runtime["gate_decision"] == "promote"
+
+
+def test_runtime_wrapper_rejects_boolean_loader_without_model_id(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "artifacts" / "smoke"
+    _write_raw(
+        output_dir,
+        runtime={
+            "model_loaded": True,
+            "datasets_loaded": ["openai/gsm8k"],
+            "examples_processed": 1,
+            "examples_by_role": {"screening": 1},
+            "seeds": [7],
+        },
+    )
+
+    with pytest.raises(
+        RuntimeArtifactError,
+        match="model_loaded must be a non-empty model id",
+    ):
+        normalize_runtime_artifacts(
+            output_dir=output_dir,
+            plan=_plan(),
+            mode="smoke",
+            allocated_gpus=1,
+            cwd=tmp_path,
+        )
+
+
 def test_runtime_wrapper_rejects_missing_measured_criterion(
     tmp_path: Path,
 ) -> None:

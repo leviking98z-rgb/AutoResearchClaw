@@ -166,7 +166,8 @@ def normalize_runtime_artifacts(
         )
 
     model_loaded, model_metadata = _normalize_model_loaded(
-        raw_runtime.get("model_loaded")
+        raw_runtime.get("model_loaded"),
+        model_id=raw_runtime.get("model_id"),
     )
     if not model_loaded:
         raise RuntimeArtifactError(
@@ -991,9 +992,23 @@ def _normalize_seeds(runtime: Mapping[str, Any]) -> list[Any]:
     return list(raw)
 
 
-def _normalize_model_loaded(value: Any) -> tuple[str, dict[str, Any]]:
+def _normalize_model_loaded(
+    value: Any,
+    *,
+    model_id: Any = None,
+) -> tuple[str, dict[str, Any]]:
+    """Normalize legacy loader evidence without weakening model identity.
+
+    Early generated workers commonly emitted ``model_loaded: true`` together
+    with a separate ``model_id`` field.  The boolean alone is not acceptable,
+    but the pair is unambiguous evidence about the worker-reported model and
+    can be migrated deterministically to the canonical string form.
+    """
+
     if isinstance(value, str):
         return value.strip(), {}
+    if value is True and isinstance(model_id, str) and model_id.strip():
+        return model_id.strip(), {"loaded": True}
     if not isinstance(value, Mapping):
         return "", {}
     model_id = str(

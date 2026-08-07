@@ -178,10 +178,18 @@ def validate_research_implementation(
         if marker in combined:
             errors.append(f"forbidden synthetic implementation marker: {marker}")
     if controller_runtime:
-        schema_errors: list[str] = []
-        schema_evidence: dict[str, Any] = {
-            "controller_owned": True,
-        }
+        # The Controller owns the canonical artifact envelope, criteria, and
+        # gate decision, but generated code still owns measured provenance.
+        # Run the static schema checks so deterministic provenance mistakes
+        # (for example ``model_loaded: true`` without an exact model id) are
+        # repaired before consuming a GPU. Envelope-only checks are skipped
+        # inside the validator when ``controller_runtime`` is true.
+        schema_errors, schema_evidence = _validate_generated_runtime_schema(
+            python_files,
+            plan=plan,
+            controller_runtime=True,
+        )
+        schema_evidence["controller_owned"] = True
     else:
         schema_errors, schema_evidence = _validate_generated_runtime_schema(
             python_files,
@@ -206,6 +214,7 @@ def _validate_generated_runtime_schema(
     python_files: list[Path],
     *,
     plan: Mapping[str, Any],
+    controller_runtime: bool = False,
 ) -> tuple[list[str], dict[str, Any]]:
     """Catch deterministic artifact-schema errors before consuming a GPU."""
 
@@ -347,7 +356,11 @@ def _validate_generated_runtime_schema(
     evidence["runtime_payloads"] = len(runtime_payloads)
     for payload in metrics_payloads:
         keys = dict_keys(payload)
-        if keys is not None and not {"result_valid", "metrics"}.issubset(keys):
+        if (
+            not controller_runtime
+            and keys is not None
+            and not {"result_valid", "metrics"}.issubset(keys)
+        ):
             errors.append(
                 "metrics.json payload must contain result_valid and metrics"
             )
@@ -388,10 +401,15 @@ def _validate_generated_runtime_schema(
             model_loaded.value,
             bool,
         ):
-            errors.append(
-                "runtime_evidence.model_loaded must identify the model, "
-                "not use a boolean"
-            )
+            separate_model_id = values.get("model_id")
+            if not (
+                model_loaded.value is True
+                and separate_model_id is not None
+            ):
+                errors.append(
+                    "runtime_evidence.model_loaded must identify the model, "
+                    "not use a boolean"
+                )
         roles = resolved_keys(values.get("examples_by_role"))
         if roles is not None:
             evidence["example_role_keys"] = sorted(roles)

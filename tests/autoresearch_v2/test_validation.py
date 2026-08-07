@@ -1288,6 +1288,87 @@ model = AutoModelForCausalLM.from_pretrained(
     assert result["ok"]
 
 
+def test_controller_runtime_accepts_legacy_boolean_loader_with_model_id(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "main.py").write_text(
+        """
+import json
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM
+
+dataset = load_dataset("openai/gsm8k", "main", split="test")
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-1.5B-Instruct"
+)
+runtime_evidence = {
+    "model_loaded": True,
+    "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+    "datasets_loaded": ["openai/gsm8k"],
+    "examples_processed": 1,
+    "examples_by_role": {"screening": 1},
+    "seeds": [0],
+    "gpu_count": 1,
+    "gate_decision": "reject",
+    "metrics": {"gain": 0.0},
+}
+with open("runtime_evidence.json", "w") as f:
+    json.dump(runtime_evidence, f)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = validate_research_implementation(
+        tmp_path,
+        plan={"required_runtime_evidence": []},
+        controller_runtime=True,
+    )
+
+    assert result["ok"]
+
+
+def test_controller_runtime_rejects_boolean_loader_without_model_id(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "main.py").write_text(
+        """
+import json
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM
+
+dataset = load_dataset("openai/gsm8k", "main", split="test")
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-1.5B-Instruct"
+)
+runtime_evidence = {
+    "model_loaded": True,
+    "datasets_loaded": ["openai/gsm8k"],
+    "examples_processed": 1,
+    "examples_by_role": {"screening": 1},
+    "seeds": [0],
+    "gpu_count": 1,
+    "gate_decision": "reject",
+    "metrics": {"gain": 0.0},
+}
+with open("runtime_evidence.json", "w") as f:
+    json.dump(runtime_evidence, f)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = validate_research_implementation(
+        tmp_path,
+        plan={"required_runtime_evidence": []},
+        controller_runtime=True,
+    )
+
+    assert not result["ok"]
+    assert any(
+        "model_loaded must identify the model" in error
+        for error in result["errors"]
+    )
+
+
 def test_controller_runtime_rejects_adding_development_to_processed_count(
     tmp_path: Path,
 ) -> None:
