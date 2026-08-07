@@ -5,7 +5,9 @@ autoresearch_v2:
   topic_brief: >-
     Discover mechanistic, falsifiable, compute-efficient research questions
     about recursive self-improvement and self-iterative optimization of LLMs
-    and LLM agents. Prefer ideas with valuable negative results.
+    and LLM agents. Prioritize mechanisms that can improve held-out capability
+    or search quality, while retaining verifier, memory, stopping, rollback,
+    and valuable negative-result studies as a balanced portfolio.
 
   population:
     reservoir_low_watermark: 12
@@ -19,6 +21,7 @@ autoresearch_v2:
     duplicate_threshold: 0.72
     semantic_duplicate_threshold: 0.72
     require_novelty_evidence: true
+    require_mechanism_activation_plan: true
 
   concurrency:
     max_llm_jobs: 4

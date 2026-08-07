@@ -793,7 +793,7 @@ def test_design_executor_compiles_typed_draft_before_decision_gate(
 
     assert outcome.success
     assert gate.plan is not None
-    assert gate.plan["compiler"]["version"] == 2
+    assert gate.plan["compiler"]["version"] == 3
     assert gate.plan["sample_accounting"]["total_model_calls"] == 64
     assert validate_plan(gate.plan) == []
     assert (

@@ -38,6 +38,7 @@ COMPILER_OWNED_DESIGN_FIELDS = (
     "decision_table",
     "promotion_rule",
     "early_stop_rule",
+    "mechanism_activation_gate",
     "confirmatory_followup",
     "required_runtime_evidence",
 )
@@ -274,6 +275,20 @@ def compile_screening_protocol(
         gate_statistic,
         plan["promotion_criteria"],
     )
+    # A screening Pilot decides whether the signal is promising enough to
+    # spend Scale compute. Confidence intervals remain descriptive at this
+    # phase; confirmatory uncertainty belongs to the larger multi-seed Scale.
+    plan["scale_promotion_criteria"] = copy.deepcopy(
+        plan["promotion_criteria"]
+    )
+    plan["promotion_criteria"] = _screening_promotion_criteria(
+        plan["promotion_criteria"],
+        uncertainty=plan["uncertainty"],
+    )
+    plan["mechanism_activation_gate"] = _compile_mechanism_activation_gate(
+        idea.candidate.get("mechanism_activation"),
+        pilot=pilot,
+    )
     plan["decision_contract"] = _compile_decision_contract(
         validity_criteria=plan["validity_criteria"],
         promotion_criteria=plan["promotion_criteria"],
@@ -289,9 +304,11 @@ def compile_screening_protocol(
         "any promotion criterion is rejected."
     )
     plan["early_stop_rule"] = (
-        "Retry only when a preregistered validity criterion fails or required "
-        "runtime evidence is missing or corrupt. Unfavorable, undefined, "
-        "low-variance, or inconclusive scientific results are valid rejects."
+        "Before the full Pilot, apply mechanism_activation_gate on the "
+        "development partition. If the mechanism does not trigger at the "
+        "minimum rate or treatment and control have no observable behavioral "
+        "contrast, stop cheaply as a valid mechanistic negative. Retry only "
+        "when operational evidence is missing or corrupt."
     )
     plan["confirmatory_followup"] = _compile_confirmatory_followup(
         plan.get("confirmatory_followup"),
@@ -312,10 +329,11 @@ def compile_screening_protocol(
         "evidence_valid",
         "gate_statistic_defined",
         "criterion_results",
+        "mechanism_activation",
     ]
     plan["compiler"] = {
         "name": "autoresearch_v2_protocol_compiler",
-        "version": 2,
+        "version": 3,
         "mechanical_fields": list(COMPILER_OWNED_DESIGN_FIELDS),
     }
     return plan
@@ -413,6 +431,106 @@ def _compile_decision_table(
             "decision": "reject",
         },
     ]
+
+
+def promotion_criteria_for_mode(
+    plan: Mapping[str, Any],
+    *,
+    mode: str,
+) -> list[dict[str, Any]]:
+    field = (
+        "scale_promotion_criteria"
+        if mode == "scale"
+        else "promotion_criteria"
+    )
+    value = plan.get(field)
+    if not isinstance(value, list):
+        return []
+    return [
+        dict(item)
+        for item in value
+        if isinstance(item, Mapping)
+    ]
+
+
+def _screening_promotion_criteria(
+    criteria: list[dict[str, Any]],
+    *,
+    uncertainty: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Keep confirmatory uncertainty from killing a small screening Pilot."""
+
+    def is_uncertainty_criterion(item: Mapping[str, Any]) -> bool:
+        metric = str(item.get("metric", "") or "").casefold()
+        identifier = str(item.get("id", "") or "").casefold()
+        description = str(item.get("description", "") or "").casefold()
+        return (
+            identifier.startswith("uncertainty")
+            or identifier in {"positive_ci", "confidence_support"}
+            or "ci_lower" in metric
+            or "ci_upper" in metric
+            or "confidence_interval" in metric
+            or "confidence interval" in description
+            or "uncertainty excludes" in description
+        )
+    filtered = [
+        copy.deepcopy(item)
+        for item in criteria
+        if not is_uncertainty_criterion(item)
+    ]
+    if not filtered:
+        return copy.deepcopy(criteria)
+    if len(filtered) != len(criteria) and isinstance(uncertainty, dict):
+        # Persist the policy choice next to uncertainty so report/review code
+        # can explain why a CI was descriptive in Pilot but required in Scale.
+        uncertainty["pilot_decision_role"] = "descriptive"
+        uncertainty["scale_decision_role"] = "confirmatory"
+    return filtered
+
+
+def _compile_mechanism_activation_gate(
+    value: Any,
+    *,
+    pilot: Mapping[str, int],
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {
+            "required": False,
+            "examples": min(8, int(pilot["development_examples"])),
+        }
+    trigger = str(value.get("trigger", "") or "").strip()
+    measurement = _slug(str(value.get("measurement", "") or ""))
+    contrast = str(value.get("behavioral_contrast", "") or "").strip()
+    early_exit = str(value.get("early_exit", "") or "").strip()
+    raw_rate = value.get("minimum_rate")
+    try:
+        minimum_rate = float(raw_rate)
+    except (TypeError, ValueError):
+        minimum_rate = 0.0
+    if not trigger or not measurement or not contrast or not early_exit:
+        raise ValueError(
+            "mechanism_activation requires trigger, measurement, "
+            "behavioral_contrast, and early_exit"
+        )
+    if not 0 < minimum_rate <= 1:
+        raise ValueError(
+            "mechanism_activation.minimum_rate must be in (0,1]"
+        )
+    examples = min(
+        16,
+        max(8, int(pilot["development_examples"])),
+    )
+    return {
+        "required": True,
+        "dataset_role": "development",
+        "examples": examples,
+        "trigger": trigger,
+        "metric": measurement,
+        "minimum_rate": minimum_rate,
+        "behavioral_contrast": contrast,
+        "early_exit_decision": "complete_negative",
+        "early_exit_reason": early_exit,
+    }
 
 
 def validate_protocol_draft(value: Mapping[str, Any]) -> list[str]:

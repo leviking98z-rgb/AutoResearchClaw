@@ -425,10 +425,12 @@ Use only measured evidence. Reject leakage, missing controls, synthetic or
 unverifiable outcomes. First audit runtime_evidence.evidence_valid,
 gate_statistic_defined, criterion_results, and gate_decision against the
 compiled decision_contract. Do not reinterpret raw metric_direction as the
-promotion direction. Protocol-invalid evidence may retry; every valid outcome
-that fails any promotion criterion, including an undefined gate statistic,
-must reject or complete_negative rather than retry. Preserve a valid
-informative null as complete_negative.
+promotion direction. Pilot is a screening gate: use plan.promotion_criteria,
+where uncertainty is descriptive. Scale is confirmatory: additionally enforce
+plan.scale_promotion_criteria. A failed mechanism_activation gate in Pilot is
+a valid early mechanistic negative, not a retry. Protocol-invalid evidence may
+retry; every other valid unfavorable outcome must reject or complete_negative.
+Preserve a valid informative null as complete_negative.
 
 Return:
 {{

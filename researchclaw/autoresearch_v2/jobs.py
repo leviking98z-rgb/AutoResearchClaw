@@ -600,6 +600,15 @@ Scientific responsibilities that remain yours:
   subject model, one seed, one GPU, 16-32 complete paired examples, two primary
   arms plus one independent no-self-improvement reference, at most 512 model
   calls, and at most one primary plus one support promotion criterion;
+- Pilot is a screening gate, not a confirmatory test. A confidence interval is
+  descriptive in Pilot and becomes decision-relevant in Scale. Do not use CI
+  exclusion as the only reason to withhold Scale when the primary coarse
+  effect passes.
+- implement plan.mechanism_activation_gate first on its 8-16 development
+  examples. Emit runtime_evidence.mechanism_activation with rate and
+  behavioral_contrast_observed. If activation is below threshold or treatment
+  and control behave identically, stop before full endpoint evaluation and
+  return a valid mechanistic negative;
 - specify the complete executable algorithm in the model-owned text fields:
   input partition, candidate/update order, frozen parameters, pairing, random
   streams, selection/promotion rule, tie/duplicate/unscorable handling, metric
@@ -985,6 +994,10 @@ Requirements:
   criterion_results schema, dataset/split declarations, GPU count, and gate
   decision. Your raw runtime_evidence must still report the measured model id,
   datasets, examples, seeds, call counts, and scalar scientific metrics.
+- For Pilot, execute plan.mechanism_activation_gate before the full screening
+  workload and emit mechanism_activation.rate plus
+  mechanism_activation.behavioral_contrast_observed. A failed activation gate
+  is a valid scientific negative, not a runtime error.
 - In runtime_evidence, examples_processed is the number of endpoint
   screening/confirmatory evaluation units, not development plus endpoint
   examples. Report development and endpoint counts separately in

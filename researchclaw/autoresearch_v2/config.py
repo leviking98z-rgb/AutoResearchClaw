@@ -34,6 +34,7 @@ class AdmissionConfig:
     duplicate_threshold: float = 0.72
     semantic_duplicate_threshold: float = 0.72
     require_novelty_evidence: bool = True
+    require_mechanism_activation_plan: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +286,12 @@ class V2Config:
             ),
             require_novelty_evidence=bool(
                 admission_raw.get("require_novelty_evidence", True)
+            ),
+            require_mechanism_activation_plan=bool(
+                admission_raw.get(
+                    "require_mechanism_activation_plan",
+                    True,
+                )
             ),
         )
         concurrency_raw = _mapping(data.get("concurrency"), "concurrency")

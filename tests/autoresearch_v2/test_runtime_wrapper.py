@@ -556,7 +556,73 @@ def test_runtime_wrapper_recomputes_proportion_bootstrap_for_ci_gate(
         "value": pytest.approx(0.0),
         "passed": False,
     }
-    assert runtime["gate_decision"] == "reject"
+
+
+def test_pilot_failed_activation_is_valid_early_negative(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    plan["mechanism_activation_gate"] = {
+        "required": True,
+        "dataset_role": "development",
+        "examples": 8,
+        "trigger": "a revision is proposed",
+        "metric": "activation_rate",
+        "minimum_rate": 0.25,
+        "behavioral_contrast": "treatment differs from control",
+        "early_exit_decision": "complete_negative",
+    }
+    output_dir = tmp_path / "artifacts" / "pilot"
+    output_dir.mkdir(parents=True)
+    (output_dir / "metrics.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "completed_examples": 32,
+                    "paired_accuracy_difference": 0.2,
+                    "activation_rate": 0.125,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "runtime_evidence.json").write_text(
+        json.dumps(
+            {
+                "model_loaded": "Qwen",
+                "datasets_loaded": ["GSM8K"],
+                "examples_processed": 32,
+                "examples_by_role": {"development": 8, "screening": 32},
+                "seeds": [1],
+                "call_counts": {
+                    "adaptation": 8,
+                    "final_evaluation": 16,
+                },
+                "metrics": {
+                    "completed_examples": 32,
+                    "paired_accuracy_difference": 0.2,
+                    "activation_rate": 0.125,
+                },
+                "mechanism_activation": {
+                    "rate": 0.125,
+                    "behavioral_contrast_observed": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    compiled = normalize_runtime_artifacts(
+        output_dir=output_dir,
+        plan=plan,
+        mode="pilot",
+        allocated_gpus=1,
+        core_returncode=0,
+    )
+
+    runtime = compiled["runtime_evidence"]
+    assert runtime["mechanism_activation"]["passed"] is False
+    assert runtime["gate_decision"] == "complete_negative"
 
 
 def test_runtime_wrapper_rejects_observations_that_do_not_match_gate(

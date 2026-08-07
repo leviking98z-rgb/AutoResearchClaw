@@ -173,7 +173,7 @@ def test_compiler_owns_arithmetic_splits_and_decision_regions() -> None:
         "meets_all_promotion_criteria",
         "valid_otherwise",
     ]
-    assert plan["compiler"]["version"] == 2
+    assert plan["compiler"]["version"] == 3
     assert plan["decision_contract"]["valid_otherwise"]["decision"] == "reject"
     assert (
         plan["datasets"][1]["access_policy"]
@@ -188,6 +188,40 @@ def test_compiler_owns_arithmetic_splits_and_decision_regions() -> None:
         == plan["datasets"][2]["split_id"]
     )
     assert validate_plan(plan) == []
+
+
+def test_pilot_drops_confirmatory_ci_gate_but_scale_preserves_it() -> None:
+    idea = _idea()
+    idea.candidate["mechanism_activation"] = {
+        "trigger": "compressed feedback is emitted",
+        "measurement": "feedback_activation_rate",
+        "minimum_rate": 0.25,
+        "behavioral_contrast": "feedback payload differs from control",
+        "early_exit": "compressed feedback was not exercised",
+    }
+
+    plan = compile_screening_protocol(idea, _draft())
+
+    assert [row["id"] for row in plan["promotion_criteria"]] == [
+        "primary_effect"
+    ]
+    assert [row["id"] for row in plan["scale_promotion_criteria"]] == [
+        "primary_effect",
+        "positive_ci",
+    ]
+    assert plan["uncertainty"]["pilot_decision_role"] == "descriptive"
+    assert plan["uncertainty"]["scale_decision_role"] == "confirmatory"
+    assert plan["mechanism_activation_gate"] == {
+        "required": True,
+        "dataset_role": "development",
+        "examples": 16,
+        "trigger": "compressed feedback is emitted",
+        "metric": "feedback_activation_rate",
+        "minimum_rate": 0.25,
+        "behavioral_contrast": "feedback payload differs from control",
+        "early_exit_decision": "complete_negative",
+        "early_exit_reason": "compressed feedback was not exercised",
+    }
 
 
 def test_compiler_gate_direction_is_independent_of_raw_metric_direction() -> None:

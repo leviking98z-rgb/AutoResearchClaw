@@ -8,6 +8,7 @@ from researchclaw.autoresearch_v2.ideas import (
     candidate_to_idea,
     designability_evidence,
     evidence_adjusted_score,
+    research_mode_target_counts,
     title_similarity,
     validate_candidate,
 )
@@ -197,6 +198,39 @@ def test_board_prompt_binds_exact_executable_resources() -> None:
     assert "Qwen/Qwen2.5-1.5B-Instruct" in prompts[0]
     assert "openai/gsm8k" in prompts[0]
     assert "Never\npropose a nearby size" in prompts[0]
+    assert "40% capability_improvement" in prompts[0]
+    assert "mechanism-activation check" in prompts[0]
+
+
+def test_admission_can_require_mechanism_activation_plan() -> None:
+    idea = candidate_to_idea(_candidate())
+    admission = IdeaAdmission(
+        minimum_score=0,
+        require_mechanism_activation_plan=True,
+    )
+
+    missing = admission.decide(idea, existing=[])
+    assert not missing.admitted
+    assert missing.reason == "mechanism_activation_plan_missing"
+
+    idea.candidate["mechanism_activation"] = {
+        "trigger": "the verifier rejects a proposed update",
+        "measurement": "verifier_rejection_rate",
+        "minimum_rate": 0.25,
+        "behavioral_contrast": "treatment commits fewer rejected updates",
+        "early_exit": "the gate is inactive under this workload",
+    }
+    assert admission.decide(idea, existing=[]).admitted
+
+
+def test_research_mode_targets_are_balanced_and_exact() -> None:
+    assert research_mode_target_counts(20) == {
+        "capability_improvement": 8,
+        "population_search": 5,
+        "verifier_memory": 4,
+        "stopping_rollback": 3,
+    }
+    assert sum(research_mode_target_counts(23).values()) == 23
 
 
 def test_designability_penalizes_reviewable_budget_and_access_uncertainty() -> None:

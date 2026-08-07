@@ -26,7 +26,7 @@ from typing import Any
 
 WRAPPER_FILENAME = "_autoresearch_runtime.py"
 WRAPPER_SCHEMA = "autoresearch_v2.controller_runtime"
-WRAPPER_VERSION = 7
+WRAPPER_VERSION = 8
 RAW_DIRNAME = "_raw"
 
 
@@ -253,14 +253,24 @@ def normalize_runtime_artifacts(
             }
         )
     else:
+        activation = _compile_mechanism_activation_evidence(
+            plan=plan,
+            raw_runtime=raw_runtime,
+            raw_metrics=raw_metrics,
+            metrics=metrics,
+            mode=mode,
+        )
+        if activation:
+            runtime["mechanism_activation"] = activation
         criterion_results = _compile_criterion_results(
             plan=plan,
             raw_runtime=raw_runtime,
             raw_metrics=raw_metrics,
             metrics=metrics,
+            mode=mode,
         )
         validity_ids = _criterion_ids(plan, "validity_criteria")
-        promotion_ids = _criterion_ids(plan, "promotion_criteria")
+        promotion_ids = _promotion_criterion_ids(plan, mode=mode)
         raw_evidence_valid = raw_runtime.get("evidence_valid")
         computed_validity = all(
             criterion_results.get(identifier, {}).get("passed") is True
@@ -289,6 +299,12 @@ def normalize_runtime_artifacts(
         )
         if not evidence_valid:
             decision = "retry"
+        elif (
+            mode == "pilot"
+            and activation.get("required") is True
+            and activation.get("passed") is False
+        ):
+            decision = "complete_negative"
         elif not gate_defined:
             decision = "reject"
         elif promotion_pass:
@@ -318,6 +334,62 @@ def normalize_runtime_artifacts(
         "runtime_evidence": runtime,
         "raw_dir": str(raw_dir),
     }
+
+
+def _compile_mechanism_activation_evidence(
+    *,
+    plan: Mapping[str, Any],
+    raw_runtime: Mapping[str, Any],
+    raw_metrics: Mapping[str, Any],
+    metrics: Mapping[str, float | int],
+    mode: str,
+) -> dict[str, Any]:
+    configured = plan.get("mechanism_activation_gate")
+    if mode != "pilot" or not isinstance(configured, Mapping):
+        return {}
+    required = configured.get("required") is True
+    result: dict[str, Any] = {
+        "required": required,
+        "examples": int(configured.get("examples", 0) or 0),
+    }
+    if not required:
+        return result
+    metric = str(configured.get("metric", "") or "")
+    raw_activation = raw_runtime.get("mechanism_activation")
+    if not isinstance(raw_activation, Mapping):
+        raw_activation = raw_metrics.get("mechanism_activation")
+    if not isinstance(raw_activation, Mapping):
+        raw_activation = {}
+    measured = raw_activation.get("rate", metrics.get(metric))
+    if not _finite_number(measured):
+        raise RuntimeArtifactError(
+            "runtime_evidence.mechanism_activation.rate or metric "
+            f"{metric!r} is required"
+        )
+    contrast_observed = raw_activation.get("behavioral_contrast_observed")
+    if not isinstance(contrast_observed, bool):
+        raise RuntimeArtifactError(
+            "runtime_evidence.mechanism_activation."
+            "behavioral_contrast_observed must be boolean"
+        )
+    rate = float(measured)
+    threshold = float(configured.get("minimum_rate", 0.0) or 0.0)
+    result.update(
+        {
+            "metric": metric,
+            "rate": rate,
+            "minimum_rate": threshold,
+            "behavioral_contrast_observed": contrast_observed,
+            "passed": rate >= threshold and contrast_observed,
+            "early_exit_decision": str(
+                configured.get(
+                    "early_exit_decision",
+                    "complete_negative",
+                )
+            ),
+        }
+    )
+    return result
 
 
 def _numeric_metrics(
@@ -379,6 +451,7 @@ def _compile_criterion_results(
     raw_runtime: Mapping[str, Any],
     raw_metrics: Mapping[str, Any],
     metrics: Mapping[str, Any],
+    mode: str = "pilot",
 ) -> dict[str, dict[str, Any]]:
     raw_results = _criterion_rows(
         raw_runtime.get(
@@ -387,7 +460,14 @@ def _compile_criterion_results(
         )
     )
     compiled: dict[str, dict[str, Any]] = {}
-    for field in ("validity_criteria", "promotion_criteria"):
+    criteria_fields = ["validity_criteria"]
+    criteria_fields.append(
+        "scale_promotion_criteria"
+        if mode == "scale"
+        and isinstance(plan.get("scale_promotion_criteria"), list)
+        else "promotion_criteria"
+    )
+    for field in criteria_fields:
         criteria = plan.get(field)
         if not isinstance(criteria, list):
             continue
@@ -449,6 +529,20 @@ def _criterion_ids(
         for item in criteria
         if isinstance(item, Mapping) and str(item.get("id", "") or "")
     ]
+
+
+def _promotion_criterion_ids(
+    plan: Mapping[str, Any],
+    *,
+    mode: str,
+) -> list[str]:
+    field = (
+        "scale_promotion_criteria"
+        if mode == "scale"
+        and isinstance(plan.get("scale_promotion_criteria"), list)
+        else "promotion_criteria"
+    )
+    return _criterion_ids(plan, field)
 
 
 def _criterion_passes(

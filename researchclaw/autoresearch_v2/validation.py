@@ -3141,7 +3141,42 @@ def validate_runtime_against_contract(
             plan=plan,
             runtime_evidence=runtime_evidence,
             errors=errors,
+            mode=mode,
         )
+    if mode == "pilot":
+        activation_gate = plan.get("mechanism_activation_gate")
+        if (
+            isinstance(activation_gate, Mapping)
+            and activation_gate.get("required") is True
+        ):
+            activation = runtime_evidence.get("mechanism_activation")
+            if not isinstance(activation, Mapping):
+                errors.append(
+                    "runtime_evidence.mechanism_activation is required"
+                )
+            else:
+                if not isinstance(activation.get("passed"), bool):
+                    errors.append(
+                        "runtime_evidence.mechanism_activation.passed "
+                        "must be boolean"
+                    )
+                if (
+                    isinstance(activation.get("rate"), bool)
+                    or not isinstance(activation.get("rate"), (int, float))
+                    or not math.isfinite(float(activation.get("rate")))
+                ):
+                    errors.append(
+                        "runtime_evidence.mechanism_activation.rate "
+                        "must be finite"
+                    )
+                if not isinstance(
+                    activation.get("behavioral_contrast_observed"),
+                    bool,
+                ):
+                    errors.append(
+                        "runtime_evidence.mechanism_activation."
+                        "behavioral_contrast_observed must be boolean"
+                    )
     if mode == "scale" and pilot_runtime:
         try:
             scale_examples = int(
@@ -3191,6 +3226,7 @@ def _validate_runtime_decision_contract(
     plan: Mapping[str, Any],
     runtime_evidence: Mapping[str, Any],
     errors: list[str],
+    mode: str = "pilot",
 ) -> None:
     contract = plan.get("decision_contract")
     if not isinstance(contract, Mapping):
@@ -3215,7 +3251,13 @@ def _validate_runtime_decision_contract(
         )
         return
     expected: dict[str, Mapping[str, Any]] = {}
-    for field in ("validity_criteria", "promotion_criteria"):
+    promotion_field = (
+        "scale_promotion_criteria"
+        if mode == "scale"
+        and isinstance(plan.get("scale_promotion_criteria"), list)
+        else "promotion_criteria"
+    )
+    for field in ("validity_criteria", promotion_field):
         criteria = plan.get(field)
         if not isinstance(criteria, list):
             continue
@@ -3265,7 +3307,7 @@ def _validate_runtime_decision_contract(
     ]
     promotion_ids = [
         str(item.get("id"))
-        for item in plan.get("promotion_criteria", [])
+        for item in plan.get(promotion_field, [])
         if isinstance(item, Mapping)
     ]
     validity_pass = all(parsed.get(item) is True for item in validity_ids)
@@ -3277,8 +3319,17 @@ def _validate_runtime_decision_contract(
             "runtime_evidence.evidence_valid disagrees with validity_criteria"
         )
     decision = str(runtime_evidence.get("gate_decision", "") or "").casefold()
+    activation = runtime_evidence.get("mechanism_activation")
+    activation_failed = (
+        mode == "pilot"
+        and isinstance(activation, Mapping)
+        and activation.get("required") is True
+        and activation.get("passed") is False
+    )
     if not evidence_valid:
         expected_decision = "retry"
+    elif activation_failed:
+        expected_decision = "complete_negative"
     elif gate_defined is False:
         expected_decision = "reject"
     elif promotion_pass:

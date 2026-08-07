@@ -23,6 +23,25 @@ _SCORE_FIELDS = (
     "reproducibility",
     "meaningful_result_likelihood",
 )
+_RESEARCH_MODES = frozenset(
+    {
+        "capability_improvement",
+        "population_search",
+        "verifier_memory",
+        "stopping_rollback",
+    }
+)
+_RESEARCH_MODE_ALIASES = {
+    "capability": "capability_improvement",
+    "capability_gain": "capability_improvement",
+    "improvement": "capability_improvement",
+    "search": "population_search",
+    "population": "population_search",
+    "verifier": "verifier_memory",
+    "memory": "verifier_memory",
+    "stopping": "stopping_rollback",
+    "rollback": "stopping_rollback",
+}
 _WEIGHTS = {
     "novelty": 0.22,
     "scientific_importance": 0.20,
@@ -194,6 +213,91 @@ def infer_family(candidate: Mapping[str, Any]) -> str:
         if marker in text:
             return family
     return "other"
+
+
+def infer_research_mode(candidate: Mapping[str, Any]) -> str:
+    """Return the portfolio-level mode used to prevent Idea mode collapse."""
+
+    explicit = (
+        str(candidate.get("research_mode", "") or "")
+        .strip()
+        .casefold()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    explicit = _RESEARCH_MODE_ALIASES.get(explicit, explicit)
+    if explicit in _RESEARCH_MODES:
+        return explicit
+    text = " ".join(
+        str(candidate.get(key, "") or "")
+        for key in (
+            "title",
+            "research_question",
+            "falsifiable_hypothesis",
+            "novelty_gap",
+        )
+    ).casefold()
+    if any(
+        marker in text
+        for marker in (
+            "population",
+            "mutation",
+            "crossover",
+            "lineage",
+            "evolution",
+            "search policy",
+        )
+    ):
+        return "population_search"
+    if any(
+        marker in text
+        for marker in (
+            "verifier",
+            "verification",
+            "memory",
+            "retrieval",
+            "credit assignment",
+        )
+    ):
+        return "verifier_memory"
+    if any(
+        marker in text
+        for marker in (
+            "stop",
+            "stopping",
+            "rollback",
+            "revert",
+            "checkpoint",
+            "abstention",
+        )
+    ):
+        return "stopping_rollback"
+    return "capability_improvement"
+
+
+def research_mode_target_counts(count: int) -> dict[str, int]:
+    """Return deterministic 40/25/20/15 board targets summing to count."""
+
+    total = max(0, int(count))
+    weights = (
+        ("capability_improvement", 0.40),
+        ("population_search", 0.25),
+        ("verifier_memory", 0.20),
+        ("stopping_rollback", 0.15),
+    )
+    raw = [
+        (index, mode, total * weight)
+        for index, (mode, weight) in enumerate(weights)
+    ]
+    targets = {mode: int(value) for _, mode, value in raw}
+    remainder = total - sum(targets.values())
+    order = sorted(
+        raw,
+        key=lambda item: (-(item[2] - int(item[2])), item[0]),
+    )
+    for _, mode, _ in order[:remainder]:
+        targets[mode] += 1
+    return targets
 
 
 def _items(candidate: Mapping[str, Any], field: str) -> list[str]:
@@ -501,6 +605,34 @@ def validate_candidate(candidate: Mapping[str, Any]) -> list[str]:
                 continue
             if not math.isfinite(score) or not 0 <= score <= 10:
                 errors.append(f"invalid score {field}")
+    research_mode = infer_research_mode(candidate)
+    if research_mode not in _RESEARCH_MODES:
+        errors.append("invalid research_mode")
+    activation = candidate.get("mechanism_activation")
+    if isinstance(activation, Mapping):
+        required = (
+            "trigger",
+            "measurement",
+            "minimum_rate",
+            "behavioral_contrast",
+            "early_exit",
+        )
+        for field in required:
+            value = activation.get(field)
+            if field == "minimum_rate":
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or not 0 < float(value) <= 1
+                ):
+                    errors.append(
+                        "mechanism_activation.minimum_rate must be in (0,1]"
+                    )
+            elif not str(value or "").strip():
+                errors.append(f"missing mechanism_activation.{field}")
+    elif activation is not None:
+        errors.append("mechanism_activation must be an object")
     return errors
 
 
@@ -560,12 +692,16 @@ class IdeaAdmission:
         minimum_score: float = 6.0,
         semantic_duplicate_threshold: float = 0.72,
         require_novelty_evidence: bool = False,
+        require_mechanism_activation_plan: bool = False,
     ) -> None:
         self.duplicate_threshold = duplicate_threshold
         self.max_same_family = max_same_family
         self.minimum_score = minimum_score
         self.semantic_duplicate_threshold = semantic_duplicate_threshold
         self.require_novelty_evidence = require_novelty_evidence
+        self.require_mechanism_activation_plan = (
+            require_mechanism_activation_plan
+        )
 
     def decide(
         self,
@@ -606,6 +742,13 @@ class IdeaAdmission:
                 return AdmissionDecision(
                     False,
                     "novelty_evidence_empty",
+                )
+        if self.require_mechanism_activation_plan:
+            activation = idea.candidate.get("mechanism_activation")
+            if not isinstance(activation, Mapping):
+                return AdmissionDecision(
+                    False,
+                    "mechanism_activation_plan_missing",
                 )
         current = list(existing)
         for other in current:
@@ -721,6 +864,7 @@ class LLMBoardIdeaGenerator:
                 "novelty_gap": str(
                     idea.candidate.get("novelty_gap", "") or ""
                 ),
+                "research_mode": infer_research_mode(idea.candidate),
             }
             for idea in existing
         ][-80:]
@@ -872,6 +1016,19 @@ propose a nearby size, legacy alias, or uncached substitute.
 Each candidate must test a mechanism of LLM/agent recursive self-improvement,
 not merely benchmark a prompt. Favor ideas whose cheap pilot can falsify the
 premise in <=2 GPU-hours before scale-up. Preserve valuable negative results.
+The board must follow this portfolio mix as closely as integer rounding allows:
+- 40% capability_improvement: mechanisms intended to improve held-out task
+  performance, sample efficiency, adaptation quality, or search quality;
+- 25% population_search: mutation, selection, diversity, lineage, or search;
+- 20% verifier_memory: verification, memory, retrieval, or credit assignment;
+- 15% stopping_rollback: stopping, abstention, rollback, or safety gates.
+Do not fill unused slots with near-duplicate stopping/verifier variants.
+
+Every Idea must include a mechanism-activation check. Before the full Pilot,
+8-16 development examples must establish that the intervention actually
+triggers often enough and produces behavior observably different from the
+control. If it does not, the run must terminate cheaply as a valid mechanistic
+negative rather than spending the full Pilot budget.
 Only propose an Idea if one concrete implementation-ready screening protocol
 fits the supported protocol families and all of these constraints:
 - exactly one public benchmark in the Pilot;
@@ -893,6 +1050,7 @@ Return:
   "candidates": [{{
     "id": "stable-id",
     "title": "specific title",
+    "research_mode": "capability_improvement|population_search|verifier_memory|stopping_rollback",
     "research_question": "precise question",
     "falsifiable_hypothesis": "one primary hypothesis",
     "closest_prior_work": ["specific paper IDs/titles from evidence where relevant"],
@@ -909,6 +1067,13 @@ Return:
     "information_gain_if_true": "what is learned",
     "information_gain_if_false": "what is learned",
     "cheap_pilot": "bounded discriminating pilot and explicit early-stop",
+    "mechanism_activation": {{
+      "trigger": "exact event that means the mechanism was exercised",
+      "measurement": "finite scalar activation-rate metric name/formula",
+      "minimum_rate": 0.25,
+      "behavioral_contrast": "how treatment behavior must differ from control",
+      "early_exit": "valid negative conclusion when activation/contrast is absent"
+    }},
     "scores": {{
       "novelty": 0, "scientific_importance": 0, "falsifiability": 0,
       "compute_tractability": 0, "reproducibility": 0,

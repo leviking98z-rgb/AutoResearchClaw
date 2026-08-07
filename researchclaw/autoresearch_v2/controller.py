@@ -27,7 +27,12 @@ from .attestation import (
 )
 from .config import V2Config
 from .gpu import GPUBroker
-from .ideas import IdeaAdmission, IdeaGenerator
+from .ideas import (
+    IdeaAdmission,
+    IdeaGenerator,
+    infer_research_mode,
+    research_mode_target_counts,
+)
 from .jobs import (
     JobExecutor,
     JobOutcome,
@@ -166,6 +171,10 @@ class V2Controller:
             ),
             require_novelty_evidence=(
                 config.admission.require_novelty_evidence
+                and not self._simulation_mode
+            ),
+            require_mechanism_activation_plan=(
+                config.admission.require_mechanism_activation_plan
                 and not self._simulation_mode
             ),
         )
@@ -725,7 +734,30 @@ class V2Controller:
         added = 0
         rejected = 0
         known = list(ideas)
+        enforce_mode_quota = not self._simulation_mode
+        mode_targets = research_mode_target_counts(len(generated))
+        mode_counts: dict[str, int] = {}
         for idea in generated:
+            research_mode = infer_research_mode(idea.candidate)
+            idea.candidate["research_mode"] = research_mode
+            if (
+                enforce_mode_quota
+                and mode_counts.get(research_mode, 0)
+                >= mode_targets.get(research_mode, 0)
+            ):
+                reason = f"research_mode_quota:{research_mode}"
+                idea.status = IdeaStatus.REJECTED
+                idea.exit_reason = reason
+                self.store.save_idea(idea)
+                self.store.event(
+                    "idea_rejected",
+                    idea_id=idea.idea_id,
+                    reason=reason,
+                    duplicate_of="",
+                )
+                rejected += 1
+                known.append(idea)
+                continue
             resource_reason = self._resource_manifest_rejection(idea)
             if resource_reason:
                 idea.status = IdeaStatus.REJECTED
@@ -764,6 +796,7 @@ class V2Controller:
             )
             known.append(idea)
             added += 1
+            mode_counts[research_mode] = mode_counts.get(research_mode, 0) + 1
         self.store.event(
             "idea_generation_batch",
             requested=requested,
@@ -773,6 +806,8 @@ class V2Controller:
             invalid_generated=len(
                 getattr(self.generator, "last_rejections", ())
             ),
+            research_mode_targets=mode_targets,
+            research_mode_admitted=mode_counts,
         )
         return {
             "generated": len(generated),
