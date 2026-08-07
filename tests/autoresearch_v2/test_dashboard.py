@@ -112,7 +112,7 @@ def test_config_contains_shared_workspace_and_infohub_defaults() -> None:
     assert "8077" in config.literature.url
 
 
-def test_dashboard_uses_desired_resource_manager_gpu_capacity(
+def test_dashboard_resource_manager_starts_at_zero_capacity(
     tmp_path: Path,
 ) -> None:
     shared_root = tmp_path / "shared-runs"
@@ -140,7 +140,7 @@ def test_dashboard_uses_desired_resource_manager_gpu_capacity(
         }
     )
 
-    assert configured_gpu_total(config) == 32
+    assert configured_gpu_total(config) == 0
 
 
 def test_health_uses_controller_tick_not_unrelated_event(

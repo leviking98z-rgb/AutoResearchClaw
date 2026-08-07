@@ -29,7 +29,9 @@ def configured_gpu_total(config: V2Config) -> int:
     if not config.gpu.enabled:
         return 0
     if config.gpu.mode == "resource_manager":
-        return max(0, int(config.gpu.resource_manager.desired_gpus))
+        # Elastic capacity scales to zero. Live allocation capacity is exposed
+        # by the Controller's elastic snapshot.
+        return 0
     if not config.gpu.pool_config:
         return 0
     try:

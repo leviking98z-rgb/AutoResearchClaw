@@ -1169,7 +1169,7 @@ def test_elastic_recovery_defers_gpu_adoption_until_broker_attaches(
         broker = None
         configured_capacity = 1
 
-        def reconcile(self) -> bool:
+        def reconcile(self, **_demand: object) -> bool:
             return False
 
         def snapshot(self) -> dict[str, object]:

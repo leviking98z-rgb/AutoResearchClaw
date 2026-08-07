@@ -81,8 +81,7 @@ autoresearch_v2:
       cb_command: /root/shared/.clusters/.tools/clusterbridge.sh
       project: AutoResearchClaw-v2
       purpose: AutoResearch v2 continuous multi-Idea experiments
-      min_gpus: 8
-      desired_gpus: 56
+      # The only capacity ceiling: request live demand up to this many GPUs.
       max_gpus: 64
       duration_min: 1440
       renew_ttl_min: 1440
@@ -91,9 +90,7 @@ autoresearch_v2:
       allow_cross_cluster: true
       gpu_type: H20
       priority: normal
-      # false preserves the allocation across a routine Controller restart.
-      # Set true only when every shutdown should return capacity immediately.
-      release_on_shutdown: false
+      release_on_shutdown: true
       # Optional exact allocation pin for controlled canaries. When set, the
       # manager never attaches or releases another matching project allocation.
       preferred_allocation_id: ""

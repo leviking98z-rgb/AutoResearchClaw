@@ -175,8 +175,6 @@ gpu:
     cb_command: /root/shared/.clusters/.tools/clusterbridge.sh
     project: AutoResearchClaw-v2
     purpose: AutoResearch v2 continuous multi-Idea experiments
-    min_gpus: 8
-    desired_gpus: 56
     max_gpus: 64
     duration_min: 1440
     renew_ttl_min: 1440
@@ -185,32 +183,33 @@ gpu:
     allow_cross_cluster: true
     gpu_type: H20
     priority: normal
-    release_on_shutdown: false
+    release_on_shutdown: true
     log_root: /root/shared/.clusters/.tmp/autoresearch-v2/elastic-pools
 ```
 
 The capacity bounds satisfy:
 
 ```text
-0 < min_gpus <= desired_gpus <= max_gpus
+max_gpus > 0
 ```
 
-`desired_gpus` is the request target and the configured capacity shown while a
-request is queued. `min_gpus` is the smallest allocation that may be attached;
-`max_gpus` is the policy ceiling for later resizing. `duration_min` controls
-the initial request, while `renew_ttl_min` and `renew_interval_sec` control
-lease renewal. The renewal interval must be shorter than the renewal TTL.
+Runtime requests equal the current dispatchable durable GPU demand and are
+capped by `max_gpus`; the resource manager may grant a whole node even when
+the requested card count is smaller. The allocation is returned immediately
+after pending and running GPU Jobs both reach zero.
+
+AutoResearch does not manage cluster GPU spin. A granted allocation is treated
+as in use throughout cache preparation, Ray startup, and experiment execution.
+After release, the cluster owns any automatic spin/idle behavior.
 
 `owner` must be a stable ClusterBridge owner identity for the unattended
 service. `project`, `purpose`, `gpu_type`, `priority`, and
 `allow_cross_cluster` are passed to the central resource request. `log_root`
 holds generated per-allocation pool state and task logs.
 
-`release_on_shutdown: false` is the safe default for a continuously restarted
-systemd service: the allocation survives a routine Controller restart and is
-re-adopted. Set it to `true` when every clean shutdown must explicitly return
-the allocation. Running GPU tasks remain governed by the durable Job and
-global GPU-lease recovery rules.
+`release_on_shutdown: true` is recommended for scale-to-zero services so a
+stopped Controller never strands capacity. Running GPU tasks remain governed
+by the durable Job and global GPU-lease recovery rules.
 
 The public manager contract is intentionally small:
 
@@ -230,10 +229,11 @@ and dashboard code must not depend on the concrete resource client.
 
 At startup, `bootstrap()` performs a best-effort reconciliation:
 
-1. reuse an active allocation owned by the configured `owner` and `project`;
-2. otherwise submit one request for `desired_gpus`;
-3. remain available for Idea generation, Design, and Build while queued;
-4. attach the broker once at least `min_gpus` is granted.
+1. observe any active allocation owned by the configured `owner` and `project`;
+2. stay at zero capacity when no durable GPU Job is dispatchable;
+3. request rounded demand only when GPU work becomes ready;
+4. remain available for Idea generation, Design, and Build while queued;
+5. attach the broker and release immediately after durable GPU demand drains.
 
 Every Controller tick calls the manager reconciliation path. A later grant,
 allocation replacement, or capacity change therefore updates

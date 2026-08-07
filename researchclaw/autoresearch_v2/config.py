@@ -116,8 +116,10 @@ class GPUResourceManagerConfig:
     )
     project: str = "AutoResearchClaw-v2"
     purpose: str = "AutoResearch v2 elastic GPU pool"
-    min_gpus: int = 8
-    desired_gpus: int = 32
+    # Retained for backward-compatible config parsing. Runtime request size is
+    # driven only by durable Job demand and capped by max_gpus.
+    min_gpus: int = 0
+    desired_gpus: int = 1
     max_gpus: int = 64
     duration_min: int = 1440
     renew_ttl_min: int = 1440
@@ -450,9 +452,9 @@ class V2Config:
                 )
                 or ""
             ),
-            min_gpus=int(resource_manager_raw.get("min_gpus", 8)),
+            min_gpus=int(resource_manager_raw.get("min_gpus", 0)),
             desired_gpus=int(
-                resource_manager_raw.get("desired_gpus", 32)
+                resource_manager_raw.get("desired_gpus", 1)
             ),
             max_gpus=int(resource_manager_raw.get("max_gpus", 64)),
             duration_min=int(
@@ -758,15 +760,9 @@ class V2Config:
                     "gpu.resource_manager.owner is required in "
                     "resource_manager mode"
                 )
-            if not (
-                0
-                < elastic.min_gpus
-                <= elastic.desired_gpus
-                <= elastic.max_gpus
-            ):
+            if elastic.max_gpus <= 0:
                 raise ValueError(
-                    "gpu.resource_manager GPU bounds must satisfy "
-                    "0 < min_gpus <= desired_gpus <= max_gpus"
+                    "gpu.resource_manager.max_gpus must be positive"
                 )
             if min(
                 elastic.duration_min,

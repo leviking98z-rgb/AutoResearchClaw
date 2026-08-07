@@ -23,7 +23,7 @@ def _config(
     root: Path,
     *,
     release_on_shutdown: bool = False,
-    min_gpus: int = 8,
+    min_gpus: int = 0,
     desired_gpus: int = 16,
     max_gpus: int = 32,
 ) -> V2Config:
@@ -99,6 +99,7 @@ class _FakeResourceClient:
         self.requests: list[dict[str, Any]] = []
         self.renewals: list[tuple[str, int]] = []
         self.releases: list[str] = []
+        self.cancellations: list[str] = []
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -123,6 +124,12 @@ class _FakeResourceClient:
     def release(self, allocation_id: str) -> None:
         self.releases.append(allocation_id)
 
+    def cancel(self, request_id: str) -> None:
+        self.cancellations.append(request_id)
+        self.queue = [
+            item for item in self.queue if item.get("id") != request_id
+        ]
+
 
 class _FakePool:
     def __init__(self, pool_config: Any, **kwargs: Any) -> None:
@@ -136,6 +143,7 @@ class _FakePool:
         self.prepared_calls = 0
         self.restored = 0
         self.pause_spin_calls = 0
+        self.spin_calls = 0
         self.stop_keepalive_calls = 0
 
     def adopt_claimed_lease(self) -> None:
@@ -157,6 +165,9 @@ class _FakePool:
 
     def pause_spin(self) -> None:
         self.pause_spin_calls += 1
+
+    def spin(self) -> None:
+        self.spin_calls += 1
 
     def stop_keepalive(self) -> None:
         self.stop_keepalive_calls += 1
@@ -249,7 +260,7 @@ def test_resource_manager_mode_parses_full_policy_without_pool_config(
         config.gpu.resource_manager.min_gpus,
         config.gpu.resource_manager.desired_gpus,
         config.gpu.resource_manager.max_gpus,
-    ) == (8, 16, 32)
+    ) == (0, 16, 32)
     assert config.gpu.resource_manager.duration_min == 120
     assert config.gpu.resource_manager.renew_ttl_min == 120
     assert config.gpu.resource_manager.renew_interval_sec == 30
@@ -282,7 +293,7 @@ def test_resource_manager_projects_cache_prepare_policy(
         cache_archive="/root/sync/autoresearch-cache.tar",
     )
 
-    manager.bootstrap()
+    manager.bootstrap(required_gpus=1)
 
     pool_config = pools.pools[0].config
     assert (
@@ -312,7 +323,7 @@ def test_resource_manager_passes_task_namespace_to_broker(
         task_namespace="rsi-canary-seven",
     )
 
-    manager.bootstrap()
+    manager.bootstrap(required_gpus=1)
 
     assert brokers.calls[0]["task_namespace"] == "rsi-canary-seven"
     assert brokers.calls[0]["manage_pool_keepalive"] is False
@@ -372,7 +383,7 @@ def test_resource_manager_can_pin_exact_allocation(tmp_path: Path) -> None:
         clock=[0.0],
     )
 
-    manager.bootstrap()
+    manager.bootstrap(required_gpus=1)
 
     assert manager.snapshot()["allocation_id"] == "alloc-preferred"
     assert pools.pools[0].config.expected_total_gpus == 16
@@ -390,26 +401,17 @@ def test_resource_manager_exposes_declared_controller_api() -> None:
     assert callable(getattr(ResourceManagedGPUManager, "snapshot", None))
 
 
-@pytest.mark.parametrize(
-    ("minimum", "desired", "maximum"),
-    [(0, 8, 16), (16, 8, 32), (8, 64, 32)],
-)
-def test_resource_manager_mode_rejects_invalid_capacity_bounds(
+def test_resource_manager_mode_rejects_non_positive_maximum(
     tmp_path: Path,
-    minimum: int,
-    desired: int,
-    maximum: int,
 ) -> None:
-    with pytest.raises(ValueError, match="GPU bounds"):
+    with pytest.raises(ValueError, match="max_gpus"):
         _config(
             tmp_path,
-            min_gpus=minimum,
-            desired_gpus=desired,
-            max_gpus=maximum,
+            max_gpus=0,
         )
 
 
-def test_bootstrap_requests_desired_capacity_when_no_allocation_exists(
+def test_bootstrap_without_demand_does_not_request_capacity(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
@@ -422,11 +424,43 @@ def test_bootstrap_requests_desired_capacity_when_no_allocation_exists(
 
     manager.bootstrap()
 
+    assert client.requests == []
+    assert manager.broker is None
+    assert manager.configured_capacity == 0
+    assert manager.snapshot()["state"] == "idle"
+    assert manager.snapshot()["request_pending"] is False
+    assert pools.pools == []
+    assert brokers.calls == []
+
+
+@pytest.mark.parametrize(
+    ("required_gpus", "expected_gpus"),
+    [(1, 1), (9, 9), (17, 17), (99, 32)],
+)
+def test_demand_requests_rounded_capacity_when_no_allocation_exists(
+    tmp_path: Path,
+    required_gpus: int,
+    expected_gpus: int,
+) -> None:
+    config = _config(tmp_path)
+    client = _FakeResourceClient()
+    manager, pools, brokers = _manager(
+        config.gpu,
+        client=client,
+        clock=[0.0],
+    )
+
+    manager.reconcile(
+        required_gpus=required_gpus,
+        pending_gpu_jobs=5,
+        force=True,
+    )
+
     assert client.requests == [
         {
             "project": "AutoResearch",
             "purpose": "elastic unit test",
-            "gpus": 16,
+            "gpus": expected_gpus,
             "duration_min": 120,
             "allow_cross_cluster": True,
             "gpu_type": "H20",
@@ -434,7 +468,7 @@ def test_bootstrap_requests_desired_capacity_when_no_allocation_exists(
         }
     ]
     assert manager.broker is None
-    assert manager.configured_capacity == 16
+    assert manager.configured_capacity == 0
     assert manager.snapshot()["state"] in {
         "requesting",
         "waiting_allocation",
@@ -442,6 +476,105 @@ def test_bootstrap_requests_desired_capacity_when_no_allocation_exists(
     assert manager.snapshot()["request_pending"] is True
     assert pools.pools == []
     assert brokers.calls == []
+
+
+def test_demand_drop_cancels_queued_request(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    client = _FakeResourceClient()
+    manager, _, _ = _manager(
+        config.gpu,
+        client=client,
+        clock=[0.0],
+    )
+    manager.reconcile(required_gpus=2, force=True)
+
+    manager.reconcile(required_gpus=0, force=True)
+
+    assert client.cancellations == ["req-1"]
+    assert client.queue == []
+    assert manager.snapshot()["state"] == "idle"
+    assert manager.snapshot()["request_pending"] is False
+
+
+def test_invisible_submitted_request_is_not_duplicated_within_grace(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+
+    class _LaggingClient(_FakeResourceClient):
+        def request(self, **kwargs: Any) -> None:
+            self.requests.append(dict(kwargs))
+
+    client = _LaggingClient()
+    clock = [0.0]
+    manager, _, _ = _manager(
+        config.gpu,
+        client=client,
+        clock=clock,
+    )
+
+    manager.reconcile(required_gpus=6, force=True)
+    for now in (2.0, 15.0, 59.9):
+        clock[0] = now
+        manager.reconcile(required_gpus=6, force=True)
+
+    assert len(client.requests) == 1
+    assert manager.snapshot()["request_pending"] is True
+    assert manager.snapshot()["requested_gpus"] == 6
+
+
+def test_invisible_submitted_request_retries_after_grace(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+
+    class _LaggingClient(_FakeResourceClient):
+        def request(self, **kwargs: Any) -> None:
+            self.requests.append(dict(kwargs))
+
+    client = _LaggingClient()
+    clock = [0.0]
+    manager, _, _ = _manager(
+        config.gpu,
+        client=client,
+        clock=clock,
+    )
+
+    manager.reconcile(required_gpus=6, force=True)
+    clock[0] = 60.0
+    manager.reconcile(required_gpus=6, force=True)
+
+    assert len(client.requests) == 2
+    assert manager.snapshot()["request_pending"] is True
+
+
+def test_recently_visible_queue_is_protected_when_snapshot_turns_empty(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    client = _FakeResourceClient()
+    client.queue = [
+        {
+            "id": "req-existing",
+            "owner": OWNER,
+            "project": "AutoResearch",
+            "status": "queued",
+        }
+    ]
+    clock = [10.0]
+    manager, _, _ = _manager(
+        config.gpu,
+        client=client,
+        clock=clock,
+    )
+
+    manager.reconcile(required_gpus=6, force=True)
+    client.queue = []
+    clock[0] = 20.0
+    manager.reconcile(required_gpus=6, force=True)
+
+    assert client.requests == []
+    assert manager.snapshot()["request_pending"] is True
 
 
 def test_later_reconcile_hot_attaches_granted_allocation(
@@ -455,7 +588,7 @@ def test_later_reconcile_hot_attaches_granted_allocation(
         client=client,
         clock=clock,
     )
-    manager.bootstrap()
+    manager.bootstrap(required_gpus=1)
     client.queue = []
     client.allocations = [_allocation(gpus=16)]
     clock[0] = 2.0
@@ -472,6 +605,7 @@ def test_later_reconcile_hot_attaches_granted_allocation(
     assert client.renewals == [("alloc-1", 120)]
     assert manager.snapshot()["state"] == "ready"
     assert manager.snapshot()["allocated_gpus"] == 16
+    assert manager.snapshot()["request_pending"] is False
 
 
 def test_existing_allocated_pool_state_skips_per_node_claim_restore(
@@ -510,18 +644,19 @@ def test_existing_allocated_pool_state_skips_per_node_claim_restore(
         prepare_async=False,
     )
 
-    manager.bootstrap()
+    manager.bootstrap(required_gpus=1)
 
     pool = pools.pools[0]
     assert pool.restored == 1
     assert pool.adopted == 0
     assert pool.prepared_calls == 0
     assert pool.stop_keepalive_calls == 1
-    assert pool.pause_spin_calls == 1
+    assert pool.pause_spin_calls == 0
+    assert pool.spin_calls == 0
     assert manager.broker is brokers.brokers[0]
 
 
-def test_attached_pool_refreshes_spin_pause_before_daemon_timeout(
+def test_attached_pool_does_not_manage_cluster_spin(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
@@ -534,21 +669,42 @@ def test_attached_pool_refreshes_spin_pause_before_daemon_timeout(
         clock=clock,
     )
 
-    manager.bootstrap()
+    manager.bootstrap(required_gpus=1)
     pool = pools.pools[0]
     assert pool.pause_spin_calls == 0
+    assert pool.spin_calls == 0
 
-    clock[0] = 91.0
-    manager.reconcile()
-    assert pool.pause_spin_calls == 1
+    clock[0] = 2.0
+    manager.reconcile(required_gpus=1, running_gpu_jobs=1)
+    assert pool.pause_spin_calls == 0
+    assert pool.spin_calls == 0
 
-    clock[0] = 120.0
-    manager.reconcile()
-    assert pool.pause_spin_calls == 1
 
-    clock[0] = 181.0
-    manager.reconcile()
-    assert pool.pause_spin_calls == 2
+def test_idle_allocation_releases_immediately(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    client = _FakeResourceClient()
+    client.allocations = [_allocation()]
+    clock = [0.0]
+    manager, pools, _ = _manager(
+        config.gpu,
+        client=client,
+        clock=clock,
+    )
+    manager.bootstrap(required_gpus=1)
+    broker = manager.broker
+    pool = pools.pools[0]
+
+    clock[0] = 2.0
+    manager.reconcile(required_gpus=0, pending_gpu_jobs=0)
+    assert client.releases == ["alloc-1"]
+    assert pool.spin_calls == 0
+    assert broker is not None
+    assert broker.closed == 1
+    assert manager.broker is None
+    assert manager.configured_capacity == 0
+    assert manager.snapshot()["state"] == "idle"
 
 
 def test_renewal_does_not_block_reconcile(tmp_path: Path) -> None:
@@ -575,7 +731,7 @@ def test_renewal_does_not_block_reconcile(tmp_path: Path) -> None:
         prepare_async=False,
     )
 
-    manager.bootstrap()
+    manager.bootstrap(required_gpus=1)
 
     assert started.wait(timeout=1)
     assert manager.broker is brokers.brokers[0]
@@ -606,11 +762,11 @@ def test_async_resource_snapshot_never_blocks_status_reads(
         prepare_async=True,
     )
 
-    manager.bootstrap()
+    manager.bootstrap(required_gpus=1)
 
     assert started.wait(timeout=1)
     assert manager.broker is None
-    assert manager.configured_capacity == 16
+    assert manager.configured_capacity == 0
     assert manager.snapshot()["state"] == "starting"
     release.set()
     manager.close()
@@ -628,7 +784,7 @@ def test_allocation_change_replaces_broker_and_updates_capacity(
         client=client,
         clock=clock,
     )
-    manager.bootstrap()
+    manager.bootstrap(required_gpus=1)
     first = manager.broker
     client.allocations = [_allocation(allocation_id="alloc-2", gpus=24)]
     clock[0] = 2.0
@@ -643,6 +799,25 @@ def test_allocation_change_replaces_broker_and_updates_capacity(
     assert manager.configured_capacity == 24
     assert manager.snapshot()["allocation_id"] == "alloc-2"
     assert manager.snapshot()["allocated_gpus"] == 24
+
+
+def test_duplicate_owned_allocations_are_released(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    client = _FakeResourceClient()
+    client.allocations = [
+        _allocation(allocation_id="alloc-small", gpus=8),
+        _allocation(allocation_id="alloc-large", gpus=16),
+    ]
+    manager, _, _ = _manager(
+        config.gpu,
+        client=client,
+        clock=[0.0],
+    )
+
+    manager.bootstrap(required_gpus=1)
+
+    assert manager.snapshot()["allocation_id"] == "alloc-large"
+    assert client.releases == ["alloc-small"]
 
 
 @pytest.mark.parametrize(
@@ -665,7 +840,7 @@ def test_close_obeys_release_policy(
         client=client,
         clock=[0.0],
     )
-    manager.bootstrap()
+    manager.bootstrap(required_gpus=1)
     broker = manager.broker
 
     manager.close()
@@ -692,8 +867,9 @@ def test_controller_tick_hot_syncs_manager_broker_and_capacity(
             self.reconciles = 0
             self.closed = 0
 
-        def reconcile(self) -> bool:
+        def reconcile(self, **kwargs: Any) -> bool:
             self.reconciles += 1
+            self.demand = dict(kwargs)
             self.broker = broker
             self.configured_capacity = 24
             return True
@@ -723,7 +899,12 @@ def test_controller_tick_hot_syncs_manager_broker_and_capacity(
 
     snapshot = controller.tick()
 
-    assert manager.reconciles == 1
+    assert manager.reconciles == 2
+    assert manager.demand == {
+        "required_gpus": 0,
+        "pending_gpu_jobs": 0,
+        "running_gpu_jobs": 0,
+    }
     assert controller.gpu_broker is broker
     assert controller.configured_gpu_capacity == 24
     assert snapshot["gpu"]["total_gpus"] == 16

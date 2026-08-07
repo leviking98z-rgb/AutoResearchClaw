@@ -207,6 +207,7 @@ class V2Controller:
         self.store.recover_retry_candidate_workspaces()
         self._initialized = True
         self.store.start_database_backup_loop()
+        self._reconcile_gpu_manager()
         self.store.event(
             "controller_initialized",
             max_cpu_jobs=self.config.concurrency.max_cpu_jobs,
@@ -336,11 +337,14 @@ class V2Controller:
         self._tick_count += 1
         if self.store.control_requested("stop"):
             self.request_stop(reason="control_stop")
+        # Collect durable terminal GPU tasks before calculating allocation
+        # demand. Otherwise a just-finished lease can retain capacity for
+        # another resource-manager interval.
+        self._collect_gpu_finished()
         self._reconcile_gpu_manager()
         self._collect_finished()
         self._collect_idea_generation()
         self._collect_research_memory_sync()
-        self._collect_gpu_finished()
         self._sync_gpu_budget_pause_state()
         self._reconcile_current_jobs()
         self._enforce_liveness_budgets()
@@ -391,8 +395,9 @@ class V2Controller:
         manager = self.gpu_manager
         if manager is None:
             return
+        demand = self._gpu_resource_demand()
         prior = self.gpu_broker
-        changed = manager.reconcile()
+        changed = manager.reconcile(**demand)
         self.gpu_broker = manager.broker
         self.configured_gpu_capacity = max(
             0,
@@ -409,6 +414,54 @@ class V2Controller:
         )
         if self.gpu_broker is not None:
             self._adopt_interrupted_gpu_jobs()
+
+    def _gpu_resource_demand(self) -> dict[str, int]:
+        """Return durable useful-work demand for the elastic GPU manager."""
+
+        now = datetime.now(UTC)
+        pending: list[JobRecord] = []
+        running: list[JobRecord] = []
+        for job in self.store.list_jobs(
+            statuses={
+                JobStatus.READY,
+                JobStatus.RETRY_WAIT,
+                JobStatus.RUNNING,
+            }
+        ):
+            if not job.requires_gpu:
+                continue
+            if job.status is JobStatus.RUNNING:
+                running.append(job)
+                continue
+            if (
+                job.status is JobStatus.RETRY_WAIT
+                and job.retry_not_before
+                and (
+                    (retry_at := _parse_time(job.retry_not_before))
+                    is not None
+                )
+                and retry_at > now
+            ):
+                continue
+            if (
+                job.status is JobStatus.READY
+                and job.result.get("remote_cancel_pending")
+            ):
+                continue
+            pending.append(job)
+        jobs = [*running, *pending]
+        required = sum(
+            max(1, int(job.preferred_gpus or job.min_gpus or 1))
+            for job in jobs[: self.config.concurrency.max_gpu_jobs]
+        )
+        return {
+            "required_gpus": min(
+                required,
+                self.config.gpu.resource_manager.max_gpus,
+            ),
+            "pending_gpu_jobs": len(pending),
+            "running_gpu_jobs": len(running),
+        }
 
     def _start_research_memory_sync(self) -> None:
         if self._research_memory_sync is not None:

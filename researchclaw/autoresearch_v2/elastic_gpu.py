@@ -98,6 +98,9 @@ class ClusterBridgeResourceClient:
     def release(self, allocation_id: str) -> None:
         self._run(["alloc-release", allocation_id])
 
+    def cancel(self, request_id: str) -> None:
+        self._run(["cancel", request_id])
+
     def _run(
         self,
         args: list[str],
@@ -177,12 +180,16 @@ class ResourceManagedGPUManager:
         self._pool: ClusterBridgePool | None = None
         self._allocation: dict[str, Any] | None = None
         self._request_pending = False
+        self._request_submitted_at: float | None = None
         self._next_reconcile = 0.0
         self._next_renew = 0.0
         self._last_error = ""
         self._state = "starting"
         self._closed = False
-        self._spin_paused_at = 0.0
+        self._required_gpus = 0
+        self._pending_gpu_jobs = 0
+        self._running_gpu_jobs = 0
+        self._requested_gpus = 0
         self._prepare_thread: threading.Thread | None = None
         self._renew_thread: threading.Thread | None = None
         self._reconcile_thread: threading.Thread | None = None
@@ -202,20 +209,40 @@ class ResourceManagedGPUManager:
             return int(
                 allocation.get(
                     "gpu_count",
-                    self.elastic.desired_gpus,
+                    0,
                 )
-                or self.elastic.desired_gpus
+                or 0
             )
-        return self.elastic.desired_gpus
+        return 0
 
-    def bootstrap(self) -> None:
-        """Try once immediately; failure remains retryable on later ticks."""
+    def bootstrap(self, *, required_gpus: int = 0) -> None:
+        """Initialize without touching the resource pool at zero demand."""
 
-        self.reconcile(force=True)
+        self._update_demand(
+            required_gpus=required_gpus,
+            pending_gpu_jobs=None,
+            running_gpu_jobs=None,
+        )
+        if required_gpus > 0:
+            self.reconcile(force=True)
+        else:
+            self._state = "idle"
 
-    def reconcile(self, *, force: bool = False) -> bool:
+    def reconcile(
+        self,
+        *,
+        required_gpus: int | None = None,
+        pending_gpu_jobs: int | None = None,
+        running_gpu_jobs: int | None = None,
+        force: bool = False,
+    ) -> bool:
         """Reconcile allocation, lease renewal, pool readiness and broker."""
 
+        self._update_demand(
+            required_gpus=required_gpus,
+            pending_gpu_jobs=pending_gpu_jobs,
+            running_gpu_jobs=running_gpu_jobs,
+        )
         if not self._prepare_async:
             return self._reconcile_sync(force=force)
         with self._lock:
@@ -245,6 +272,7 @@ class ResourceManagedGPUManager:
         """Blocking implementation used by tests and the background worker."""
 
         to_close: GPUBroker | None = None
+        allocations_to_release: list[str] = []
         early_result: bool | None = None
         with self._lock:
             if self._closed:
@@ -259,8 +287,35 @@ class ResourceManagedGPUManager:
             try:
                 snapshot = self.client.snapshot()
                 allocation = self._select_allocation(snapshot)
-                if allocation is None:
-                    if self._broker_has_running_tasks():
+                selected_id = str((allocation or {}).get("id", ""))
+                allocations_to_release = [
+                    str(item.get("id", ""))
+                    for item in self._owned_allocations(snapshot)
+                    if str(item.get("id", "")) != selected_id
+                ]
+                has_running_tasks = self._broker_has_running_tasks()
+                demand = self._required_gpus
+                idle_only = demand <= 0 and not has_running_tasks
+                if idle_only:
+                    prepare = self._prepare_thread
+                    if prepare is not None and prepare.is_alive():
+                        self._state = "draining_prepare"
+                    else:
+                        for request_id in self._request_ids(snapshot):
+                            self.client.cancel(request_id)
+                        to_close = self._take_broker()
+                        if allocation is not None:
+                            self.client.release(
+                                str(allocation.get("id", ""))
+                            )
+                        self._allocation = None
+                        self._clear_request_tracking()
+                        self._requested_gpus = 0
+                        self._state = "idle"
+                    self._last_error = ""
+                    early_result = previous is not self._broker
+                if not idle_only and allocation is None:
+                    if has_running_tasks:
                         raise ResourceManagerError(
                             "allocation unavailable while GPU tasks are "
                             "running; retaining the old broker until tasks "
@@ -268,18 +323,39 @@ class ResourceManagedGPUManager:
                         )
                     to_close = self._take_broker()
                     self._allocation = None
+                    visible_request = self._has_request(snapshot)
+                    if visible_request:
+                        # Refresh the timestamp while the queue entry is
+                        # visible. If the manager grants it and allocation
+                        # visibility lags behind queue removal, grace starts
+                        # from the last authoritative sighting.
+                        self._request_pending = True
+                        self._request_submitted_at = now
+                    if (
+                        self._request_pending
+                        and not visible_request
+                        and not self._within_request_visibility_grace(now)
+                    ):
+                        self._clear_request_tracking()
+                        self._requested_gpus = 0
                     self._state = (
                         "waiting_allocation"
-                        if self._request_pending
+                        if self._request_pending or visible_request
                         else "requesting"
                     )
-                    if not self._request_pending and not self._has_request(
-                        snapshot
-                    ):
+                    if not self._request_pending and not visible_request:
+                        requested = self._request_size(demand)
+                        # Record the attempt before invoking the control plane.
+                        # A timed-out command may still have been accepted, so
+                        # treating the request as pending avoids an immediate
+                        # duplicate submission.
+                        self._requested_gpus = requested
+                        self._request_pending = True
+                        self._request_submitted_at = now
                         self.client.request(
                             project=self.elastic.project,
                             purpose=self.elastic.purpose,
-                            gpus=self.elastic.desired_gpus,
+                            gpus=requested,
                             duration_min=self.elastic.duration_min,
                             allow_cross_cluster=(
                                 self.elastic.allow_cross_cluster
@@ -287,19 +363,30 @@ class ResourceManagedGPUManager:
                             gpu_type=self.elastic.gpu_type,
                             priority=self.elastic.priority,
                         )
-                        self._request_pending = True
                         # The manager may grant synchronously. Pick it up now
                         # so an otherwise idle controller does not wait a full
                         # reconcile interval.
                         snapshot = self.client.snapshot()
                         allocation = self._select_allocation(snapshot)
+                        visible_request = self._has_request(snapshot)
                     if allocation is None:
-                        self._request_pending = self._has_request(snapshot)
+                        self._request_pending = (
+                            visible_request
+                            or self._within_request_visibility_grace(now)
+                        )
+                        if not self._request_pending:
+                            self._clear_request_tracking()
+                            self._requested_gpus = 0
+                        self._state = (
+                            "waiting_allocation"
+                            if self._request_pending
+                            else "requesting"
+                        )
                         self._last_error = ""
                         early_result = previous is not self._broker
 
-                if allocation is not None:
-                    self._request_pending = False
+                if not idle_only and allocation is not None:
+                    self._clear_request_tracking()
                     allocation_id = str(allocation.get("id", ""))
                     current_id = str(
                         (self._allocation or {}).get("id", "")
@@ -312,12 +399,13 @@ class ResourceManagedGPUManager:
                             )
                         to_close = self._take_broker()
                     self._allocation = dict(allocation)
+                    self._requested_gpus = int(
+                        allocation.get("gpu_count", 0) or 0
+                    )
                     if now >= self._next_renew:
                         self._start_renew(allocation_id)
                     if self._broker is None:
                         self._start_attach(allocation)
-                    elif now >= self._next_spin_pause_at():
-                        self._start_spin_pause()
                     if self._broker is not None:
                         self._state = "ready"
                     self._last_error = ""
@@ -329,6 +417,12 @@ class ResourceManagedGPUManager:
             changed = previous is not self._broker
         if to_close is not None:
             to_close.close()
+        for allocation_id in allocations_to_release:
+            try:
+                self.client.release(allocation_id)
+            except Exception as exc:  # noqa: BLE001
+                with self._lock:
+                    self._last_error = f"{type(exc).__name__}: {exc}"
         return changed if early_result is None else early_result
 
     def close(self) -> None:
@@ -388,9 +482,11 @@ class ResourceManagedGPUManager:
         return {
             "mode": "resource_manager",
             "state": self._state,
-            "desired_gpus": self.elastic.desired_gpus,
-            "min_gpus": self.elastic.min_gpus,
             "max_gpus": self.elastic.max_gpus,
+            "required_gpus": self._required_gpus,
+            "requested_gpus": self._requested_gpus,
+            "pending_gpu_jobs": self._pending_gpu_jobs,
+            "running_gpu_jobs": self._running_gpu_jobs,
             "allocation_id": allocation.get("id", ""),
             "allocated_gpus": int(
                 allocation.get("gpu_count", 0) or 0
@@ -434,50 +530,53 @@ class ResourceManagedGPUManager:
                     + self.elastic.reconcile_interval_sec,
                 )
 
-    def _next_spin_pause_at(self) -> float:
-        """Return when the running Ray pool needs its keepalive paused again."""
+    def _update_demand(
+        self,
+        *,
+        required_gpus: int | None,
+        pending_gpu_jobs: int | None,
+        running_gpu_jobs: int | None,
+    ) -> None:
+        with self._lock:
+            if required_gpus is not None:
+                self._required_gpus = max(
+                    0,
+                    min(int(required_gpus), self.elastic.max_gpus),
+                )
+            if pending_gpu_jobs is not None:
+                self._pending_gpu_jobs = max(0, int(pending_gpu_jobs))
+            if running_gpu_jobs is not None:
+                self._running_gpu_jobs = max(0, int(running_gpu_jobs))
 
-        if self._spin_paused_at <= 0.0:
-            return 0.0
-        # ``node_spin.sh pause`` currently suppresses the daemon for 60
-        # minutes. Refresh comfortably before that deadline while the
-        # allocation remains attached to a live Ray broker.
-        return self._spin_paused_at + min(
-            45.0 * 60.0,
-            max(
-                60.0,
-                float(self.elastic.renew_interval_sec) * 3.0,
-            ),
+    def _request_size(self, required_gpus: int) -> int:
+        return min(self.elastic.max_gpus, max(1, int(required_gpus)))
+
+    def _request_visibility_grace_sec(self) -> float:
+        """Bound control-plane snapshot lag after a successful request."""
+
+        return max(
+            60.0,
+            float(self.elastic.reconcile_interval_sec) * 4.0,
         )
 
-    def _start_spin_pause(self) -> None:
-        """Pause the GPU keepalive while this manager owns a prepared pool."""
+    def _within_request_visibility_grace(self, now: float) -> bool:
+        submitted_at = self._request_submitted_at
+        if submitted_at is None:
+            return False
+        return (
+            max(0.0, float(now) - submitted_at)
+            < self._request_visibility_grace_sec()
+        )
 
-        pool = self._pool
-        if pool is None:
-            return
-        try:
-            pool.pause_spin()
-        except Exception as exc:  # noqa: BLE001
-            self._last_error = f"{type(exc).__name__}: {exc}"
-            return
-        self._spin_paused_at = self._monotonic()
+    def _clear_request_tracking(self) -> None:
+        self._request_pending = False
+        self._request_submitted_at = None
 
     def _select_allocation(
         self,
         snapshot: Mapping[str, Any],
     ) -> dict[str, Any] | None:
-        allocations = snapshot.get("allocations", ())
-        if not isinstance(allocations, list):
-            return None
-        owned = [
-            dict(item)
-            for item in allocations
-            if isinstance(item, Mapping)
-            and str(item.get("owner", "")) == self.elastic.owner
-            and str(item.get("project", "")) == self.elastic.project
-            and str(item.get("status", "active")) == "active"
-        ]
+        owned = self._owned_allocations(snapshot)
         if not owned:
             return None
         preferred = self.elastic.preferred_allocation_id.strip()
@@ -497,23 +596,44 @@ class ResourceManagedGPUManager:
             )
         )
         allocation = owned[0]
-        if int(allocation.get("gpu_count", 0) or 0) < (
-            self.elastic.min_gpus
-        ):
+        if int(allocation.get("gpu_count", 0) or 0) < 1:
             return None
         return allocation
 
-    def _has_request(self, snapshot: Mapping[str, Any]) -> bool:
-        queue = snapshot.get("queue", ())
-        if not isinstance(queue, list):
-            return False
-        return any(
-            isinstance(item, Mapping)
+    def _owned_allocations(
+        self,
+        snapshot: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        allocations = snapshot.get("allocations", ())
+        if not isinstance(allocations, list):
+            return []
+        return [
+            dict(item)
+            for item in allocations
+            if isinstance(item, Mapping)
             and str(item.get("owner", "")) == self.elastic.owner
             and str(item.get("project", "")) == self.elastic.project
-            and str(item.get("status", "queued")) == "queued"
+            and str(item.get("status", "active")) == "active"
+        ]
+
+    def _has_request(self, snapshot: Mapping[str, Any]) -> bool:
+        return bool(self._request_ids(snapshot))
+
+    def _request_ids(self, snapshot: Mapping[str, Any]) -> list[str]:
+        queue = snapshot.get("queue", ())
+        if not isinstance(queue, list):
+            return []
+        return [
+            str(item.get("id", ""))
             for item in queue
-        )
+            if (
+                isinstance(item, Mapping)
+                and str(item.get("id", ""))
+                and str(item.get("owner", "")) == self.elastic.owner
+                and str(item.get("project", "")) == self.elastic.project
+                and str(item.get("status", "queued")) == "queued"
+            )
+        ]
 
     def _attach_allocation(self, allocation: Mapping[str, Any]) -> None:
         node_details = allocation.get("node_details", ())
@@ -537,10 +657,9 @@ class ResourceManagedGPUManager:
                 )
             )
         total = sum(node.gpu_count for node in nodes)
-        if total < self.elastic.min_gpus:
+        if total < 1:
             raise ResourceManagerError(
-                f"allocation exposes {total} GPUs, below min_gpus "
-                f"{self.elastic.min_gpus}"
+                f"allocation exposes invalid GPU count {total}"
             )
         pool_id = (
             f"autoresearch-v2-{str(allocation['id']).replace('_', '-')}"
@@ -600,12 +719,6 @@ class ResourceManagedGPUManager:
             # records. Adopt those records rather than issuing a second request.
             pool.adopt_claimed_lease()
             pool.prepare()
-        else:
-            # A restored Ray cluster may have outlived the 60-minute pause
-            # issued during its original preparation. Reassert the pause before
-            # exposing the broker so daemon_gpu cannot consume otherwise idle
-            # cards in the shared research pool.
-            pool.pause_spin()
         broker = self.broker_factory(
             pool,
             total_gpus=total,
@@ -627,7 +740,6 @@ class ResourceManagedGPUManager:
                 return
             self._pool = pool
             self._broker = broker
-            self._spin_paused_at = self._monotonic()
         # Older controllers may have persisted a terminal legacy
         # LeaseKeepalive failure. Stop it after publishing the broker: the
         # central ResourceManagedGPUManager owns allocation renewal in this
@@ -709,7 +821,6 @@ class ResourceManagedGPUManager:
         broker = self._broker
         self._broker = None
         self._pool = None
-        self._spin_paused_at = 0.0
         return broker
 
     def _broker_has_running_tasks(self) -> bool:

@@ -163,9 +163,7 @@ def build_production_controller(
     gpu_broker_error = ""
     if config.gpu.enabled:
         if config.gpu.mode == "resource_manager":
-            configured_gpu_capacity = (
-                config.gpu.resource_manager.desired_gpus
-            )
+            configured_gpu_capacity = 0
             gpu_manager = ResourceManagedGPUManager(
                 config.gpu,
                 task_env=task_env,
@@ -173,7 +171,10 @@ def build_production_controller(
                 cache_archive=config.execution.gpu_cache_archive,
                 task_namespace=config.system_id,
             )
-            gpu_manager.bootstrap()
+            # The Controller supplies durable READY/RUNNING demand on its first
+            # tick. Bootstrap is observation-only so startup never reserves an
+            # idle fixed-size GPU pool.
+            gpu_manager.bootstrap(required_gpus=0)
             broker = gpu_manager.broker
             manager_snapshot = gpu_manager.snapshot()
             if broker is None and manager_snapshot.get("last_error"):
