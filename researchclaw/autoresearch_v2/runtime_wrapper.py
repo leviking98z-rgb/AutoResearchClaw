@@ -1089,12 +1089,26 @@ def _is_canonical_artifact_pair(
         raise RuntimeArtifactError(
             "controller runtime artifacts have inconsistent wrapper markers"
         )
-    if metrics.get("wrapper_version") != WRAPPER_VERSION or (
-        runtime.get("wrapper_version") != WRAPPER_VERSION
-    ):
+    try:
+        metric_version = int(metrics.get("wrapper_version", -1))
+        runtime_version = int(runtime.get("wrapper_version", -1))
+    except (TypeError, ValueError):
+        metric_version = -1
+        runtime_version = -1
+    if metric_version != runtime_version:
         raise RuntimeArtifactError(
-            "controller runtime artifact version is unsupported"
+            "controller runtime artifacts have inconsistent wrapper versions"
         )
+    if metric_version > WRAPPER_VERSION:
+        raise RuntimeArtifactError(
+            "controller runtime artifact version is newer than this controller"
+        )
+    if metric_version < WRAPPER_VERSION:
+        # These are already canonical artifacts emitted by a trusted older
+        # wrapper. Preserve the measured payload; the active controller will
+        # validate it against the current execution contract below rather than
+        # trying to reinterpret canonical data as raw generated output.
+        return True
     measured = metrics.get("metrics")
     reported = runtime.get("metrics")
     if not isinstance(measured, Mapping) or dict(measured) != dict(

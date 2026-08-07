@@ -701,3 +701,41 @@ def test_runtime_wrapper_rejects_partial_canonical_markers(
             allocated_gpus=1,
             cwd=tmp_path,
         )
+
+
+def test_runtime_wrapper_accepts_older_canonical_artifact_pair(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "artifacts" / "pilot"
+    output_dir.mkdir(parents=True)
+    metrics = {
+        "result_valid": True,
+        "metrics": {"paired_accuracy_difference": 0.20},
+        "wrapper_schema": WRAPPER_SCHEMA,
+        "wrapper_version": WRAPPER_VERSION - 1,
+    }
+    runtime = {
+        "wrapper_schema": WRAPPER_SCHEMA,
+        "wrapper_version": WRAPPER_VERSION - 1,
+        "metrics": {"paired_accuracy_difference": 0.20},
+    }
+    (output_dir / "metrics.json").write_text(
+        json.dumps(metrics),
+        encoding="utf-8",
+    )
+    (output_dir / "runtime_evidence.json").write_text(
+        json.dumps(runtime),
+        encoding="utf-8",
+    )
+
+    value = normalize_runtime_artifacts(
+        output_dir=output_dir,
+        plan=_plan(),
+        mode="pilot",
+        allocated_gpus=1,
+        cwd=tmp_path,
+    )
+
+    assert value["already_compiled"] is True
+    assert value["metrics"] == metrics
+    assert value["runtime_evidence"] == runtime
