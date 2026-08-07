@@ -285,3 +285,134 @@ def test_gpu_unavailable_startup_event_backfills_pause_start(
     assert durable is not None
     assert durable.status is IdeaStatus.PILOTING
     controller.close()
+
+
+def test_elastic_zero_demand_idle_does_not_pause_budgets(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _ClockDateTime.current = datetime(2026, 8, 6, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr(controller_module, "datetime", _ClockDateTime)
+    monkeypatch.setattr(
+        controller_module,
+        "utc_now",
+        lambda: _ClockDateTime.current.isoformat(timespec="milliseconds"),
+    )
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "gpu": {
+                    "enabled": True,
+                    "mode": "resource_manager",
+                    "shared_workspace_root": str(tmp_path),
+                    "resource_manager": {"owner": "test-owner"},
+                },
+                "budgets": {
+                    "max_wall_clock_hours_per_idea": 1,
+                    "max_no_progress_hours": 1,
+                },
+            }
+        }
+    )
+    store = V2Store(tmp_path)
+    store.initialize()
+
+    class _IdleManager:
+        broker = None
+        configured_capacity = 0
+
+        def reconcile(self, **_demand: object) -> bool:
+            return False
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "mode": "resource_manager",
+                "state": "idle",
+                "required_gpus": 0,
+                "allocated_gpus": 0,
+            }
+
+        def close(self) -> None:
+            pass
+
+    controller = V2Controller(
+        config=config,
+        store=store,
+        generator=StaticIdeaGenerator([]),
+        gpu_manager=_IdleManager(),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+
+    assert controller.snapshot()["idea_budget_paused"] is False
+    assert not any(
+        event["event_type"] == "idea_budget_pause_started"
+        for event in store.list_events(limit=20)
+    )
+    controller.close()
+
+
+def test_elastic_gpu_demand_without_broker_pauses_budgets(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _ClockDateTime.current = datetime(2026, 8, 6, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr(controller_module, "datetime", _ClockDateTime)
+    monkeypatch.setattr(
+        controller_module,
+        "utc_now",
+        lambda: _ClockDateTime.current.isoformat(timespec="milliseconds"),
+    )
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "gpu": {
+                    "enabled": True,
+                    "mode": "resource_manager",
+                    "shared_workspace_root": str(tmp_path),
+                    "resource_manager": {"owner": "test-owner"},
+                },
+            }
+        }
+    )
+    store = V2Store(tmp_path)
+    store.initialize()
+    _active_gpu_idea(store)
+
+    class _WaitingManager:
+        broker = None
+        configured_capacity = 0
+
+        def reconcile(self, **_demand: object) -> bool:
+            return False
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "mode": "resource_manager",
+                "state": "waiting_allocation",
+                "required_gpus": 1,
+                "allocated_gpus": 0,
+            }
+
+        def close(self) -> None:
+            pass
+
+    controller = V2Controller(
+        config=config,
+        store=store,
+        generator=StaticIdeaGenerator([]),
+        gpu_manager=_WaitingManager(),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+
+    assert controller.snapshot()["idea_budget_paused"] is True
+    assert any(
+        event["event_type"] == "idea_budget_pause_started"
+        for event in store.list_events(limit=20)
+    )
+    controller.close()

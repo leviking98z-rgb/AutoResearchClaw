@@ -3965,6 +3965,17 @@ class V2Controller:
         if not self.config.gpu.enabled:
             return False
         if self.gpu_manager is not None:
+            # In resource-manager mode a missing Broker is the normal
+            # zero-demand state: the allocation is deliberately released and
+            # recreated only when durable GPU work appears. Treat only an
+            # unavailable Broker while useful GPU demand exists as an outage;
+            # otherwise every idle interval would pause wall-clock and
+            # no-progress budgets indefinitely. Normal allocation queueing is
+            # still paused because it is infrastructure wait, not scientific
+            # progress.
+            demand = self._gpu_resource_demand()
+            if int(demand.get("required_gpus", 0) or 0) <= 0:
+                return False
             return self.gpu_broker is None
         # A static controller can only recover a missing broker after restart.
         # Avoid treating an intentionally broker-less unit/simulation fixture
