@@ -1195,6 +1195,10 @@ class V2Controller:
             attempt = self.store.create_attempt(job)
             attempt.status = AttemptStatus.RUNNING
             attempt.started_at = utc_now()
+            self.store.recover_retry_candidate_workspace(
+                job=job,
+                attempt=attempt,
+            )
             candidate = self.store.snapshot_current(attempt)
             try:
                 if self._is_remote_smoke_job(job):
@@ -1398,6 +1402,13 @@ class V2Controller:
     ) -> tuple[str, Path]:
         build_path = candidate / "build.json"
         build = json.loads(build_path.read_text(encoding="utf-8"))
+        build = self._refresh_candidate_runtime_wrapper(
+            candidate=candidate,
+            build=build,
+            idea_id=idea.idea_id,
+            job_id=job.job_id,
+            attempt_id=attempt.attempt_id,
+        )
         if not self._simulation_mode:
             plan = json.loads(
                 (candidate / "plan.json").read_text(encoding="utf-8")
@@ -2247,6 +2258,92 @@ class V2Controller:
             return ""
         return f"{schema}:v{version}" if schema and version >= 0 else ""
 
+    def _refresh_candidate_runtime_wrapper(
+        self,
+        *,
+        candidate: Path,
+        build: Mapping[str, Any],
+        idea_id: str,
+        job_id: str,
+        attempt_id: str,
+    ) -> dict[str, Any]:
+        """Upgrade controller-owned runtime bytes before contract hashing.
+
+        Candidate snapshots are immutable scientific inputs, but the runtime
+        wrapper is controller-owned infrastructure. A long-running campaign can
+        therefore contain a valid candidate compiled by an older controller.
+        Refresh the wrapper source and its duplicated build metadata before
+        validating the implementation or creating the execution contract, so
+        the attested build hash describes the bytes that will actually run.
+        """
+
+        from .runtime_wrapper import (
+            WRAPPER_FILENAME,
+            WRAPPER_SCHEMA,
+            WRAPPER_VERSION,
+            wrapper_source,
+        )
+
+        runtime = build.get("controller_runtime")
+        if not isinstance(runtime, Mapping):
+            return dict(build)
+        wrapper = str(runtime.get("wrapper", "") or "")
+        if wrapper != WRAPPER_FILENAME:
+            return dict(build)
+        previous = self._candidate_runtime_compiler(candidate)
+        current = self._runtime_compiler_identity()
+        source = wrapper_source()
+        wrapper_path = candidate / WRAPPER_FILENAME
+        files = build.get("files")
+        files_mapping = dict(files) if isinstance(files, Mapping) else {}
+        needs_refresh = (
+            previous != current
+            or not wrapper_path.is_file()
+            or wrapper_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+            != source
+            or files_mapping.get(WRAPPER_FILENAME) != source
+        )
+        if not needs_refresh:
+            return dict(build)
+        updated_runtime = {
+            **dict(runtime),
+            "schema": WRAPPER_SCHEMA,
+            "version": WRAPPER_VERSION,
+            "wrapper": WRAPPER_FILENAME,
+        }
+        updated = {
+            **dict(build),
+            "files": {
+                **files_mapping,
+                WRAPPER_FILENAME: source,
+            },
+            "controller_runtime": updated_runtime,
+        }
+        wrapper_path.write_text(source, encoding="utf-8")
+        (candidate / "build.json").write_text(
+            json.dumps(
+                updated,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.store.event(
+            "runtime_wrapper_refreshed",
+            idea_id=idea_id,
+            job_id=job_id,
+            attempt_id=attempt_id,
+            previous=previous,
+            current=current,
+            phase="gpu_preflight",
+        )
+        return updated
+
     def _implementation_failure_fingerprint(
         self,
         *,
@@ -2466,9 +2563,6 @@ class V2Controller:
                 "cannot find the requested files in the disk cache",
                 "couldn't find cache",
                 "not found in the cached files",
-                "offline mode is enabled",
-                "hf_hub_offline",
-                "hf_datasets_offline",
             )
         ):
             return "dependency_cache_miss"

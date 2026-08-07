@@ -447,6 +447,50 @@ def test_retry_workspace_recovery_preserves_accepted_candidate(
     )
 
 
+def test_live_retry_workspace_recovery_quarantines_reused_candidate(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize()
+    idea = _idea()
+    store.save_idea(idea)
+    job = JobRecord(
+        job_id="idea-test-scale",
+        idea_id=idea.idea_id,
+        kind=JobKind.SCALE,
+        status=JobStatus.RETRY_WAIT,
+        attempt=2,
+        attempt_id="",
+    )
+    store.save_job(job)
+    attempt = store.create_attempt(job)
+    attempt.status = AttemptStatus.FAILED
+    store.save_attempt(attempt)
+    candidate = store.snapshot_current(attempt)
+    (candidate / "partial.json").write_text("{}", encoding="utf-8")
+
+    store.acquire_writer_lock()
+    try:
+        quarantine = store.recover_retry_candidate_workspace(
+            job=job,
+            attempt=attempt,
+        )
+        replacement = store.snapshot_current(attempt)
+    finally:
+        store.release_writer_lock()
+
+    assert quarantine is not None
+    assert (quarantine / "partial.json").read_text(encoding="utf-8") == "{}"
+    assert replacement.is_dir()
+    events = store.list_events(limit=10)
+    assert any(
+        event["event_type"]
+        == "retry_attempt_candidate_quarantined"
+        and event["attempt_id"] == attempt.attempt_id
+        for event in events
+    )
+
+
 def test_maintenance_rotates_logs_and_prunes_old_failed_candidates(
     tmp_path: Path,
 ) -> None:

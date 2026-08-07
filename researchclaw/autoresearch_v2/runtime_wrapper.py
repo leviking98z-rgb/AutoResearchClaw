@@ -25,7 +25,7 @@ from typing import Any
 
 WRAPPER_FILENAME = "_autoresearch_runtime.py"
 WRAPPER_SCHEMA = "autoresearch_v2.controller_runtime"
-WRAPPER_VERSION = 6
+WRAPPER_VERSION = 7
 RAW_DIRNAME = "_raw"
 
 

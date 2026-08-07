@@ -214,6 +214,18 @@ def test_remote_smoke_infrastructure_classifier_reads_stdout() -> None:
     )
     assert (
         classify(
+            result={},
+            stdout=(
+                "HF_HUB_OFFLINE=1: offline mode is enabled; "
+                "reusing cached dataset"
+            ),
+            stderr="",
+            returncode=0,
+        )
+        == ""
+    )
+    assert (
+        classify(
             result={"pool_state": "probe_failed"},
             stdout="",
             stderr="",
@@ -230,6 +242,110 @@ def test_remote_smoke_infrastructure_classifier_reads_stdout() -> None:
         )
         == "dependency_cache_miss"
     )
+
+
+def test_gpu_preflight_upgrades_legacy_controller_wrapper(
+    tmp_path: Path,
+) -> None:
+    from researchclaw.autoresearch_v2.runtime_wrapper import (
+        WRAPPER_FILENAME,
+        WRAPPER_SCHEMA,
+        WRAPPER_VERSION,
+        wrapper_source,
+    )
+
+    config = V2Config.from_mapping(
+        {
+            "autoresearch_v2": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "execution": {"python_executable": sys.executable},
+                "gpu": {
+                    "enabled": True,
+                    "pool_config": "unused-in-test",
+                    "shared_workspace_root": str(tmp_path),
+                },
+            }
+        }
+    )
+    store = V2Store(tmp_path)
+    controller = V2Controller(
+        config=config,
+        store=store,
+        generator=StaticIdeaGenerator([]),
+        sleep=lambda _: None,
+    )
+    controller.initialize()
+    idea = candidate_to_idea(_candidate(0))
+    job = JobRecord(
+        job_id=f"{idea.idea_id}-pilot",
+        idea_id=idea.idea_id,
+        kind=JobKind.PILOT,
+        requires_gpu=True,
+        min_gpus=1,
+        preferred_gpus=1,
+        max_gpus=1,
+    )
+    attempt = store.create_attempt(job)
+    candidate = store.attempt_dir(attempt) / "candidate"
+    candidate.mkdir(parents=True)
+    legacy_source = "# legacy controller wrapper\n"
+    (candidate / WRAPPER_FILENAME).write_text(
+        legacy_source,
+        encoding="utf-8",
+    )
+    (candidate / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    (candidate / "plan.json").write_text("{}\n", encoding="utf-8")
+    build = {
+        "files": {
+            WRAPPER_FILENAME: legacy_source,
+            "main.py": "print('ok')\n",
+        },
+        "commands": {
+            "smoke": ["python", WRAPPER_FILENAME, "--mode", "smoke"],
+            "pilot": ["python", WRAPPER_FILENAME, "--mode", "pilot"],
+            "scale": ["python", WRAPPER_FILENAME, "--mode", "scale"],
+        },
+        "controller_runtime": {
+            "schema": WRAPPER_SCHEMA,
+            "version": WRAPPER_VERSION - 1,
+            "wrapper": WRAPPER_FILENAME,
+            "core_commands": {
+                "smoke": ["python", "main.py"],
+                "pilot": ["python", "main.py"],
+                "scale": ["python", "main.py"],
+            },
+        },
+    }
+    (candidate / "build.json").write_text(
+        json.dumps(build),
+        encoding="utf-8",
+    )
+
+    updated = controller._refresh_candidate_runtime_wrapper(
+        candidate=candidate,
+        build=build,
+        idea_id=idea.idea_id,
+        job_id=job.job_id,
+        attempt_id=attempt.attempt_id,
+    )
+
+    assert updated["controller_runtime"]["version"] == WRAPPER_VERSION
+    assert updated["files"][WRAPPER_FILENAME] == wrapper_source()
+    assert (
+        (candidate / WRAPPER_FILENAME).read_text(encoding="utf-8")
+        == wrapper_source()
+    )
+    durable_build = json.loads(
+        (candidate / "build.json").read_text(encoding="utf-8")
+    )
+    assert durable_build["controller_runtime"]["version"] == WRAPPER_VERSION
+    assert any(
+        event["event_type"] == "runtime_wrapper_refreshed"
+        and event["phase"] == "gpu_preflight"
+        for event in store.list_events(limit=20)
+    )
+    controller.close()
 
 
 def test_controller_runs_build_smoke_on_gpu_pool_before_pilot(

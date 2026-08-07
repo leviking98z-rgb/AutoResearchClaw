@@ -415,6 +415,61 @@ class V2Store:
                 ),
             )
 
+    def recover_retry_candidate_workspace(
+        self,
+        *,
+        job: JobRecord,
+        attempt: AttemptRecord | None = None,
+    ) -> Path | None:
+        """Quarantine one stale candidate immediately before retry dispatch.
+
+        Startup recovery handles workspaces that already existed when the
+        controller acquired its writer lock. A retry can also be created while
+        the controller remains live (for example after an infrastructure
+        refund or command-preparation failure). In that case the next attempt
+        number may refer to a durable failed row whose immutable candidate is
+        still present. Quarantine it at the dispatch boundary so one stale
+        directory cannot fail every subsequent controller tick.
+        """
+
+        if self._writer_lock_stream is None:
+            raise RuntimeError(
+                "retry workspace recovery requires the controller writer lock"
+            )
+        selected = attempt or self.create_attempt(job)
+        candidate = self.attempt_dir(selected) / "candidate"
+        if not candidate.is_dir():
+            return None
+        durable = self.get_attempt(selected.attempt_id)
+        if (
+            durable is not None
+            and durable.status is AttemptStatus.ACCEPTED
+        ):
+            # Accepted evidence must be reconciled, never moved out of place.
+            return None
+        quarantine = candidate.with_name("candidate.interrupted-retry")
+        if quarantine.exists():
+            quarantine = candidate.with_name(
+                "candidate.interrupted-retry."
+                + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+            )
+        try:
+            os.replace(candidate, quarantine)
+        except FileNotFoundError:
+            return None
+        self.event(
+            "retry_attempt_candidate_quarantined",
+            idea_id=job.idea_id,
+            job_id=job.job_id,
+            attempt_id=selected.attempt_id,
+            candidate=str(candidate),
+            quarantine_path=str(quarantine),
+            attempt_status=(
+                durable.status.value if durable is not None else ""
+            ),
+        )
+        return quarantine
+
     def _recover_orphan_attempt_candidates(self) -> None:
         """Quarantine candidate workspaces that have no durable attempt row.
 
