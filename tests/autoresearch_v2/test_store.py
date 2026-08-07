@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -282,6 +284,23 @@ def test_explicit_recovery_requires_writer_lock(tmp_path: Path) -> None:
     store.acquire_writer_lock()
     store.recover_filesystem_commits()
     store.release_writer_lock()
+    assert not store.writer_lock_path.exists()
+
+
+def test_late_writer_release_does_not_unlink_new_controller_record(
+    tmp_path: Path,
+) -> None:
+    store = V2Store(tmp_path)
+    store.initialize(recover_filesystem=False)
+    store.acquire_writer_lock()
+    store.writer_lock_path.write_text(
+        json.dumps({"pid": os.getpid() + 1}),
+        encoding="utf-8",
+    )
+
+    store.release_writer_lock()
+
+    assert store.writer_lock_path.exists()
 
 
 def test_writer_recovery_quarantines_candidate_without_attempt_row(

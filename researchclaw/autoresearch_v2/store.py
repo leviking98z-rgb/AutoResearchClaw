@@ -534,6 +534,25 @@ class V2Store:
         finally:
             stream.close()
             self._writer_lock_stream = None
+            # The JSON record is only a dashboard/status hint; ``flock`` is
+            # the actual exclusion primitive. Remove the hint after releasing
+            # the lock, but only when it still names this process so a newly
+            # started controller cannot have its live record unlinked by a
+            # late cleanup from the previous process.
+            try:
+                value = json.loads(
+                    self.writer_lock_path.read_text(encoding="utf-8")
+                )
+                if int(value.get("pid", 0) or 0) == os.getpid():
+                    self.writer_lock_path.unlink(missing_ok=True)
+            except (
+                FileNotFoundError,
+                OSError,
+                ValueError,
+                TypeError,
+                json.JSONDecodeError,
+            ):
+                pass
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
