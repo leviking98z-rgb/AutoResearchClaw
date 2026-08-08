@@ -1,5 +1,12 @@
 # AutoResearch v2
 
+> **Architecture update (2026-08-08):** This document describes the current
+> deployed v2 baseline. The simplification target and migration plan are in
+> [`CONTINUOUS_RESEARCH_QUEUE_ROADMAP.md`](CONTINUOUS_RESEARCH_QUEUE_ROADMAP.md).
+> The target keeps the stable LLM, ClusterBridge, SQLite, InfoHub, and
+> observability adapters while replacing the stage-oriented control plane with
+> one continuous queue, one state owner, and one unified Run protocol.
+
 AutoResearch v2 is the production-oriented, pipeline-independent execution
 core for continuous multi-Idea research.
 

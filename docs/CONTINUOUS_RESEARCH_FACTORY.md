@@ -1,5 +1,13 @@
 # Continuous Multi-Idea Research Factory
 
+> **Superseded as a target architecture (2026-08-08):** The Work-Item DAG,
+> Idea Actor, multi-stage Factory design below is retained for historical
+> context only. The active simplification roadmap is
+> [`CONTINUOUS_RESEARCH_QUEUE_ROADMAP.md`](CONTINUOUS_RESEARCH_QUEUE_ROADMAP.md).
+> New implementation work should not add Factory actors, stage proliferation,
+> or a generic DAG unless production evidence first proves that the smaller
+> continuous-queue model is insufficient.
+
 **Status:** Proposed architecture and implementation roadmap
 
 **Scope:** An optional, backward-compatible execution mode for AutoResearchClaw
