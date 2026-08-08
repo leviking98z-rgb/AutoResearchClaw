@@ -393,7 +393,7 @@ class AcceptanceSupervisor:
             try:
                 passed = self._wait_for_canary()
                 if not passed:
-                    return 2
+                    return 0 if self.stop_requested else 2
                 return self._run_benchmark()
             finally:
                 self._release_recorded_allocation()
