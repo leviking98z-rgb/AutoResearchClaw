@@ -529,6 +529,10 @@ class ResearchQueueController:
             "max_revisions_per_idea": (self.config.limits.max_revisions_per_idea),
             "max_runs_per_budget": (self.config.limits.max_runs_per_budget),
             "max_steps_per_idea": self.config.limits.max_steps_per_idea,
+            "remaining_steps_after_review": max(
+                0,
+                self.config.limits.max_steps_per_idea - (idea.step_count + 1),
+            ),
         }
         decision: ReviewDecision = await self._call_llm(
             self.reviewer.review,
@@ -557,6 +561,13 @@ class ResearchQueueController:
         history: list[RunRecord],
     ) -> None:
         if decision.action is ReviewAction.RUN_MORE:
+            if not self._has_step_budget(idea, required=1):
+                self._conclude(
+                    idea,
+                    Conclusion.INCONCLUSIVE,
+                    "run_more requires another Run but no step budget remains",
+                )
+                return
             count = sum(
                 1
                 for run in history
@@ -573,6 +584,14 @@ class ResearchQueueController:
                 return
             idea.next_action = "run"
         elif decision.action is ReviewAction.ESCALATE:
+            if not self._has_step_budget(idea, required=2):
+                self._conclude(
+                    idea,
+                    Conclusion.INCONCLUSIVE,
+                    "escalation requires a Run and Review but insufficient "
+                    "step budget remains",
+                )
+                return
             expected = idea.current_budget.next()
             if expected is None or decision.next_budget is not expected:
                 self._conclude(
@@ -584,6 +603,14 @@ class ResearchQueueController:
             idea.current_budget = expected
             idea.next_action = "run"
         elif decision.action is ReviewAction.REVISE:
+            if not self._has_step_budget(idea, required=3):
+                self._conclude(
+                    idea,
+                    Conclusion.INCONCLUSIVE,
+                    "revision requires Prepare, Run, and Review but "
+                    "insufficient step budget remains",
+                )
+                return
             if idea.current_revision >= self.config.limits.max_revisions_per_idea:
                 self._conclude(
                     idea,
@@ -604,6 +631,12 @@ class ResearchQueueController:
             raise ValueError(f"unsupported decision {decision.action}")
         idea.last_reason = decision.reason
         self.store.upsert_idea(idea)
+
+    def _has_step_budget(self, idea: IdeaRecord, *, required: int) -> bool:
+        return (
+            idea.step_count + max(0, int(required))
+            <= self.config.limits.max_steps_per_idea
+        )
 
     def _conclude(
         self,

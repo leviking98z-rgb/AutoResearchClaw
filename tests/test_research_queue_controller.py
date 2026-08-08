@@ -13,6 +13,7 @@ from researchclaw.research_queue.models import (
     Conclusion,
     GenerationBatch,
     IdeaProposal,
+    IdeaRecord,
     IdeaStatus,
     PreparedRevision,
     ReviewAction,
@@ -714,3 +715,51 @@ def test_llm_call_timeout_quarantines_stuck_idea(tmp_path) -> None:
         item["event"] == "idea_loop_failed"
         for item in snapshot["state"]["latest_events"]
     )
+
+
+def test_escalation_is_rejected_when_no_review_step_would_remain(
+    tmp_path,
+) -> None:
+    idea = IdeaRecord.from_proposal(_proposal("Budget edge", "positive"))
+    idea.status = IdeaStatus.ACTIVE
+    idea.current_revision = 1
+    idea.step_count = 3
+    idea.next_action = "review"
+    config = ResearchQueueConfig.from_mapping(
+        {
+            "research_queue": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "limits": {"max_steps_per_idea": 4},
+                "execution": {"simulation": True},
+                "gpu": {
+                    "max_total_gpus": 0,
+                    "max_gpus_per_run": 0,
+                },
+            }
+        }
+    )
+    store = ResearchQueueStore(tmp_path)
+    store.initialize()
+    store.upsert_idea(idea)
+    controller = ResearchQueueController(
+        config=config,
+        store=store,
+        producer=StaticIdeaProducer([]),
+        preparer=SimulatedPreparationWorker(python_executable=sys.executable),
+        reviewer=SimulatedReviewWorker(),
+        run_backend=LocalRunBackend(slot_pool=GPUSlotPool(0)),
+    )
+    decision = ReviewDecision(
+        action=ReviewAction.ESCALATE,
+        reason="more compute",
+        next_budget=BudgetLevel.B1,
+    )
+
+    controller._apply_review(idea, decision, [])
+
+    saved = store.get_idea(idea.idea_id)
+    assert saved is not None
+    assert saved.status is IdeaStatus.CONCLUDED
+    assert saved.conclusion is Conclusion.INCONCLUSIVE
+    assert "insufficient step budget" in saved.last_reason

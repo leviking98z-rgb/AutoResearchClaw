@@ -373,6 +373,14 @@ Choose exactly one:
   should change.
 - conclude: positive, negative, or inconclusive.
 
+Do not choose an action whose minimum required remaining steps exceed
+LIMITS.remaining_steps_after_review:
+- run_more needs 1 additional step (Run);
+- escalate needs 2 additional steps (Run + Review);
+- revise needs 3 additional steps (Prepare + Run + Review).
+If the remaining budget is insufficient, conclude using the evidence already
+available.
+
 Return:
 {{
   "action": "run_more|escalate|revise|conclude",
