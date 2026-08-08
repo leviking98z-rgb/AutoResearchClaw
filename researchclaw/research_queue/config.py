@@ -103,6 +103,7 @@ class ResearchQueueConfig:
     enabled: bool = False
     system_id: str = "research-queue-prototype"
     state_dir: str = "workspace/research-queue-prototype"
+    artifact_dir: str = ""
     brief: str = ""
     brief_file: str = ""
     limits: QueueLimits = field(default_factory=QueueLimits)
@@ -115,6 +116,11 @@ class ResearchQueueConfig:
     @property
     def root(self) -> Path:
         return Path(self.state_dir).expanduser().resolve()
+
+    @property
+    def artifact_root(self) -> Path:
+        value = self.artifact_dir or self.state_dir
+        return Path(value).expanduser().resolve()
 
     def budget(self, level: BudgetLevel) -> BudgetSpec:
         return self.budgets[level]
@@ -220,6 +226,9 @@ class ResearchQueueConfig:
         )
         if not Path(state_dir).expanduser().is_absolute():
             state_dir = str((base / state_dir).resolve())
+        artifact_dir = str(data.get("artifact_dir", "") or "").strip()
+        if artifact_dir and not Path(artifact_dir).expanduser().is_absolute():
+            artifact_dir = str((base / artifact_dir).resolve())
         brief_file = str(data.get("brief_file", "") or "").strip()
         if brief_file and not Path(brief_file).expanduser().is_absolute():
             brief_file = str((base / brief_file).resolve())
@@ -230,6 +239,7 @@ class ResearchQueueConfig:
                 or "research-queue-prototype"
             ),
             state_dir=state_dir,
+            artifact_dir=artifact_dir,
             brief=str(data.get("brief", "") or "").strip(),
             brief_file=brief_file,
             limits=limits,

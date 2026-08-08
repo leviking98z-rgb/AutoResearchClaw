@@ -48,7 +48,10 @@ def build_controller(
     *,
     ideas_json: Path | None = None,
 ) -> ResearchQueueController:
-    store = ResearchQueueStore(config.root)
+    store = ResearchQueueStore(
+        config.root,
+        artifact_root=config.artifact_root,
+    )
     producer, preparer, reviewer = build_workers(config)
     if ideas_json is not None:
         value = json.loads(ideas_json.read_text(encoding="utf-8"))
@@ -68,7 +71,10 @@ def build_controller(
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = ResearchQueueConfig.from_file(args.config)
-    store = ResearchQueueStore(config.root)
+    store = ResearchQueueStore(
+        config.root,
+        artifact_root=config.artifact_root,
+    )
     store.initialize()
     if args.command == "status":
         print(json.dumps(store.snapshot(), ensure_ascii=False, indent=2))

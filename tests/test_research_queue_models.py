@@ -46,6 +46,7 @@ def test_config_resolves_relative_paths(tmp_path) -> None:
             "research_queue": {
                 "enabled": True,
                 "state_dir": "state",
+                "artifact_dir": "artifacts",
                 "models": {"researchclaw_config": "models.yaml"},
                 "gpu": {
                     "max_total_gpus": 4,
@@ -56,6 +57,7 @@ def test_config_resolves_relative_paths(tmp_path) -> None:
         base_dir=tmp_path,
     )
     assert config.root == tmp_path / "state"
+    assert config.artifact_root == tmp_path / "artifacts"
     assert config.models.researchclaw_config == str(tmp_path / "models.yaml")
 
 

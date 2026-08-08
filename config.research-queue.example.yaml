@@ -1,7 +1,10 @@
 research_queue:
   enabled: false
   system_id: research-queue-prototype
+  # Keep SQLite/controller state on local disk. For ClusterBridge, point
+  # artifact_dir at shared CephFS so remote workers can see revisions/results.
   state_dir: workspace/research-queue-prototype
+  artifact_dir: ""
 
   # Use either inline brief or brief_file.
   brief: >-

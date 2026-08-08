@@ -21,6 +21,14 @@ generate -> admit -> prepare -> run(B0/B1/B2) -> review -> conclude -> refill
   concurrently harvested results back to the correct Run;
 - finite static Idea sources signal exhaustion, while cycling simulation Ideas
   receive globally unique titles;
+- short SQLite transactions are serialized inside the single Controller
+  process, which keeps shared/FUSE workspaces reliable without introducing a
+  separate database service;
+- SQLite uses rollback-journal mode rather than WAL so its shared-memory index
+  does not stall on CephFS/FUSE-backed prototype state directories;
+- `state_dir` and `artifact_dir` can be separated: keep SQLite/event state on
+  local disk and place immutable revisions/runs on shared CephFS for
+  ClusterBridge workers;
 - every concluded Idea writes a local `research_note.md`.
 
 It does not provide production restart adoption, long-lived leases, InfoHub,
@@ -94,6 +102,13 @@ gpu:
   max_gpus_per_run: 2
   resource_manager:
     owner: <stable AutoResearch owner UUID>
+```
+
+Use separate roots for a real ClusterBridge smoke:
+
+```yaml
+state_dir: /root/.local/state/research-queue-prototype
+artifact_dir: /root/shared/.clusters/.workdir/research-queue-prototype
 ```
 
 The backend requests capacity only when a fully prepared Run is ready and

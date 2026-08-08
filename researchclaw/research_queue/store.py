@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -21,20 +22,35 @@ class ResearchQueueStore:
     contain the human-readable experiment artifacts.
     """
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        artifact_root: str | Path | None = None,
+    ) -> None:
         self.root = Path(root).expanduser().resolve()
+        self.artifact_root = Path(artifact_root or root).expanduser().resolve()
         self.db_path = self.root / "research_queue.db"
-        self.ideas_root = self.root / "ideas"
+        self.ideas_root = self.artifact_root / "ideas"
         self.events_path = self.root / "events.jsonl"
+        self._db_lock = threading.RLock()
+        self._events_lock = threading.Lock()
 
     def initialize(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+        self.artifact_root.mkdir(parents=True, exist_ok=True)
         self.ideas_root.mkdir(parents=True, exist_ok=True)
+        bootstrap = not self.db_path.exists()
         with self.connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+            if bootstrap:
+                # DELETE mode is slower than WAL on a local SSD, but the queue
+                # prototype is also expected to run directly on shared CephFS/
+                # FUSE. WAL's shared-memory file can block there for tens of
+                # seconds even inside one process.
+                conn.execute("PRAGMA journal_mode=DELETE")
             conn.executescript(
                 """
-                PRAGMA synchronous=NORMAL;
+                PRAGMA synchronous=FULL;
                 CREATE TABLE IF NOT EXISTS ideas (
                     idea_id TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
@@ -68,13 +84,19 @@ class ResearchQueueStore:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+        # The prototype has one Controller process but several asyncio Idea
+        # tasks. Serializing short SQLite transactions avoids filesystem-level
+        # lock contention on shared/FUSE workspaces without adding a database
+        # service or a second state owner.
+        with self._db_lock:
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=30000")
+            try:
+                yield conn
+                conn.commit()
+            finally:
+                conn.close()
 
     def upsert_idea(self, idea: IdeaRecord) -> None:
         idea.updated_at = utc_now()
@@ -232,7 +254,10 @@ class ResearchQueueStore:
                     encoded,
                 ),
             )
-        with self.events_path.open("a", encoding="utf-8") as stream:
+        with (
+            self._events_lock,
+            self.events_path.open("a", encoding="utf-8") as stream,
+        ):
             stream.write(
                 json.dumps(
                     {
@@ -337,6 +362,7 @@ class ResearchQueueStore:
         }
         return {
             "root": str(self.root),
+            "artifact_root": str(self.artifact_root),
             "database": str(self.db_path),
             "ideas": idea_counts,
             "runs": run_counts,
