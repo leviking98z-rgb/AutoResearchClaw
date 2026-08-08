@@ -82,6 +82,22 @@ hypothesis_supported ∈ {true, false}
 
 负结果与正结果等价计数，避免鼓励 p-hacking 或只追求正结果。
 
+### 2.1 实用显著性门槛
+
+`cifar10_calibration` BenchmarkProfile v2 冻结：
+
+```text
+primary metric                  ECE（越低越好）
+minimum practical effect       0.001
+support condition              paired effect CI lower bound > 0.001
+numerical no-op epsilon         1e-12
+```
+
+因此，浮点舍入产生的 `1e-17` 级“改善”不能被判为 positive。若执行与证据
+合同均有效，但改善未越过 `0.001`，结论为 valid negative；它仍计入 VCO，
+但 `promotion_decision=reject`。新 ResearchSpec 若声明更低门槛，会在申请
+代码生成或 GPU 之前被 compatibility gate 拒绝。
+
 ---
 
 ## 3. 必要辅助指标
@@ -321,10 +337,13 @@ Correct verdict        inconclusive / reject
 - [x] 实现 `RQ-Full` 配置；
 - [x] 统一导出 outcome、Token、GPU 和事件时间线；
 - [x] real runner 自动验证 GPU 最终释放。
+- [x] 增加原子化真实 logits cache 构建 CLI；
+- [x] 压缩 Review prompt，去除 latest run 重复和原始 per-seed/artifact；
 
 ### P0：定义判定和聚合
 
 - [x] 实现 VCO 判定器；
+- [x] 冻结 ECE `minimum_effect=0.001` 并拒绝浮点 no-op；
 - [x] 实现 TTFV；
 - [x] 实现 Token/VCO 和 GPU-sec/VCO；
 - [x] 实现 False Accept Rate；
@@ -414,3 +433,27 @@ smoke 无法测量它在真实 Benchmark 中浪费的 GPU 成本。
 
 该结果证明确定性门禁修复了“只看 aggregate ECE 改善就 accept”的已知
 错误模式。还需要增加 LLM-only reviewer 和独立 gold review。
+
+### 11.3 两 Idea 真实模型诊断（非正式）
+
+commit `5b90601`、相同两条固定 Idea、单次运行：
+
+| Variant | VCO@900s | TTFV | Token | 逻辑 GPU-sec | Wall time |
+|---|---:|---:|---:|---:|---:|
+| RQ-Sequential | 0 | censored | 96,948 | 153.495 | 650.959s |
+| RQ-Full | 1 | 590.283s | 167,147 | 409.403 | 620.734s |
+
+这只是管线诊断，不能作为正式架构结论。它暴露出旧 Profile
+`minimum_effect=0` 的漏洞：RQ-Full 曾把 ECE `4.44e-17`、CI
+`[1.11e-17, 7.77e-17]` 的 no-op 标为 positive accept。非破坏性重审在
+不修改冻结 ResearchSpec、result 和旧 review 的前提下，将其更正为：
+
+```text
+scientific_valid       true
+hypothesis_supported   false
+promotion_decision     reject
+conclusion             negative
+```
+
+所以该结果在修正后仍是一个 VCO，但类别从错误 positive 改为 valid
+negative。下一次公平复跑必须使用 Profile v2 和同一真实 logits cache。

@@ -12,6 +12,7 @@ from researchclaw.benchmark_adapter.cifar10_calibration import (
     _load_cifar10_test,
     _load_treatment,
     evaluate_probabilities,
+    main,
     paired_bootstrap_mean_interval,
     run_from_logits_cache,
     sha256_path,
@@ -214,3 +215,47 @@ benchmark:
     assert result.evidence["protocol"]["calibration_split"] == "clean"
     assert result.evidence["protocol"]["evaluation_split"] == "corrupted"
     assert result.evidence["argmax"]["argmax_preserved"] is True
+
+
+def test_cli_builds_reusable_logits_cache(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    config = tmp_path / "benchmark.yaml"
+    config.write_text(
+        """
+benchmark:
+  cache_dir: cache
+  output_dir: output
+  treatment_path: treatment.py
+""".lstrip()
+    )
+    destination = tmp_path / "trusted-logits.npz"
+
+    def fake_build(path, *, cache_path):
+        assert path == str(config)
+        assert cache_path == destination.resolve()
+        destination.write_bytes(b"trusted-cache")
+        return {"schema_version": 3, "seeds": [17]}
+
+    monkeypatch.setattr(
+        "researchclaw.benchmark_adapter.cifar10_calibration.build_logits_cache",
+        fake_build,
+    )
+
+    returncode = main(
+        [
+            "--config",
+            str(config),
+            "--build-logits-cache",
+            str(destination),
+        ]
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert returncode == 0
+    assert output["status"] == "ok"
+    assert output["operation"] == "build_logits_cache"
+    assert output["cache_path"] == str(destination)
+    assert output["cache_sha256"] == sha256_path(destination)

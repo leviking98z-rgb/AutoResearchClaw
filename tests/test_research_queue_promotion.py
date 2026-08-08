@@ -186,6 +186,7 @@ benchmark:
         stopping_rules=("reject when ECE does not improve",),
         benchmark_id="cifar10_calibration",
         treatment_api=TREATMENT_API,
+        minimum_effect=0.001,
         primary_requires_effect_ci=True,
         guardrail_metrics=(
             MetricGuardrail(
@@ -277,6 +278,7 @@ benchmark:
         stopping_rules=("reject when ECE does not improve",),
         benchmark_id="cifar10_calibration",
         treatment_api=TREATMENT_API,
+        minimum_effect=0.001,
         primary_requires_effect_ci=True,
         guardrail_metrics=(
             MetricGuardrail(

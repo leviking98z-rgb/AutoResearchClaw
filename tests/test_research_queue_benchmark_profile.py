@@ -31,7 +31,11 @@ benchmark:
     return path
 
 
-def _spec(*, minimum_pairs: int = 2) -> ResearchSpec:
+def _spec(
+    *,
+    minimum_pairs: int = 2,
+    minimum_effect: float = 0.001,
+) -> ResearchSpec:
     return ResearchSpec(
         question="Does treatment improve calibration?",
         hypothesis="ECE improves without worse NLL or changed predictions.",
@@ -45,6 +49,7 @@ def _spec(*, minimum_pairs: int = 2) -> ResearchSpec:
         stopping_rules=("reject unsupported effects",),
         benchmark_id="cifar10_calibration",
         treatment_api=TREATMENT_API,
+        minimum_effect=minimum_effect,
         minimum_pairs=minimum_pairs,
         primary_requires_effect_ci=True,
         guardrail_metrics=(
@@ -91,9 +96,27 @@ def test_profile_freezes_protocol_and_capabilities(tmp_path) -> None:
     assert profile.calibration_split == "clean"
     assert profile.evaluation_split == "corrupted"
     assert profile.pairing_strategy == "disjoint_example_blocks"
+    assert profile.minimum_effect_for("ECE") == pytest.approx(0.001)
     assert validate_benchmark_compatibility(_spec(minimum_pairs=5), profile).passed
     assert plan["protocol"]["seeds"] == [17, 29, 43, 59, 71]
     assert len(plan["config_sha256"]) == 64
+    assert plan["benchmark_profile"]["minimum_effects"] == {"ece": 0.001}
+
+
+def test_profile_rejects_zero_practical_effect_floor(tmp_path) -> None:
+    profile = load_benchmark_profile(
+        "cifar10_calibration",
+        _config(tmp_path),
+    )
+
+    result = validate_benchmark_compatibility(
+        _spec(minimum_effect=0.0),
+        profile,
+    )
+
+    assert result.passed is False
+    assert result.checks["minimum_effect_meets_profile"] is False
+    assert "frozen cifar10_calibration floor" in result.errors[-1]
 
 
 def test_profile_does_not_claim_unobservable_objective_evaluations(tmp_path) -> None:

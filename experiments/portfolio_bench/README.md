@@ -49,6 +49,21 @@ the exact source commit to the shared run directory so remote nodes execute the
 same code. With no `--logits-cache`, each promoted treatment requests one GPU
 on demand. With a trusted five-seed cache, treatment evaluation is CPU-only.
 
+Build that cache once with the frozen adapter on a GPU node:
+
+```bash
+researchclaw-benchmark-cifar10 \
+  --config /root/shared/path/to/rendered-benchmark.yaml \
+  --build-logits-cache /root/shared/path/to/cifar10-v1-logits.npz
+```
+
+The cache is written atomically and the command prints its SHA-256. Formal
+architecture comparisons must pass the same cache path to every variant and
+record the hash. The rendered config must point at the same pinned dataset,
+weights, model-source archive, seeds, and shared asset cache used by the suite.
+A separate cold-GPU smoke should still exercise the complete request →
+inference → release path.
+
 ```bash
 python experiments/portfolio_bench/run.py \
   --mode real \
@@ -61,6 +76,11 @@ python experiments/portfolio_bench/run.py \
 
 Start with a short 2–4 Idea smoke before a complete run. Formal results require
 three independent repeats and a common baseline adapter.
+
+The frozen CIFAR-10 profile requires an ECE improvement of at least `0.001`,
+with the paired confidence-interval lower endpoint strictly above that floor.
+Effects at numerical-noise scale are valid negative results, never positive
+accepts.
 
 ## Outputs
 

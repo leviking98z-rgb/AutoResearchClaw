@@ -458,7 +458,7 @@ def _queue_config(
                 else ["positive", "inconclusive"]
             ),
             "minimum_priority": 0,
-            "minimum_effect": 0,
+            "minimum_effect": 0.001,
             "max_promotions": idea_count,
             "max_treatment_repairs": 1,
             "preflight_examples": 48 if synthetic else 96,

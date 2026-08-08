@@ -8,9 +8,12 @@ from researchclaw.research_queue.models import (
     IdeaProposal,
     IdeaRecord,
     IdeaStatus,
+    RunRecord,
+    RunStatus,
 )
 from researchclaw.research_queue.workers import (
     LLMPreparationWorker,
+    LLMReviewWorker,
     StaticIdeaProducer,
     validate_python_sources,
 )
@@ -321,6 +324,100 @@ def test_llm_preparer_rejects_hardcoded_budget_parameters() -> None:
         assert "RESEARCH_QUEUE_BUDGET_JSON" in str(exc)
     else:
         raise AssertionError("hardcoded budget parameters should fail")
+
+
+def test_llm_reviewer_compacts_history_and_omits_latest_duplicate() -> None:
+    class FakeClient:
+        prompt = ""
+
+        def chat(self, messages, **kwargs):
+            del kwargs
+            self.prompt = messages[0]["content"]
+            return type(
+                "Response",
+                (),
+                {
+                    "content": (
+                        '{"action":"conclude","reason":"bounded evidence",'
+                        '"next_budget":null,"conclusion":"negative"}'
+                    ),
+                    "model": "fake",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            )()
+
+    idea = IdeaRecord.from_proposal(
+        IdeaProposal(
+            title="Compact review",
+            question="Does it improve?",
+            hypothesis="It improves.",
+            treatment="A",
+            control="B",
+            primary_metric="score",
+        )
+    )
+    prior = RunRecord(
+        run_id="run-prior",
+        idea_id=idea.idea_id,
+        revision=1,
+        budget=BudgetLevel.B0,
+        requested_gpus=1,
+        timeout_sec=10,
+        command=("python", "experiment.py"),
+        output_dir="prior",
+        status=RunStatus.SUCCEEDED,
+        result={
+            "ok": True,
+            "metrics": {"effect": 0.01},
+            "artifacts": [],
+        },
+    )
+    latest = RunRecord(
+        run_id="run-latest-unique",
+        idea_id=idea.idea_id,
+        revision=1,
+        budget=BudgetLevel.B1,
+        requested_gpus=1,
+        timeout_sec=20,
+        command=("python", "experiment.py"),
+        output_dir="latest",
+        status=RunStatus.SUCCEEDED,
+        result={
+            "ok": True,
+            "metrics": {
+                "effect": 0.02,
+                "effect_ci": [0.01, 0.03],
+                "per_seed": [
+                    {
+                        "seed": index,
+                        "effect": index / 1000,
+                        "raw_blob": f"private-row-{index:03d}",
+                    }
+                    for index in range(100)
+                ],
+            },
+            "artifacts": [f"/large/artifact-{index}.json" for index in range(30)],
+            "usage": {"budget_parameters": {"examples": 512, "seeds": 100}},
+        },
+    )
+    client = FakeClient()
+    decision = LLMReviewWorker(client=client).review(
+        idea,
+        run=latest,
+        history=[prior, latest],
+        limits={"remaining_steps_after_review": 0},
+    )
+
+    assert decision.conclusion is Conclusion.NEGATIVE
+    assert client.prompt.count("run-latest-unique") == 1
+    assert "run-prior" in client.prompt
+    assert '"row_count": 100' in client.prompt
+    assert '"effect_ci": [' in client.prompt
+    assert "private-row-099" not in client.prompt
+    assert "artifact-29.json" not in client.prompt
+    assert len(client.prompt) < 15_000
 
 
 def test_python_source_gate_allows_stdlib_numpy_and_local_modules() -> None:

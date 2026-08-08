@@ -20,6 +20,7 @@ TREATMENT_API = (
     "build_treatment(); treatment.fit(calibration_logits, calibration_labels); "
     "treatment.transform(evaluation_logits, state)"
 )
+CIFAR10_ECE_MINIMUM_EFFECT = 1e-3
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +37,7 @@ class BenchmarkProfile:
     evidence_capabilities: tuple[str, ...]
     compute_accounting: tuple[str, ...]
     treatment_api: str
+    minimum_effects: dict[str, float]
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -45,7 +47,16 @@ class BenchmarkProfile:
             "compute_accounting",
         ):
             value[name] = list(value[name])
+        value["minimum_effects"] = dict(sorted(self.minimum_effects.items()))
         return value
+
+    def minimum_effect_for(self, metric: str) -> float:
+        """Return the frozen practical-significance floor for ``metric``."""
+
+        return max(
+            0.0,
+            float(self.minimum_effects.get(_metric_key(metric), 0.0) or 0.0),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +95,7 @@ def load_benchmark_profile(
     config = BenchmarkConfig.from_file(config_path)
     return BenchmarkProfile(
         benchmark_id=normalized,
-        version=1,
+        version=2,
         available_pairs=len(config.seeds),
         metrics=("accuracy", "ece", "nll"),
         calibration_split="clean",
@@ -107,6 +118,7 @@ def load_benchmark_profile(
             "model_forward_examples",
         ),
         treatment_api=TREATMENT_API,
+        minimum_effects={"ece": CIFAR10_ECE_MINIMUM_EFFECT},
     )
 
 
@@ -229,6 +241,17 @@ def validate_benchmark_compatibility(
     )
     if not checks["treatment_api_matches"]:
         errors.append("ResearchSpec treatment_api does not match benchmark profile")
+
+    minimum_effect = profile.minimum_effect_for(spec.primary_metric)
+    checks["minimum_effect_meets_profile"] = (
+        spec.minimum_effect >= minimum_effect
+    )
+    if not checks["minimum_effect_meets_profile"]:
+        errors.append(
+            f"ResearchSpec minimum_effect {spec.minimum_effect:.12g} is below "
+            f"the frozen {profile.benchmark_id} floor "
+            f"{minimum_effect:.12g} for {_metric_key(spec.primary_metric)!r}"
+        )
 
     return BenchmarkCompatibility(
         passed=not errors,

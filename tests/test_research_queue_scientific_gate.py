@@ -127,6 +127,25 @@ def test_scientific_result_separates_execution_validity_and_support() -> None:
     assert hypothesis_supported(spec, result) is True
 
 
+def test_hypothesis_support_rejects_floating_point_noop() -> None:
+    spec = _spec()
+    spec.minimum_effect = 0.0
+    result = {
+        "metrics": {
+            "baseline_ece": 0.48481052937129565,
+            "treatment_ece": 0.48481052937129554,
+        },
+        "uncertainty": {
+            "effect_ece_ci": [
+                1.1102230246251566e-17,
+                7.771561172376095e-17,
+            ],
+        },
+    }
+
+    assert hypothesis_supported(spec, result) is False
+
+
 def test_scientific_result_rejects_accuracy_degradation() -> None:
     spec = _spec()
     result = {

@@ -168,6 +168,203 @@ def _review_errors(value: Mapping[str, Any]) -> list[str]:
     return errors
 
 
+def _compact_review_idea(idea: IdeaRecord) -> dict[str, Any]:
+    """Keep only decision-relevant Idea state in the reviewer prompt."""
+
+    return {
+        "idea_id": idea.idea_id,
+        "title": idea.title,
+        "question": idea.question,
+        "hypothesis": idea.hypothesis,
+        "treatment": idea.treatment,
+        "control": idea.control,
+        "primary_metric": idea.primary_metric,
+        "tags": list(idea.tags),
+        "priority": idea.priority,
+        "status": idea.status.value,
+        "current_revision": idea.current_revision,
+        "current_budget": idea.current_budget.value,
+        "step_count": idea.step_count,
+        "last_reason": idea.last_reason,
+    }
+
+
+def _compact_review_run(run: RunRecord) -> dict[str, Any]:
+    """Summarize one run without embedding raw artifacts or per-sample rows."""
+
+    raw = run.result if isinstance(run.result, Mapping) else {}
+    result: dict[str, Any] = {
+        "ok": bool(
+            raw.get(
+                "ok",
+                run.status.value in {"succeeded", "passed"},
+            )
+        ),
+        "status": str(raw.get("status", "") or ""),
+        "metrics": _compact_review_metrics(raw.get("metrics", {})),
+    }
+    usage = raw.get("usage")
+    if isinstance(usage, Mapping):
+        result["usage"] = _compact_scalar_mapping(usage)
+    artifacts = raw.get("artifacts")
+    if isinstance(artifacts, Sequence) and not isinstance(
+        artifacts,
+        (str, bytes, bytearray),
+    ):
+        names = [
+            _bounded_text(str(item), limit=160)
+            for item in artifacts[:8]
+        ]
+        result["artifact_count"] = len(artifacts)
+        result["artifact_names"] = names
+    error = str(run.error or raw.get("error", "") or "")
+    if error:
+        result["error"] = _bounded_text(error, limit=1200)
+    if "returncode" in raw:
+        result["returncode"] = raw.get("returncode")
+    return {
+        "run_id": run.run_id,
+        "budget": run.budget.value,
+        "revision": run.revision,
+        "status": run.status.value,
+        "requested_gpus": run.requested_gpus,
+        "timeout_sec": run.timeout_sec,
+        "result": result,
+    }
+
+
+def _compact_review_metrics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    compact: dict[str, Any] = {}
+    for index, (raw_name, item) in enumerate(value.items()):
+        if index >= 48:
+            compact["_omitted_metric_count"] = len(value) - index
+            break
+        name = str(raw_name)
+        scalar = _compact_scalar(item)
+        if scalar is not _REVIEW_OMITTED:
+            compact[name] = scalar
+        elif isinstance(item, Mapping):
+            compact[name] = _compact_scalar_mapping(item)
+        elif isinstance(item, Sequence) and not isinstance(
+            item,
+            (str, bytes, bytearray),
+        ):
+            rows = [row for row in item if isinstance(row, Mapping)]
+            if rows and len(rows) == len(item):
+                compact[f"{name}_summary"] = _heterogeneity_summary(rows)
+            else:
+                compact[name] = {"item_count": len(item)}
+    return compact
+
+
+def _heterogeneity_summary(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    numeric: dict[str, list[float]] = {}
+    for row in rows:
+        for raw_name, item in row.items():
+            if isinstance(item, (int, float)) and not isinstance(item, bool):
+                number = float(item)
+                if math.isfinite(number):
+                    numeric.setdefault(str(raw_name), []).append(number)
+
+    def priority(name: str) -> tuple[int, str]:
+        lowered = name.casefold()
+        important = (
+            "effect",
+            "delta",
+            "primary",
+            "treatment",
+            "control",
+            "baseline",
+            "ece",
+            "nll",
+            "accuracy",
+            "score",
+            "reward",
+            "loss",
+        )
+        return (0 if any(term in lowered for term in important) else 1, lowered)
+
+    numeric_summary: dict[str, Any] = {}
+    for name in sorted(numeric, key=priority)[:16]:
+        values = numeric[name]
+        mean = sum(values) / len(values)
+        variance = sum((item - mean) ** 2 for item in values) / len(values)
+        numeric_summary[name] = {
+            "n": len(values),
+            "mean": mean,
+            "std": math.sqrt(variance),
+            "min": min(values),
+            "max": max(values),
+        }
+    result = {
+        "row_count": len(rows),
+        "numeric": numeric_summary,
+    }
+    if len(numeric) > len(numeric_summary):
+        result["omitted_numeric_field_count"] = len(numeric) - len(
+            numeric_summary
+        )
+    return result
+
+
+_REVIEW_OMITTED = object()
+
+
+def _compact_scalar(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _bounded_text(value, limit=800)
+    if (
+        isinstance(value, Sequence)
+        and not isinstance(
+            value,
+            (str, bytes, bytearray),
+        )
+        and len(value) <= 8
+        and all(
+            item is None or isinstance(item, (str, int, float, bool))
+            for item in value
+        )
+    ):
+        return [
+            _bounded_text(item, limit=200) if isinstance(item, str) else item
+            for item in value
+        ]
+    return _REVIEW_OMITTED
+
+
+def _compact_scalar_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for index, (raw_name, item) in enumerate(value.items()):
+        if index >= 24:
+            compact["_omitted_field_count"] = len(value) - index
+            break
+        name = str(raw_name)
+        scalar = _compact_scalar(item)
+        if scalar is not _REVIEW_OMITTED:
+            compact[name] = scalar
+        elif isinstance(item, Mapping):
+            nested: dict[str, Any] = {}
+            for key, nested_item in list(item.items())[:24]:
+                nested_scalar = _compact_scalar(nested_item)
+                if nested_scalar is not _REVIEW_OMITTED:
+                    nested[str(key)] = nested_scalar
+            compact[name] = nested
+    return compact
+
+
+def _bounded_text(value: str, *, limit: int) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 15)] + "...[truncated]"
+
+
 class LLMIdeaProducer:
     def __init__(self, *, client: Any, brief: str) -> None:
         self.brief = brief
@@ -266,6 +463,12 @@ class LLMResearchSpecWorker:
         benchmark_profile: Mapping[str, Any],
         feedback: str,
     ) -> tuple[ResearchSpec, dict[str, Any]]:
+        minimum_effects = benchmark_profile.get("minimum_effects", {})
+        minimum_ece_effect = (
+            float(minimum_effects.get("ece", 0.0) or 0.0)
+            if isinstance(minimum_effects, Mapping)
+            else 0.0
+        )
         result = self.role.call(
             f"""
 IDEA:
@@ -288,7 +491,7 @@ Return a strict ResearchSpec:
   "control": "...",
   "primary_metric": "ece|nll|accuracy",
   "metric_direction": "minimize|maximize",
-  "minimum_effect": 0.0,
+  "minimum_effect": {minimum_ece_effect},
   "primary_requires_effect_ci": true,
   "minimum_pairs": 5,
   "confidence_level": 0.95,
@@ -329,7 +532,8 @@ Return a strict ResearchSpec:
 
 For CIFAR-10 calibration:
 - use ECE as the primary metric and minimize it;
-- set minimum_effect to 0 and require a paired 95% effect CI;
+- set minimum_effect to at least the frozen benchmark floor
+  ({minimum_ece_effect}) and require a paired 95% effect CI;
 - require at least 5 disjoint example-block pairs with independent corruption
   seeds;
 - require exact per-pair accuracy equality;
@@ -490,6 +694,12 @@ class SimulatedResearchSpecWorker:
             1,
             int(benchmark_profile.get("available_pairs", 1) or 1),
         )
+        minimum_effects = benchmark_profile.get("minimum_effects", {})
+        minimum_effect = (
+            float(minimum_effects.get("ece", 0.0) or 0.0)
+            if isinstance(minimum_effects, Mapping)
+            else 0.0
+        )
         return (
             ResearchSpec(
                 question=idea.question,
@@ -506,7 +716,7 @@ class SimulatedResearchSpecWorker:
                 stopping_rules=("reject when ECE does not improve",),
                 benchmark_id=benchmark_id,
                 treatment_api=treatment_api,
-                minimum_effect=0.0,
+                minimum_effect=minimum_effect,
                 primary_requires_effect_ci=True,
                 guardrail_metrics=(
                     MetricGuardrail(
@@ -794,24 +1004,19 @@ class LLMReviewWorker:
         limits: Mapping[str, Any],
     ) -> ReviewDecision:
         history_payload = [
-            {
-                "budget": item.budget.value,
-                "revision": item.revision,
-                "status": item.status.value,
-                "result": item.result,
-                "error": item.error,
-            }
+            _compact_review_run(item)
             for item in history
+            if item.run_id != run.run_id
         ]
         result = self.role.call(
             f"""
 IDEA:
-{json.dumps(idea.to_dict(), ensure_ascii=False, indent=2)}
+{json.dumps(_compact_review_idea(idea), ensure_ascii=False, indent=2)}
 
 LATEST RUN:
-{json.dumps(run.to_dict(), ensure_ascii=False, indent=2)}
+{json.dumps(_compact_review_run(run), ensure_ascii=False, indent=2)}
 
-RUN HISTORY:
+PRIOR RUN HISTORY (LATEST RUN OMITTED):
 {json.dumps(history_payload, ensure_ascii=False, indent=2)}
 
 LIMITS:

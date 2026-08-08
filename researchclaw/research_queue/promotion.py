@@ -417,7 +417,10 @@ class BenchmarkPromotionBridge:
             spec=spec,
             benchmark_result=benchmark_result,
             execution_passed=result.ok,
-            minimum_effect=self.config.minimum_effect,
+            minimum_effect=max(
+                self.config.minimum_effect,
+                self.profile.minimum_effect_for(spec.primary_metric),
+            ),
             execution_error=result.error,
             usage={
                 **usage,

@@ -12,11 +12,13 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import random
 import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -1020,7 +1022,21 @@ def build_logits_cache(
     arrays["metadata_json"] = np.asarray(
         json.dumps(metadata, ensure_ascii=False, sort_keys=True)
     )
-    np.savez_compressed(destination, **arrays)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            np.savez_compressed(stream, **arrays)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     return metadata
 
 
@@ -1129,11 +1145,45 @@ def _parser() -> argparse.ArgumentParser:
         description="Run the pinned CIFAR-10 calibration benchmark adapter",
     )
     parser.add_argument("-c", "--config", required=True)
+    parser.add_argument(
+        "--build-logits-cache",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Run the frozen model once and atomically materialize a reusable "
+            "trusted logits cache instead of evaluating a treatment."
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.build_logits_cache is not None:
+        destination = args.build_logits_cache.expanduser().resolve()
+        try:
+            metadata = build_logits_cache(
+                args.config,
+                cache_path=destination,
+            )
+        except Exception as exc:  # noqa: BLE001
+            failed = {
+                "status": "error",
+                "operation": "build_logits_cache",
+                "cache_path": str(destination),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            print(json.dumps(failed, ensure_ascii=False, indent=2))
+            return 1
+        completed = {
+            "status": "ok",
+            "operation": "build_logits_cache",
+            "cache_path": str(destination),
+            "cache_sha256": sha256_path(destination),
+            "metadata": metadata,
+        }
+        print(json.dumps(completed, ensure_ascii=False, indent=2))
+        return 0
     try:
         result = run_from_file(args.config)
     except Exception as exc:  # noqa: BLE001
@@ -1144,6 +1194,7 @@ def main(argv: list[str] | None = None) -> int:
             metrics={},
             uncertainty={},
             per_seed=[],
+            evidence={},
             assets={},
             usage={},
             provenance={"adapter": "Cifar10CalibrationAdapter"},

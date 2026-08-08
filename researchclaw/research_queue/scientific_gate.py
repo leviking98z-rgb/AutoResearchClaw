@@ -16,6 +16,8 @@ from .models import (
     ResearchSpec,
 )
 
+NUMERICAL_EFFECT_EPSILON = 1e-12
+
 
 @dataclass(frozen=True, slots=True)
 class ScientificGateResult:
@@ -367,7 +369,7 @@ def validate_benchmark_result(
         else:
             lower, _ = interval
             checks["primary_effect_ci_supports_hypothesis"] = (
-                lower > spec.minimum_effect
+                lower > max(spec.minimum_effect, NUMERICAL_EFFECT_EPSILON)
             )
 
     guardrail_specs = _guardrail_specs(spec)
@@ -486,6 +488,7 @@ def hypothesis_supported(
         if minimum_effect is None
         else max(spec.minimum_effect, minimum_effect)
     )
+    threshold = max(threshold, NUMERICAL_EFFECT_EPSILON)
     if spec.primary_requires_effect_ci:
         if not isinstance(nested_metrics, Mapping):
             return None

@@ -80,7 +80,9 @@ research_queue:
     benchmark_config: ""
     trigger_conclusions: [positive, inconclusive]
     minimum_priority: 0.0
-    minimum_effect: 0.0
+    # Frozen CIFAR-10 ECE practical-significance floor. The BenchmarkProfile
+    # rejects a ResearchSpec below this value, even if this override is lower.
+    minimum_effect: 0.001
     max_promotions: 1
     max_treatment_repairs: 1
     preflight_examples: 96
