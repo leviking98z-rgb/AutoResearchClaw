@@ -630,3 +630,27 @@ VCO@2h = 两小时内完成的科学有效且结论明确的研究结果数量
 完整协议、对比组、公平性约束、Evidence-Pack 评测和实施清单见：
 
 [`PORTFOLIO_BENCHMARK_TODO.md`](PORTFOLIO_BENCHMARK_TODO.md)。
+
+### 9.1 PortfolioBench 的最小同源证据实现
+
+通用 Queue 仍允许不同领域自定义 `prepare/run/review`。但
+PortfolioBench 不再让 LLM 先自由生成 synthetic `experiment.py`、再用
+另一套 treatment 跑真实 Benchmark。其固定 adapter 路径为：
+
+```text
+ResearchSpec
+→ 一次 treatment.py 生成与 preflight
+→ 同一 frozen pairing universe 上的 B0/B1/B2
+→ B2 deterministic final gate
+```
+
+- B0、B1、B2 使用同一个 treatment hash；
+- 三个预算使用不相交的 seed partitions；
+- B2 就是 confirmatory result，不再生成第二套实现或重复 promotion run；
+- PortfolioBench 中 `max_runs_per_budget=1`，避免把同代码、同参数、同 seed
+  的重复执行误称为独立证据；
+- PortfolioBench 中 `max_revisions_per_idea=1`，避免模型看过 pilot
+  evaluation labels 后修改 treatment，再把旧 pilot 当作新实现的证据。
+
+这些是 Benchmark adapter 的公平性约束，不增加新的 Idea 状态、Actor、
+DAG 或第二个 Controller。

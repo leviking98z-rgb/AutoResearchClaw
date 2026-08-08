@@ -342,11 +342,26 @@ class ResearchQueueController:
                 and self.config.promotion.direct_all_admitted
                 and self.promotion_bridge is not None
             )
-            idea.next_action = "scientific_gate" if direct else "prepare"
+            progressive = bool(
+                self.config.promotion.enabled
+                and self.config.promotion.progressive_pilot
+                and self.promotion_bridge is not None
+            )
+            idea.next_action = (
+                "scientific_gate"
+                if direct or progressive
+                else "prepare"
+            )
+            if direct and progressive:
+                idea.current_budget = BudgetLevel.B2
             idea.last_reason = (
-                "admitted directly to frozen benchmark"
+                "admitted directly to frozen confirmatory benchmark"
                 if direct
-                else "admitted"
+                else (
+                    "admitted to progressive frozen evidence"
+                    if progressive
+                    else "admitted"
+                )
             )
             self.store.upsert_idea(idea)
             self.store.event(
@@ -381,7 +396,13 @@ class ResearchQueueController:
                 return
             action = idea.next_action or "prepare"
             if (
-                action in {"prepare", "run", "review"}
+                action in {
+                    "prepare",
+                    "prepare_benchmark",
+                    "run",
+                    "review",
+                    "finalize_benchmark",
+                }
                 and idea.step_count >= self.config.limits.max_steps_per_idea
             ):
                 self._conclude(
@@ -392,10 +413,14 @@ class ResearchQueueController:
                 return
             if action == "prepare":
                 await self._prepare(idea)
+            elif action == "prepare_benchmark":
+                await self._prepare_benchmark(idea)
             elif action == "run":
                 await self._run(idea)
             elif action == "review":
                 await self._review(idea)
+            elif action == "finalize_benchmark":
+                await self._finalize_benchmark(idea)
             elif action == "scientific_gate":
                 await self._scientific_gate(idea)
             elif action == "promote":
@@ -487,6 +512,91 @@ class ResearchQueueController:
             requested_gpus=prepared.requested_gpus,
             usage=prepared.usage,
             repair_attempts=repairs,
+        )
+
+    async def _prepare_benchmark(self, idea: IdeaRecord) -> None:
+        """Generate one treatment and wrap it in framework-owned runner code."""
+
+        if self.promotion_bridge is None or idea.research_spec is None:
+            self._conclude(
+                idea,
+                Conclusion.INCONCLUSIVE,
+                "progressive benchmark preparation requires a ResearchSpec",
+            )
+            return
+        revision = idea.current_revision + 1
+        if revision > self.config.limits.max_revisions_per_idea:
+            self._conclude(
+                idea,
+                Conclusion.INCONCLUSIVE,
+                "maximum progressive treatment revisions reached",
+            )
+            return
+        self.store.event(
+            "benchmark_prepare_started",
+            idea_id=idea.idea_id,
+            revision=revision,
+        )
+        outcome = await self._call_llm(
+            self.promotion_bridge.prepare_progressive_revision,
+            idea,
+            spec=idea.research_spec,
+            revision=revision,
+            timeout_sec=max(
+                budget.timeout_sec for budget in self.config.budgets.values()
+            ),
+        )
+        idea.total_tokens += int(outcome.usage.get("total_tokens", 0) or 0)
+        self.store.upsert_idea(idea)
+        if not outcome.passed or outcome.prepared_revision is None:
+            self.store.event(
+                "benchmark_prepare_failed",
+                idea_id=idea.idea_id,
+                revision=revision,
+                reason=outcome.reason,
+                preflight=outcome.preflight,
+                usage=outcome.usage,
+            )
+            self._conclude(
+                idea,
+                Conclusion.INCONCLUSIVE,
+                outcome.reason,
+            )
+            return
+        prepared = outcome.prepared_revision
+        errors = self._prepared_revision_errors(prepared, revision)
+        if errors:
+            self.store.event(
+                "benchmark_prepare_failed",
+                idea_id=idea.idea_id,
+                revision=revision,
+                reason="; ".join(errors),
+                preflight=outcome.preflight,
+                usage=outcome.usage,
+            )
+            self._conclude(
+                idea,
+                Conclusion.INCONCLUSIVE,
+                "progressive revision failed deterministic validation: "
+                + "; ".join(errors),
+            )
+            return
+        materialize_revision(
+            self.store.revision_dir(idea.idea_id, revision),
+            prepared,
+        )
+        idea.current_revision = revision
+        idea.next_action = "run"
+        idea.step_count += 1
+        idea.last_reason = outcome.reason
+        self.store.upsert_idea(idea)
+        self.store.event(
+            "benchmark_prepare_completed",
+            idea_id=idea.idea_id,
+            revision=revision,
+            requested_gpus=prepared.requested_gpus,
+            treatment_sha256=prepared.plan.get("treatment_sha256", ""),
+            usage=prepared.usage,
         )
 
     def _prepared_revision_errors(
@@ -597,8 +707,18 @@ class ResearchQueueController:
         idea.gpu_seconds += float(result.usage.get("gpu_seconds", 0.0) or 0.0)
         idea.step_count += 1
         if result.ok:
-            idea.next_action = "review"
-            idea.last_reason = "run completed"
+            final_progressive = bool(
+                self.config.promotion.progressive_pilot
+                and idea.current_budget is BudgetLevel.B2
+            )
+            idea.next_action = (
+                "finalize_benchmark" if final_progressive else "review"
+            )
+            idea.last_reason = (
+                "confirmatory benchmark completed"
+                if final_progressive
+                else "run completed"
+            )
             idea.infra_failures = 0
         else:
             idea.infra_failures += 1
@@ -632,6 +752,15 @@ class ResearchQueueController:
             "max_revisions_per_idea": (self.config.limits.max_revisions_per_idea),
             "max_runs_per_budget": (self.config.limits.max_runs_per_budget),
             "max_steps_per_idea": self.config.limits.max_steps_per_idea,
+            "successful_runs_current_budget": sum(
+                1
+                for item in history
+                if item.budget is idea.current_budget
+                and item.revision == idea.current_revision
+                and item.status is RunStatus.SUCCEEDED
+            ),
+            "progressive_pilot": self.config.promotion.progressive_pilot,
+            "b2_is_confirmatory": self.config.promotion.progressive_pilot,
             "remaining_steps_after_review": max(
                 0,
                 self.config.limits.max_steps_per_idea - (idea.step_count + 1),
@@ -705,6 +834,16 @@ class ResearchQueueController:
                 return
             idea.current_budget = expected
             idea.next_action = "run"
+            if (
+                self.config.promotion.progressive_pilot
+                and expected is BudgetLevel.B2
+            ):
+                self.store.event(
+                    "idea_selected_for_promotion",
+                    idea_id=idea.idea_id,
+                    conclusion="pending_confirmatory_b2",
+                    reason=decision.reason,
+                )
         elif decision.action is ReviewAction.REVISE:
             if not self._has_step_budget(idea, required=3):
                 self._conclude(
@@ -728,7 +867,26 @@ class ResearchQueueController:
             if self._should_promote(idea, conclusion):
                 idea.conclusion = conclusion
                 idea.last_reason = decision.reason
-                idea.next_action = "scientific_gate"
+                if (
+                    self.config.promotion.progressive_pilot
+                    and idea.research_spec is not None
+                ):
+                    if not self._has_step_budget(idea, required=2):
+                        self._conclude(
+                            idea,
+                            Conclusion.INCONCLUSIVE,
+                            "confirmatory B2 requires a Run and finalization "
+                            "but insufficient step budget remains",
+                        )
+                        return
+                    idea.current_budget = BudgetLevel.B2
+                    idea.next_action = "run"
+                else:
+                    idea.next_action = (
+                        "promote"
+                        if idea.research_spec is not None
+                        else "scientific_gate"
+                    )
                 self.store.upsert_idea(idea)
                 self.store.event(
                     "idea_selected_for_promotion",
@@ -765,6 +923,64 @@ class ResearchQueueController:
             if event.get("event") == "idea_selected_for_promotion"
         }
         return len(selected) < self.config.promotion.max_promotions
+
+    async def _finalize_benchmark(self, idea: IdeaRecord) -> None:
+        if self.promotion_bridge is None or idea.research_spec is None:
+            self._conclude(
+                idea,
+                Conclusion.INCONCLUSIVE,
+                "confirmatory finalization requires a promotion bridge and "
+                "ResearchSpec",
+            )
+            return
+        history = self.store.list_runs(idea_id=idea.idea_id)
+        if not history:
+            self._conclude(
+                idea,
+                Conclusion.INCONCLUSIVE,
+                "confirmatory finalization requested without a Run",
+            )
+            return
+        run = history[-1]
+        if run.budget is not BudgetLevel.B2:
+            self._conclude(
+                idea,
+                Conclusion.INCONCLUSIVE,
+                "only B2 may be finalized as confirmatory evidence",
+            )
+            return
+        self.store.event(
+            "benchmark_finalization_started",
+            idea_id=idea.idea_id,
+            run_id=run.run_id,
+        )
+        outcome = self.promotion_bridge.finalize_progressive(
+            idea,
+            spec=idea.research_spec,
+            run=run,
+        )
+        idea.step_count += 1
+        final_conclusion = (
+            Conclusion.POSITIVE
+            if outcome.hypothesis_supported is True
+            and outcome.scientific_valid
+            else (
+                Conclusion.NEGATIVE
+                if outcome.hypothesis_supported is False
+                and outcome.scientific_valid
+                else Conclusion.INCONCLUSIVE
+            )
+        )
+        idea.conclusion = final_conclusion
+        self.store.write_json_atomic(
+            self.store.idea_dir(idea.idea_id) / "final_review.json",
+            outcome.to_dict(),
+        )
+        self._conclude(
+            idea,
+            final_conclusion,
+            outcome.reason,
+        )
 
     async def _scientific_gate(self, idea: IdeaRecord) -> None:
         if self.spec_worker is None:
@@ -884,7 +1100,11 @@ class ResearchQueueController:
                 f"scientific contract rejected: {reason}",
             )
             return
-        idea.next_action = "promote"
+        idea.next_action = (
+            "prepare_benchmark"
+            if self.config.promotion.progressive_pilot
+            else "promote"
+        )
         idea.last_reason = "scientific contract accepted"
         idea.step_count += 1
         self.store.upsert_idea(idea)

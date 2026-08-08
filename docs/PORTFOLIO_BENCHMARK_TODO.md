@@ -1,6 +1,6 @@
 # PortfolioBench-2h：核心架构 Benchmark TODO
 
-状态：**实现中 / 已完成确定性 smoke，尚未产出正式真实模型三重复结果**
+状态：**实现中 / 已完成同源渐进证据 smoke 和单次旧架构真实模型诊断，尚未产出新架构正式三重复结果**
 
 本文冻结 Continuous Research Queue 的核心评测协议。目标不是比较谁生成
 的论文数量最多，也不是用 GPU 利用率作为成功标准，而是回答：
@@ -84,13 +84,17 @@ hypothesis_supported ∈ {true, false}
 
 ### 2.1 实用显著性门槛
 
-`cifar10_calibration` BenchmarkProfile v2 冻结：
+`cifar10_calibration` BenchmarkProfile v3 冻结。v3 保留 v2 的实用显著性
+门槛，并增加一个固定的十 pair universe：
 
 ```text
 primary metric                  ECE（越低越好）
 minimum practical effect       0.001
 support condition              paired effect CI lower bound > 0.001
 numerical no-op epsilon         1e-12
+B0 pilot pairs                 2
+B1 pilot pairs                 3
+B2 confirmatory pairs          5
 ```
 
 因此，浮点舍入产生的 `1e-17` 级“改善”不能被判为 positive。若执行与证据
@@ -339,6 +343,9 @@ Correct verdict        inconclusive / reject
 - [x] real runner 自动验证 GPU 最终释放。
 - [x] 增加原子化真实 logits cache 构建 CLI；
 - [x] 压缩 Review prompt，去除 latest run 重复和原始 per-seed/artifact；
+- [x] B0/B1/B2 复用同一个 ResearchSpec、treatment 和 frozen cache；
+- [x] B0/B1/B2 使用不相交 seed partitions，B2 即最终 confirmatory result；
+- [x] 禁止同一 budget 的伪“独立重复”和 pilot 后 treatment revision；
 
 ### P0：定义判定和聚合
 
@@ -457,3 +464,85 @@ conclusion             negative
 
 所以该结果在修正后仍是一个 VCO，但类别从错误 positive 改为 valid
 negative。下一次公平复跑必须使用 Profile v2 和同一真实 logits cache。
+
+### 11.4 Profile v2 公平复跑（非正式）
+
+commit `daa78da`，suite
+`20260808-184814-466807`。RQ-Sequential 与 RQ-Full 使用相同两条
+Idea、相同 frozen logits cache、相同 900 秒 wall cap、相同 300,000
+Token cap和相同模型配置，各运行一次：
+
+| Variant | VCO@900s | TTFV | Token | 逻辑 GPU-sec | Wall time |
+|---|---:|---:|---:|---:|---:|
+| RQ-Sequential | 0 | censored | 99,498 | 0 | 506.388s |
+| RQ-Full | 0 | censored | 67,849 | 0 | 256.784s |
+
+在这个两 Idea 小样本中，RQ-Full 的 wall time 低 `49.3%`，Token 低
+`31.8%`。但两组的 `VCO=0`，因此这些差异**不能**被解释为科研产出、
+真实 Benchmark throughput 或单位 VCO 成本提升。
+
+本次运行进一步暴露了两个 Benchmark 对齐问题：
+
+1. B0/B1 使用 LLM 临时生成的 synthetic `experiment.py`，而最终判定使用
+   frozen CIFAR-10 logits cache；pilot 与 final evidence 不是同一数据和
+   treatment 实现。四条 Idea 都在 synthetic pilot 被判 negative，真实
+   cache 从未触发。
+2. 同一 revision、同一 budget 的 `run_more` 复用了相同代码、参数和随机
+   种子，产生逐位相同的结果，却被 reviewer 当成“独立重复”。这没有增加
+   证据，只增加了一次 Run 和 Review 成本。
+
+因此该复跑目前只验证了独立 Idea task 的 bounded asynchronous
+orchestration。它没有验证：
+
+- 多分支代码候选的 stale 检测、rebase、组合或主线 commit；
+- promotion 后真实 Benchmark 的吞吐量；
+- 动态 GPU 调度优势（本次没有申请物理 GPU）；
+- RQ-Full 比 RQ-Sequential 产生更多 VCO。
+
+原始 manifest、报告和比较结果位于：
+
+```text
+/root/shared/.clusters/.workdir/portfolio-bench/20260808-184814-466807/
+```
+
+该诊断给出的修复要求是：下一次真实复跑前，让 B0/B1/B2 与最终判定复用
+同一 frozen evidence 和同一个 treatment artifact，并为各预算分配不相交
+的 pair slice。11.5 记录了这一要求的实现。
+
+### 11.5 同源渐进证据架构 smoke
+
+上述 11.4 暴露的问题已经在 BenchmarkProfile v3 原型中按最小架构改动
+修复：
+
+```text
+Idea
+→ ResearchSpec
+→ 生成并 preflight 一次 treatment.py
+→ B0: seeds [101, 103]
+→ B1: seeds [107, 109, 113]（仅在需要时）
+→ B2: seeds [17, 29, 43, 59, 71]
+→ deterministic scientific gate
+```
+
+十个 pair 由同一个 `pairing_seeds` universe 一次性分配，选择 B0/B1/B2
+子集不会改变 B2 的数据块。B2 本身就是最终 confirmatory benchmark，
+不再额外生成第二套 treatment 或重复执行一轮 promotion benchmark。
+
+2 Idea × 3 variants 的确定性集成 smoke 已通过：
+
+| Variant | VCO@30s | Token | GPU-sec |
+|---|---:|---:|---:|
+| RQ-Sequential | 2 | 0 | 0 |
+| RQ-Full | 2 | 0 | 0 |
+| RQ-NoEarlyExit | 2 | 0 | 0 |
+
+artifact audit 进一步确认：
+
+- 每个 Idea 的 B0 与 B2 `treatment_sha256` 完全相同；
+- B0 使用 2 个 pair，B2 使用 5 个完全不相交 pair；
+- final review 的 treatment hash 与 Run artifact 相同；
+- 每个 budget 最多运行一次，不再把相同代码、参数和 seed 当独立重复。
+
+这仍然只是 deterministic integration smoke。下一步必须构建包含十个
+pair 的可信真实 logits cache，并用真实 LLM 复跑 RQ-Sequential 与
+RQ-Full；11.4 的旧结果不能用于评价这次修复后的科研质量。

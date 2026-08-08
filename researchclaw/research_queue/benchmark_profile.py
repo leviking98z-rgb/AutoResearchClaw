@@ -95,7 +95,7 @@ def load_benchmark_profile(
     config = BenchmarkConfig.from_file(config_path)
     return BenchmarkProfile(
         benchmark_id=normalized,
-        version=2,
+        version=3,
         available_pairs=len(config.seeds),
         metrics=("accuracy", "ece", "nll"),
         calibration_split="clean",
@@ -107,6 +107,7 @@ def load_benchmark_profile(
         pairing_strategy="disjoint_example_blocks",
         evidence_capabilities=(
             "disjoint_pairs",
+            "partitioned_disjoint_pairs",
             "paired_effect_ci",
             "per_pair_metrics",
             "per_example_argmax",
@@ -272,7 +273,7 @@ def build_benchmark_plan(
     source = Path(config_path).expanduser().resolve()
     config = BenchmarkConfig.from_file(source)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark_profile": profile.to_dict(),
         "protocol": {
             "dataset_url": config.dataset_url,
@@ -283,6 +284,7 @@ def build_benchmark_plan(
             "model_source_commit": config.model_source_commit,
             "model_name": config.model_name,
             "seeds": list(config.seeds),
+            "pairing_seeds": list(config.pairing_seeds or config.seeds),
             "examples_per_pair": config.examples,
             "calibration_examples_per_pair": config.calibration_examples,
             "calibration_split": profile.calibration_split,

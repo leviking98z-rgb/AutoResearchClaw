@@ -27,6 +27,7 @@ from .config import BenchmarkPromotionConfig
 from .models import (
     BudgetLevel,
     IdeaRecord,
+    PreparedRevision,
     ResearchSpec,
     RunRecord,
     RunStatus,
@@ -66,6 +67,17 @@ class PromotionOutcome:
             "usage": self.usage,
             "provenance": self.provenance,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressivePreparationOutcome:
+    """Result of generating one immutable treatment-backed Queue revision."""
+
+    passed: bool
+    reason: str
+    prepared_revision: PreparedRevision | None
+    usage: dict[str, Any]
+    preflight: dict[str, Any]
 
 
 def review_benchmark_result(
@@ -176,12 +188,11 @@ class BenchmarkPromotionBridge:
     def profile_dict(self) -> dict[str, Any]:
         return self.profile.to_dict()
 
-    async def promote(
+    def _persist_contract(
         self,
         idea: IdeaRecord,
-        *,
         spec: ResearchSpec,
-    ) -> PromotionOutcome:
+    ) -> tuple[Path, BenchmarkCompatibility]:
         benchmark_root = self.store.idea_dir(idea.idea_id) / "benchmark"
         benchmark_root.mkdir(parents=True, exist_ok=True)
         self.store.write_json_atomic(
@@ -197,6 +208,307 @@ class BenchmarkPromotionBridge:
             benchmark_root / "benchmark_compatibility.json",
             compatibility.to_dict(),
         )
+        return benchmark_root, compatibility
+
+    def _prepare_treatment(
+        self,
+        idea: IdeaRecord,
+        *,
+        spec: ResearchSpec,
+        benchmark_root: Path,
+    ) -> tuple[Path | None, dict[str, Any], dict[str, Any]]:
+        """Generate and preflight one treatment, reusing it after a resume."""
+
+        treatment_path = benchmark_root / "treatment.py"
+        treatment_manifest = _read_json(
+            benchmark_root / "treatment-manifest.json"
+        )
+        current_spec_sha256 = sha256_path(
+            benchmark_root / "research_spec.json"
+        )
+        if (
+            treatment_path.is_file()
+            and treatment_manifest.get("research_spec_sha256")
+            == current_spec_sha256
+        ):
+            source_errors = validate_treatment_source(
+                treatment_path.read_text(encoding="utf-8")
+            )
+            preflight = (
+                {
+                    "passed": False,
+                    "errors": source_errors,
+                    "reused": True,
+                }
+                if source_errors
+                else {
+                    **preflight_treatment(
+                        treatment_path,
+                        examples=self.config.preflight_examples,
+                        classes=self.config.preflight_classes,
+                        timeout_sec=self.config.preflight_timeout_sec,
+                    ),
+                    "reused": True,
+                }
+            )
+            self.store.write_json_atomic(
+                benchmark_root / "preflight-reuse.json",
+                preflight,
+            )
+            if preflight.get("passed"):
+                return treatment_path, {}, preflight
+
+        usage: dict[str, Any] = {}
+        feedback = ""
+        preflight: dict[str, Any] = {}
+        for attempt in range(self.config.max_treatment_repairs + 1):
+            try:
+                source, current_usage = self.treatment_worker.build(
+                    idea,
+                    spec=spec,
+                    feedback=feedback,
+                )
+            except Exception as exc:  # noqa: BLE001
+                preflight = {
+                    "passed": False,
+                    "errors": [
+                        (
+                            "treatment generation failed validation: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    ],
+                }
+                self.store.write_json_atomic(
+                    benchmark_root / f"preflight-{attempt + 1:02d}.json",
+                    preflight,
+                )
+                # StructuredRole already performs bounded repair internally.
+                # There is no metered usable result object to retry here.
+                break
+            _merge_usage(usage, current_usage)
+            source_errors = validate_treatment_source(source)
+            treatment_path.write_text(source, encoding="utf-8")
+            if source_errors:
+                preflight = {
+                    "passed": False,
+                    "errors": source_errors,
+                }
+            else:
+                preflight = preflight_treatment(
+                    treatment_path,
+                    examples=self.config.preflight_examples,
+                    classes=self.config.preflight_classes,
+                    timeout_sec=self.config.preflight_timeout_sec,
+                )
+            self.store.write_json_atomic(
+                benchmark_root / f"preflight-{attempt + 1:02d}.json",
+                preflight,
+            )
+            if preflight.get("passed"):
+                break
+            feedback = (
+                "Treatment preflight failed. Return a complete corrected "
+                f"treatment. Diagnostics: {json.dumps(preflight, ensure_ascii=False)}"
+            )
+        if not preflight.get("passed"):
+            return None, usage, preflight
+        self.store.write_json_atomic(
+            benchmark_root / "treatment-manifest.json",
+            {
+                "treatment_sha256": sha256_path(treatment_path),
+                "research_spec_sha256": current_spec_sha256,
+                "preflight": preflight,
+                "usage": usage,
+            },
+        )
+        return treatment_path, usage, preflight
+
+    def prepare_progressive_revision(
+        self,
+        idea: IdeaRecord,
+        *,
+        spec: ResearchSpec,
+        revision: int,
+        timeout_sec: float,
+    ) -> ProgressivePreparationOutcome:
+        """Create one framework-owned runner around one generated treatment."""
+
+        benchmark_root, compatibility = self._persist_contract(idea, spec)
+        if not compatibility.passed:
+            return ProgressivePreparationOutcome(
+                passed=False,
+                reason=(
+                    "ResearchSpec is incompatible with the frozen benchmark "
+                    "profile: " + "; ".join(compatibility.errors)
+                ),
+                prepared_revision=None,
+                usage={},
+                preflight={
+                    "passed": False,
+                    "errors": list(compatibility.errors),
+                },
+            )
+        treatment_path, usage, preflight = self._prepare_treatment(
+            idea,
+            spec=spec,
+            benchmark_root=benchmark_root,
+        )
+        if treatment_path is None:
+            return ProgressivePreparationOutcome(
+                passed=False,
+                reason="generated treatment failed deterministic preflight",
+                prepared_revision=None,
+                usage=usage,
+                preflight=preflight,
+            )
+        logits_cache = (
+            Path(self.config.logits_cache).expanduser().resolve()
+            if self.config.logits_cache
+            else None
+        )
+        cache_ready = bool(
+            self.config.prefer_logits_cache
+            and logits_cache is not None
+            and logits_cache.is_file()
+        )
+        command = [
+            sys.executable if cache_ready else self.config.runtime_python,
+            "-m",
+            "researchclaw.research_queue.progressive_benchmark_runner",
+            "--benchmark-config",
+            str(Path(self.config.benchmark_config).expanduser().resolve()),
+            "--treatment-path",
+            str(treatment_path),
+        ]
+        if cache_ready and logits_cache is not None:
+            command += ["--logits-cache", str(logits_cache)]
+        prepared = PreparedRevision(
+            revision=revision,
+            command=tuple(command),
+            requested_gpus=0 if cache_ready else 1,
+            timeout_sec=max(1.0, float(timeout_sec)),
+            plan={
+                "method_summary": (
+                    "One immutable generated treatment evaluated by the "
+                    "framework-owned progressive benchmark runner."
+                ),
+                "treatment": spec.treatment,
+                "control": spec.control,
+                "primary_metric": spec.primary_metric,
+                "source_files": {},
+                "benchmark_config": str(
+                    Path(self.config.benchmark_config).expanduser().resolve()
+                ),
+                "benchmark_config_sha256": sha256_path(
+                    self.config.benchmark_config
+                ),
+                "treatment_path": str(treatment_path),
+                "treatment_sha256": sha256_path(treatment_path),
+                "logits_cache": str(logits_cache or ""),
+                "logits_cache_sha256": (
+                    sha256_path(logits_cache)
+                    if cache_ready and logits_cache is not None
+                    else ""
+                ),
+                "progressive_evidence": True,
+            },
+            usage=usage,
+        )
+        return ProgressivePreparationOutcome(
+            passed=True,
+            reason="immutable treatment passed deterministic preflight",
+            prepared_revision=prepared,
+            usage=usage,
+            preflight=preflight,
+        )
+
+    def finalize_progressive(
+        self,
+        idea: IdeaRecord,
+        *,
+        spec: ResearchSpec,
+        run: RunRecord,
+    ) -> PromotionOutcome:
+        """Apply the final scientific gate to the already completed B2 Run."""
+
+        benchmark_root, compatibility = self._persist_contract(idea, spec)
+        raw_path = Path(run.output_dir) / "benchmark-result.json"
+        benchmark_result = _read_json(raw_path)
+        execution_passed = bool(
+            compatibility.passed
+            and run.status is RunStatus.SUCCEEDED
+            and str(benchmark_result.get("status", "")).casefold()
+            in {"ok", "success", "succeeded", "passed"}
+        )
+        logits_cache = (
+            Path(self.config.logits_cache).expanduser().resolve()
+            if self.config.logits_cache
+            else None
+        )
+        treatment_path = benchmark_root / "treatment.py"
+        provenance = {
+            "idea_id": idea.idea_id,
+            "revision": run.revision,
+            "run_id": run.run_id,
+            "budget": run.budget.value,
+            "research_spec_sha256": sha256_path(
+                benchmark_root / "research_spec.json"
+            ),
+            "treatment_sha256": (
+                sha256_path(treatment_path)
+                if treatment_path.is_file()
+                else ""
+            ),
+            "benchmark_plan_sha256": sha256_path(
+                benchmark_root / "benchmark_plan.json"
+            ),
+            "benchmark_profile_version": self.profile.version,
+            "benchmark_id": self.config.benchmark_id,
+            "logits_cache_sha256": (
+                sha256_path(logits_cache)
+                if logits_cache is not None and logits_cache.is_file()
+                else ""
+            ),
+            "evidence_partition": "B2",
+        }
+        outcome = review_benchmark_result(
+            spec=spec,
+            benchmark_result=benchmark_result,
+            execution_passed=execution_passed,
+            minimum_effect=max(
+                self.config.minimum_effect,
+                self.profile.minimum_effect_for(spec.primary_metric),
+            ),
+            execution_error=run.error,
+            usage={"benchmark": dict(run.result.get("usage", {}) or {})},
+            provenance=provenance,
+        )
+        self.store.write_json_atomic(
+            benchmark_root / "final_review.json",
+            outcome.to_dict(),
+        )
+        if raw_path.is_file():
+            shutil.copy2(raw_path, benchmark_root / "result.json")
+        self.store.event(
+            "benchmark_completed",
+            idea_id=idea.idea_id,
+            run_id=run.run_id,
+            execution_passed=outcome.execution_passed,
+            scientific_valid=outcome.scientific_valid,
+            hypothesis_supported=outcome.hypothesis_supported,
+            promotion_decision=outcome.promotion_decision,
+            reason=outcome.reason,
+            reused_progressive_b2=True,
+        )
+        return outcome
+
+    async def promote(
+        self,
+        idea: IdeaRecord,
+        *,
+        spec: ResearchSpec,
+    ) -> PromotionOutcome:
+        benchmark_root, compatibility = self._persist_contract(idea, spec)
         if not compatibility.passed:
             outcome = PromotionOutcome(
                 execution_passed=False,
@@ -236,62 +548,12 @@ class BenchmarkPromotionBridge:
                 errors=list(compatibility.errors),
             )
             return outcome
-        usage: dict[str, Any] = {}
-        feedback = ""
-        source = ""
-        preflight: dict[str, Any] = {}
-        for attempt in range(self.config.max_treatment_repairs + 1):
-            try:
-                source, current_usage = self.treatment_worker.build(
-                    idea,
-                    spec=spec,
-                    feedback=feedback,
-                )
-            except Exception as exc:  # noqa: BLE001
-                preflight = {
-                    "passed": False,
-                    "errors": [
-                        (
-                            "treatment generation failed validation: "
-                            f"{type(exc).__name__}: {exc}"
-                        )
-                    ],
-                }
-                self.store.write_json_atomic(
-                    benchmark_root / f"preflight-{attempt + 1:02d}.json",
-                    preflight,
-                )
-                # StructuredRole already performs its own bounded repair. A
-                # thrown exception means there is no usable source or metered
-                # result object to retry safely here.
-                break
-            _merge_usage(usage, current_usage)
-            source_errors = validate_treatment_source(source)
-            treatment_path = benchmark_root / "treatment.py"
-            treatment_path.write_text(source, encoding="utf-8")
-            if source_errors:
-                preflight = {
-                    "passed": False,
-                    "errors": source_errors,
-                }
-            else:
-                preflight = preflight_treatment(
-                    treatment_path,
-                    examples=self.config.preflight_examples,
-                    classes=self.config.preflight_classes,
-                    timeout_sec=self.config.preflight_timeout_sec,
-                )
-            self.store.write_json_atomic(
-                benchmark_root / f"preflight-{attempt + 1:02d}.json",
-                preflight,
-            )
-            if preflight.get("passed"):
-                break
-            feedback = (
-                "Treatment preflight failed. Return a complete corrected "
-                f"treatment. Diagnostics: {json.dumps(preflight, ensure_ascii=False)}"
-            )
-        if not preflight.get("passed"):
+        treatment_path, usage, preflight = self._prepare_treatment(
+            idea,
+            spec=spec,
+            benchmark_root=benchmark_root,
+        )
+        if treatment_path is None:
             outcome = PromotionOutcome(
                 execution_passed=False,
                 scientific_valid=False,
@@ -322,7 +584,7 @@ class BenchmarkPromotionBridge:
         output_dir = benchmark_root / "output"
         runtime_config = build_promoted_benchmark_config(
             template_path=self.config.benchmark_config,
-            treatment_path=benchmark_root / "treatment.py",
+            treatment_path=treatment_path,
             output_dir=output_dir,
             destination=benchmark_root / "benchmark-config.yaml",
         )

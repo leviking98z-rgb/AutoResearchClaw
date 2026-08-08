@@ -217,6 +217,80 @@ benchmark:
     assert result.evidence["argmax"]["argmax_preserved"] is True
 
 
+def test_logits_cache_supports_selected_subset_of_frozen_pairing_seeds(
+    tmp_path,
+) -> None:
+    treatment = tmp_path / "treatment.py"
+    treatment.write_text(
+        """
+class Identity:
+    def fit(self, calibration_logits, calibration_labels):
+        return {}
+
+    def transform(self, logits, state):
+        return logits
+
+
+def build_treatment():
+    return Identity()
+""".lstrip()
+    )
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""
+benchmark:
+  cache_dir: {tmp_path / "cache"}
+  output_dir: {tmp_path / "output"}
+  treatment_path: {treatment}
+  examples: 4
+  calibration_examples: 4
+  pairing_seeds: [101, 103, 17, 29]
+  seeds: [17, 29]
+  corruption: gaussian_noise
+  corruption_severity: 0.04
+  ece_bins: 3
+  require_cuda: true
+  device: cuda
+""".lstrip()
+    )
+    rng = np.random.default_rng(9)
+    arrays = {}
+    for seed in (101, 103, 17, 29):
+        arrays[f"calibration_logits_{seed}"] = rng.normal(size=(4, 3))
+        arrays[f"calibration_labels_{seed}"] = np.asarray([0, 1, 2, 0])
+        arrays[f"evaluation_logits_{seed}"] = rng.normal(size=(4, 3))
+        arrays[f"evaluation_labels_{seed}"] = np.asarray([0, 1, 2, 0])
+    metadata = {
+        "schema_version": 4,
+        "seeds": [101, 103, 17, 29],
+        "selected_seeds": [17, 29],
+        "ece_bins": 3,
+        "assets": {"model_name": "fake"},
+        "provenance": {
+            "corruption": "gaussian_noise",
+            "corruption_severity": 0.04,
+            "examples": 4,
+            "calibration_examples": 4,
+            "calibration_split": "clean",
+            "evaluation_split": "corrupted",
+            "pairing_strategy": "disjoint_example_blocks",
+            "pairing_seeds": [101, 103, 17, 29],
+        },
+    }
+    cache = tmp_path / "partitioned-logits.npz"
+    np.savez_compressed(
+        cache,
+        metadata_json=np.asarray(json.dumps(metadata)),
+        **arrays,
+    )
+
+    result = run_from_logits_cache(config, cache_path=cache)
+
+    assert [row["seed"] for row in result.per_seed] == [17, 29]
+    assert result.evidence["protocol"]["independent_pairs"] == 2
+    assert result.provenance["pairing_seeds"] == [101, 103, 17, 29]
+
+
 def test_cli_builds_reusable_logits_cache(
     tmp_path,
     monkeypatch,

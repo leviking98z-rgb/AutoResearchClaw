@@ -94,7 +94,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--logits-cache",
         type=Path,
-        help="Optional trusted five-seed cache; omit to exercise real GPU runs.",
+        help=(
+            "Optional trusted partitioned cache; omit to exercise real GPU "
+            "runs."
+        ),
     )
     parser.add_argument(
         "--allow-dirty",
@@ -414,13 +417,13 @@ def _queue_config(
             "max_active_ideas": settings["max_active_ideas"],
             "max_total_ideas": idea_count,
             "max_total_tokens": args.token_budget,
-            "max_revisions_per_idea": 2,
-            "max_runs_per_budget": 2,
+            "max_revisions_per_idea": 1,
+            "max_runs_per_budget": 1,
             "max_steps_per_idea": 10,
             "max_infra_retries": 0,
             "max_prepare_repairs": 1,
             "duplicate_threshold": 0.95,
-            "required_paths": [] if direct else ["revise", "b2"],
+            "required_paths": [] if direct else ["b2"],
         },
         "concurrency": {
             "max_llm_jobs": settings["max_llm_jobs"],
@@ -472,6 +475,7 @@ def _queue_config(
             "logits_cache": str(logits_cache or ""),
             "prefer_logits_cache": logits_cache is not None,
             "direct_all_admitted": direct,
+            "progressive_pilot": True,
         },
         "research_memory": {"enabled": False},
         "gpu": {
@@ -500,17 +504,26 @@ def _queue_config(
             "B0": {
                 "gpus": 0,
                 "timeout_sec": 120,
-                "parameters": {"examples": 128, "seeds": 4},
+                "parameters": {
+                    "evidence_partition": "pilot-b0",
+                    "seeds": [101, 103],
+                },
             },
             "B1": {
                 "gpus": 0,
                 "timeout_sec": 240,
-                "parameters": {"examples": 512, "seeds": 8},
+                "parameters": {
+                    "evidence_partition": "pilot-b1",
+                    "seeds": [107, 109, 113],
+                },
             },
             "B2": {
                 "gpus": 0,
                 "timeout_sec": 480,
-                "parameters": {"examples": 1024, "seeds": 16},
+                "parameters": {
+                    "evidence_partition": "confirmatory-b2",
+                    "seeds": [17, 29, 43, 59, 71],
+                },
             },
         },
     }
@@ -527,6 +540,7 @@ def _synthetic_benchmark(
         "treatment_path": str(run_root / "placeholder-treatment.py"),
         "examples": 64,
         "calibration_examples": 64,
+        "pairing_seeds": [101, 103, 107, 109, 113, 17, 29, 43, 59, 71],
         "seeds": [17, 29, 43, 59, 71],
         "corruption": "gaussian_noise",
         "corruption_severity": 0.04,
@@ -565,7 +579,8 @@ def _real_benchmark(
 
 
 def _build_synthetic_logits_cache(path: Path) -> None:
-    seeds = [17, 29, 43, 59, 71]
+    seeds = [101, 103, 107, 109, 113, 17, 29, 43, 59, 71]
+    selected_seeds = [17, 29, 43, 59, 71]
     examples = 64
     classes = 10
     labels = np.arange(examples, dtype=np.int64) % classes
@@ -582,8 +597,9 @@ def _build_synthetic_logits_cache(path: Path) -> None:
         )
         arrays[f"evaluation_labels_{seed}"] = labels
     metadata = {
-        "schema_version": 3,
+        "schema_version": 4,
         "seeds": seeds,
+        "selected_seeds": selected_seeds,
         "ece_bins": 10,
         "assets": {
             "fixture": "uniform-logits-v1",
@@ -597,6 +613,7 @@ def _build_synthetic_logits_cache(path: Path) -> None:
             "calibration_split": "clean",
             "evaluation_split": "corrupted",
             "pairing_strategy": "disjoint_example_blocks",
+            "pairing_seeds": seeds,
         },
     }
     arrays["metadata_json"] = np.asarray(

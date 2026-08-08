@@ -1031,6 +1031,14 @@ Choose exactly one:
   should change.
 - conclude: positive, negative, or inconclusive.
 
+If LIMITS.progressive_pilot is true:
+- every budget is a different frozen, disjoint evidence partition for the same
+  immutable treatment;
+- B2 is the confirmatory benchmark and is finalized by deterministic gates;
+- never choose run_more when successful_runs_current_budget is already
+  max_runs_per_budget;
+- do not request revision when max_revisions_per_idea is already reached.
+
 Do not choose an action whose minimum required remaining steps exceed
 LIMITS.remaining_steps_after_review:
 - run_more needs 1 additional step (Run);

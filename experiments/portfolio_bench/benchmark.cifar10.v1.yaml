@@ -15,6 +15,9 @@ benchmark:
   model_name: cifar10_resnet20
   examples: 500
   calibration_examples: 500
+  # B0/B1 and final B2 select disjoint subsets from this one frozen pairing
+  # universe.  The final five seeds remain the public confirmatory benchmark.
+  pairing_seeds: [101, 103, 107, 109, 113, 17, 29, 43, 59, 71]
   seeds: [17, 29, 43, 59, 71]
   corruption: gaussian_noise
   corruption_severity: 0.04

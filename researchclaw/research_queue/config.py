@@ -110,6 +110,7 @@ class BenchmarkPromotionConfig:
     logits_cache: str = ""
     prefer_logits_cache: bool = True
     direct_all_admitted: bool = False
+    progressive_pilot: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +351,9 @@ class ResearchQueueConfig:
             direct_all_admitted=bool(
                 promotion_raw.get("direct_all_admitted", False)
             ),
+            progressive_pilot=bool(
+                promotion_raw.get("progressive_pilot", False)
+            ),
         )
         memory_raw = _mapping(data.get("research_memory"), "research_memory")
         research_memory = ResearchMemoryConfig(
@@ -536,6 +540,64 @@ class ResearchQueueConfig:
                     "direct_all_admitted requires max_promotions >= "
                     "limits.max_total_ideas"
                 )
+            if self.promotion.progressive_pilot:
+                if self.promotion.benchmark_id != "cifar10_calibration":
+                    raise ValueError(
+                        "progressive_pilot currently supports only "
+                        "cifar10_calibration"
+                    )
+                if self.limits.max_runs_per_budget != 1:
+                    raise ValueError(
+                        "progressive_pilot requires max_runs_per_budget=1; "
+                        "repeating an immutable budget partition is not "
+                        "independent evidence"
+                    )
+                if self.limits.max_revisions_per_idea != 1:
+                    raise ValueError(
+                        "progressive_pilot requires max_revisions_per_idea=1 "
+                        "so B0/B1/B2 evaluate one immutable treatment"
+                    )
+                final_seeds = tuple(benchmark.seeds)
+                pairing_seeds = tuple(
+                    benchmark.pairing_seeds or benchmark.seeds
+                )
+                seen: set[int] = set()
+                for level in BudgetLevel:
+                    raw_seeds = self.budgets[level].parameters.get("seeds")
+                    if (
+                        not isinstance(raw_seeds, (list, tuple))
+                        or not raw_seeds
+                    ):
+                        raise ValueError(
+                            "progressive_pilot requires every budget to "
+                            f"declare a non-empty seeds list; missing "
+                            f"budgets.{level.value}.parameters.seeds"
+                        )
+                    selected = tuple(int(item) for item in raw_seeds)
+                    if len(set(selected)) != len(selected):
+                        raise ValueError(
+                            f"budgets.{level.value}.parameters.seeds contains "
+                            "duplicates"
+                        )
+                    overlap = seen.intersection(selected)
+                    if overlap:
+                        raise ValueError(
+                            "progressive_pilot budget seed partitions overlap: "
+                            + ", ".join(str(item) for item in sorted(overlap))
+                        )
+                    unknown = set(selected) - set(pairing_seeds)
+                    if unknown:
+                        raise ValueError(
+                            f"budgets.{level.value}.parameters.seeds are not "
+                            "present in benchmark pairing_seeds: "
+                            + ", ".join(str(item) for item in sorted(unknown))
+                        )
+                    seen.update(selected)
+                    if level is BudgetLevel.B2 and selected != final_seeds:
+                        raise ValueError(
+                            "progressive_pilot B2 seeds must exactly equal "
+                            "the frozen benchmark seeds"
+                        )
             if self.execution.backend == "clusterbridge":
                 benchmark_path = Path(self.promotion.benchmark_config)
                 if not str(benchmark_path).startswith("/root/shared/"):

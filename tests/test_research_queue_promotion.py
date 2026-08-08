@@ -147,6 +147,15 @@ class NeverTreatmentWorker:
         raise AssertionError("incompatible ResearchSpec reached treatment generation")
 
 
+class CountingTreatmentWorker(StaticTreatmentWorker):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def build(self, idea, *, spec, feedback):
+        self.calls += 1
+        return super().build(idea, spec=spec, feedback=feedback)
+
+
 def test_promotion_bridge_generates_treatment_and_separates_outcome(
     tmp_path,
 ) -> None:
@@ -353,6 +362,123 @@ benchmark:
         (store.idea_dir(idea.idea_id) / "benchmark" / "preflight-01.json").read_text()
     )
     assert "structured treatment invalid" in preflight["errors"][0]
+
+
+def test_progressive_preparation_generates_one_reusable_treatment(
+    tmp_path,
+) -> None:
+    template = tmp_path / "benchmark.yaml"
+    template.write_text(
+        """
+benchmark:
+  cache_dir: cache
+  output_dir: output
+  treatment_path: treatment.py
+  pairing_seeds: [101, 103, 17, 29]
+  seeds: [17, 29]
+  device: cuda
+  require_cuda: true
+""".lstrip()
+    )
+    cache = tmp_path / "trusted-logits.npz"
+    cache.write_bytes(b"trusted")
+    store = ResearchQueueStore(tmp_path / "state")
+    store.initialize()
+    idea = IdeaRecord.from_proposal(
+        IdeaProposal(
+            title="Progressive",
+            question="Does it improve calibration?",
+            hypothesis="It lowers ECE.",
+            treatment="Adaptive calibration.",
+            control="Temperature scaling.",
+            primary_metric="ECE",
+        )
+    )
+    store.upsert_idea(idea)
+    spec = ResearchSpec(
+        question=idea.question,
+        hypothesis=idea.hypothesis,
+        treatment=idea.treatment,
+        control=idea.control,
+        primary_metric="ece",
+        metric_direction=MetricDirection.MINIMIZE,
+        guardrails=("accuracy unchanged", "NLL no worse"),
+        validity_conditions=("frozen held-out split",),
+        compute_matching=("same model logits",),
+        stopping_rules=("reject invalid evidence",),
+        benchmark_id="cifar10_calibration",
+        treatment_api=TREATMENT_API,
+        minimum_effect=0.001,
+        minimum_pairs=2,
+        primary_requires_effect_ci=True,
+        guardrail_metrics=(
+            MetricGuardrail(
+                metric="accuracy",
+                direction=MetricDirection.MAXIMIZE,
+                relation=MetricRelation.EQUAL,
+                per_pair=True,
+            ),
+            MetricGuardrail(
+                metric="nll",
+                direction=MetricDirection.MINIMIZE,
+                require_effect_ci=True,
+            ),
+        ),
+        calibration_split="clean",
+        evaluation_split="corrupted",
+        pairing_strategy="disjoint_example_blocks",
+        require_per_example_argmax=True,
+        required_compute_accounting=(
+            "calibration_examples",
+            "evaluation_examples",
+            "model_forward_examples",
+        ),
+    )
+    worker = CountingTreatmentWorker()
+    bridge = BenchmarkPromotionBridge(
+        config=BenchmarkPromotionConfig(
+            enabled=True,
+            benchmark_config=str(template),
+            runtime_python="/node-only/python",
+            logits_cache=str(cache),
+            prefer_logits_cache=True,
+            preflight_timeout_sec=5,
+            progressive_pilot=True,
+        ),
+        store=store,
+        treatment_worker=worker,
+        run_backend=RecordingBenchmarkBackend(),
+        max_gpus_per_run=1,
+    )
+
+    first = bridge.prepare_progressive_revision(
+        idea,
+        spec=spec,
+        revision=1,
+        timeout_sec=60,
+    )
+    resumed = bridge.prepare_progressive_revision(
+        idea,
+        spec=spec,
+        revision=1,
+        timeout_sec=60,
+    )
+
+    assert first.passed is True
+    assert resumed.passed is True
+    assert worker.calls == 1
+    assert first.prepared_revision is not None
+    assert resumed.prepared_revision is not None
+    assert first.prepared_revision.requested_gpus == 0
+    assert first.prepared_revision.command[0] == sys.executable
+    assert (
+        "researchclaw.research_queue.progressive_benchmark_runner"
+        in first.prepared_revision.command
+    )
+    assert first.prepared_revision.plan["treatment_sha256"] == (
+        resumed.prepared_revision.plan["treatment_sha256"]
+    )
+    assert resumed.usage == {}
 
 
 def test_offline_review_rejects_successful_execution_with_insufficient_evidence() -> (

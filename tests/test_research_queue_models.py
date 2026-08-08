@@ -170,6 +170,55 @@ def test_config_rejects_single_seed_confirmatory_benchmark(tmp_path) -> None:
         raise AssertionError("single-seed benchmark should fail validation")
 
 
+def test_progressive_config_requires_disjoint_seed_partitions(tmp_path) -> None:
+    benchmark = tmp_path / "benchmark.yaml"
+    benchmark.write_text(
+        """
+benchmark:
+  pairing_seeds: [101, 103, 107, 17, 29]
+  seeds: [17, 29]
+""".lstrip()
+    )
+    base = {
+        "scientific_gate": {"enabled": True},
+        "promotion": {
+            "enabled": True,
+            "benchmark_id": "cifar10_calibration",
+            "benchmark_config": str(benchmark),
+            "progressive_pilot": True,
+        },
+        "limits": {
+            "max_revisions_per_idea": 1,
+            "max_runs_per_budget": 1,
+        },
+        "budgets": {
+            "B0": {"parameters": {"seeds": [101]}},
+            "B1": {"parameters": {"seeds": [103, 107]}},
+            "B2": {"parameters": {"seeds": [17, 29]}},
+        },
+    }
+
+    config = ResearchQueueConfig.from_mapping({"research_queue": base})
+
+    assert config.promotion.progressive_pilot is True
+    assert config.budgets[BudgetLevel.B2].parameters["seeds"] == [17, 29]
+
+    overlapping = {
+        **base,
+        "budgets": {
+            "B0": {"parameters": {"seeds": [101]}},
+            "B1": {"parameters": {"seeds": [101, 107]}},
+            "B2": {"parameters": {"seeds": [17, 29]}},
+        },
+    }
+    try:
+        ResearchQueueConfig.from_mapping({"research_queue": overlapping})
+    except ValueError as exc:
+        assert "partitions overlap" in str(exc)
+    else:
+        raise AssertionError("overlapping progressive partitions should fail")
+
+
 def test_static_idea_producer_reports_exhaustion() -> None:
     proposal = IdeaProposal(
         title="Finite",

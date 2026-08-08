@@ -77,6 +77,11 @@ class BenchmarkConfig:
     examples: int = 1000
     calibration_examples: int = 1000
     seeds: tuple[int, ...] = (17, 29, 43)
+    # ``pairing_seeds`` freezes the complete disjoint block assignment while
+    # ``seeds`` selects the evidence partition evaluated by one run.  They are
+    # identical for legacy one-shot benchmarks.  Progressive pilots may use
+    # disjoint seed subsets without changing the final confirmatory blocks.
+    pairing_seeds: tuple[int, ...] = ()
     corruption: str = "gaussian_noise"
     corruption_severity: float = 0.12
     batch_size: int = 256
@@ -104,6 +109,23 @@ class BenchmarkConfig:
             seeds = tuple(range(seeds_raw))
         else:
             seeds = tuple(int(item) for item in seeds_raw)
+        pairing_raw = value.get("pairing_seeds", seeds)
+        if isinstance(pairing_raw, int):
+            pairing_seeds = tuple(range(pairing_raw))
+        else:
+            pairing_seeds = tuple(int(item) for item in pairing_raw)
+        seeds = seeds or (17,)
+        pairing_seeds = pairing_seeds or seeds
+        if len(set(seeds)) != len(seeds):
+            raise ContractError("benchmark seeds must be unique")
+        if len(set(pairing_seeds)) != len(pairing_seeds):
+            raise ContractError("benchmark pairing_seeds must be unique")
+        missing_seeds = set(seeds) - set(pairing_seeds)
+        if missing_seeds:
+            raise ContractError(
+                "benchmark seeds must be a subset of pairing_seeds; missing "
+                + ", ".join(str(item) for item in sorted(missing_seeds))
+            )
         return cls(
             cache_dir=resolved("cache_dir", "cache"),
             output_dir=resolved("output_dir", "output"),
@@ -130,7 +152,8 @@ class BenchmarkConfig:
             dataset_format=str(value.get("dataset_format", "parquet")),
             examples=max(1, int(value.get("examples", 1000))),
             calibration_examples=max(1, int(value.get("calibration_examples", 1000))),
-            seeds=seeds or (17,),
+            seeds=seeds,
+            pairing_seeds=pairing_seeds,
             corruption=str(value.get("corruption", "gaussian_noise")),
             corruption_severity=float(value.get("corruption_severity", 0.12)),
             batch_size=max(1, int(value.get("batch_size", 256))),
@@ -757,6 +780,12 @@ def _disjoint_pair_indices(
     return pairs
 
 
+def _pairing_seed_universe(config: BenchmarkConfig) -> tuple[int, ...]:
+    """Return the frozen seed universe used to assign disjoint data blocks."""
+
+    return tuple(config.pairing_seeds or config.seeds)
+
+
 class Cifar10CalibrationAdapter:
     def __init__(self, config: BenchmarkConfig) -> None:
         self.config = config
@@ -806,7 +835,7 @@ class Cifar10CalibrationAdapter:
         )
         pairs = _disjoint_pair_indices(
             total_examples=len(labels),
-            seeds=self.config.seeds,
+            seeds=_pairing_seed_universe(self.config),
             calibration_examples=self.config.calibration_examples,
             evaluation_examples=self.config.examples,
         )
@@ -961,13 +990,14 @@ def build_logits_cache(
     )
     pairs = _disjoint_pair_indices(
         total_examples=len(labels),
-        seeds=config.seeds,
+        seeds=_pairing_seed_universe(config),
         calibration_examples=config.calibration_examples,
         evaluation_examples=config.examples,
     )
     adapter = Cifar10CalibrationAdapter(config)
     arrays: dict[str, np.ndarray] = {}
-    for seed in config.seeds:
+    pairing_seeds = _pairing_seed_universe(config)
+    for seed in pairing_seeds:
         calibration_indices, evaluation_indices = pairs[seed]
         arrays[f"calibration_logits_{seed}"] = adapter._infer(
             model,
@@ -991,8 +1021,11 @@ def build_logits_cache(
     destination = Path(cache_path).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
-        "schema_version": 3,
-        "seeds": list(config.seeds),
+        "schema_version": 4,
+        # ``seeds`` remains the list of arrays physically available in the
+        # cache for backward-compatible readers.
+        "seeds": list(pairing_seeds),
+        "selected_seeds": list(config.seeds),
         "ece_bins": config.ece_bins,
         "assets": {
             **dataset_assets,
@@ -1012,6 +1045,7 @@ def build_logits_cache(
                 else "corrupted"
             ),
             "pairing_strategy": "disjoint_example_blocks",
+            "pairing_seeds": list(pairing_seeds),
         },
         "usage": {
             "device": str(device),
@@ -1067,12 +1101,32 @@ def run_from_logits_cache(
         ),
         "pairing_strategy": "disjoint_example_blocks",
     }
-    if metadata.get("provenance") != expected:
+    provenance = metadata.get("provenance", {})
+    if not isinstance(provenance, dict) or any(
+        provenance.get(name) != expected_value
+        for name, expected_value in expected.items()
+    ):
         raise ContractError(
             "logits cache provenance does not match benchmark configuration"
         )
-    if tuple(metadata.get("seeds", ())) != tuple(config.seeds):
-        raise ContractError("logits cache seeds do not match benchmark configuration")
+    cached_seeds = tuple(int(item) for item in metadata.get("seeds", ()))
+    cached_pairing_seeds = tuple(
+        int(item)
+        for item in provenance.get(
+            "pairing_seeds",
+            cached_seeds,
+        )
+    )
+    if cached_pairing_seeds != _pairing_seed_universe(config):
+        raise ContractError(
+            "logits cache pairing_seeds do not match benchmark configuration"
+        )
+    missing_seeds = set(config.seeds) - set(cached_seeds)
+    if missing_seeds:
+        raise ContractError(
+            "logits cache does not contain requested seeds: "
+            + ", ".join(str(item) for item in sorted(missing_seeds))
+        )
     treatment = _load_treatment(config.treatment_path)
     rows: list[dict[str, Any]] = []
     for seed in config.seeds:
@@ -1123,6 +1177,7 @@ def run_from_logits_cache(
                 else "corrupted"
             ),
             "pairing_strategy": "disjoint_example_blocks",
+            "pairing_seeds": list(_pairing_seed_universe(config)),
             "logits_cache_sha256": sha256_path(cache_path),
         },
         artifacts=[str(result_path)],

@@ -8,7 +8,8 @@ outcomes completed inside a fixed wall-time window.
 
 - `ideas.v1.json`: 16 versioned calibration Ideas.
 - `benchmark.cifar10.v1.yaml`: pinned CIFAR-10/ResNet20 corruption protocol
-  with five independent seed pairs.
+  with ten disjoint seed pairs: two for B0, three for B1, and five for the
+  confirmatory B2 result.
 - The runner records the Git commit and SHA-256 of the Idea pool, Benchmark,
   model config, and rendered Queue config.
 
@@ -18,7 +19,7 @@ outcomes completed inside a fixed wall-time window.
 |---|---|
 | `rq-sequential` | Same Queue and scientific gate, one active Idea/Run |
 | `rq-no-early-exit` | Four active Ideas, every Idea goes directly to the frozen Benchmark |
-| `rq-full` | Four asynchronous Ideas with B0/B1/B2 early exit and dynamic promotion |
+| `rq-full` | Four asynchronous Ideas with disjoint B0/B1 evidence, confirmatory B2, and dynamic promotion |
 
 The direct variant is an ablation, not the normal production configuration.
 The AutoResearchClaw loop adapter remains a separate baseline TODO because it
@@ -27,7 +28,7 @@ by its incompatible legacy “paper generated” terminal state.
 
 ## Fast deterministic smoke
 
-This runs the full state machine, revisions, budgets, scientific gate,
+This runs the full state machine, budgets, scientific gate,
 BenchmarkProfile compatibility check, treatment preflight, logits-cache
 adapter, VCO aggregation, and cross-variant comparison without LLM/GPU cost:
 
@@ -46,8 +47,23 @@ result.
 
 Real mode uses the configured three model roles and ClusterBridge. It copies
 the exact source commit to the shared run directory so remote nodes execute the
-same code. With no `--logits-cache`, each promoted treatment requests one GPU
-on demand. With a trusted five-seed cache, treatment evaluation is CPU-only.
+same code. With no `--logits-cache`, each treatment requests one GPU on
+demand. With a trusted partitioned cache, treatment evaluation is CPU-only.
+
+The LLM generates `ResearchSpec` and one narrow `treatment.py` exactly once.
+Framework-owned runner code evaluates that same treatment and metric on:
+
+```text
+B0 pilot          seeds [101, 103]
+B1 pilot          seeds [107, 109, 113]
+B2 confirmatory   seeds [17, 29, 43, 59, 71]
+```
+
+The ten blocks are assigned from one frozen `pairing_seeds` universe, so
+changing the selected budget subset does not change or overlap the final B2
+data. `run_more` and treatment revision are disabled in this benchmark:
+repeating an identical partition is not independent evidence, and revising
+after seeing pilot labels would invalidate reuse of earlier evidence.
 
 Build that cache once with the frozen adapter on a GPU node:
 
@@ -71,6 +87,7 @@ python experiments/portfolio_bench/run.py \
   --duration-sec 7200 \
   --token-budget 1200000 \
   --max-gpus 8 \
+  --logits-cache /root/shared/path/to/cifar10-partitioned-v1-logits.npz \
   --repeat 1
 ```
 
