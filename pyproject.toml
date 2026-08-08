@@ -34,6 +34,7 @@ researchclaw-factory = "researchclaw.factory.cli:main"
 researchclaw-factory-dashboard = "researchclaw.factory.dashboard:main"
 autoresearch-v2 = "researchclaw.autoresearch_v2.cli:main"
 autoresearch-v2-dashboard = "researchclaw.autoresearch_v2.dashboard:main"
+research-queue = "researchclaw.research_queue.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["researchclaw", "sibyl", "arc"]

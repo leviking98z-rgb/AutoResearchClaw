@@ -1,0 +1,85 @@
+research_queue:
+  enabled: false
+  system_id: research-queue-prototype
+  state_dir: workspace/research-queue-prototype
+
+  # Use either inline brief or brief_file.
+  brief: >-
+    Study a small, falsifiable computational research question. Prefer cheap
+    experiments with a clear treatment, compute-matched control, and one
+    primary metric.
+  brief_file: ""
+
+  limits:
+    candidate_target: 6
+    generation_batch_size: 2
+    max_active_ideas: 4
+    # Zero means continuous. Set a finite number for --until-idle tests.
+    max_total_ideas: 0
+    max_revisions_per_idea: 2
+    max_runs_per_budget: 2
+    max_steps_per_idea: 10
+    max_infra_retries: 1
+    duplicate_threshold: 0.78
+
+  concurrency:
+    max_llm_jobs: 2
+    max_run_jobs: 4
+    poll_interval_sec: 0.1
+
+  models:
+    researchclaw_config: config.rsi.yaml
+    decision_role: research_director
+    worker_role: coding_engineer
+    utility_role: literature_researcher
+
+  execution:
+    # local is enough for prototype development. clusterbridge reuses the
+    # existing elastic resource-manager adapter.
+    backend: local
+    python_executable: python
+    # true uses deterministic Idea/Prepare/Review workers and spends no tokens.
+    simulation: true
+
+  gpu:
+    # Logical maximum. local mode only simulates slots; clusterbridge mode
+    # requests real capacity only while a prepared Run is waiting/running.
+    max_total_gpus: 4
+    max_gpus_per_run: 2
+    poll_interval_sec: 1
+    pass_env: []
+    resource_manager:
+      owner: ""
+      cb_command: /root/shared/.clusters/.tools/clusterbridge.sh
+      project: ResearchQueuePrototype
+      purpose: Continuous Research Queue prototype runs
+      max_gpus: 4
+      duration_min: 120
+      renew_ttl_min: 120
+      renew_interval_sec: 300
+      reconcile_interval_sec: 2
+      allow_cross_cluster: true
+      gpu_type: H20
+      priority: normal
+      release_on_shutdown: true
+      log_root: /root/shared/.clusters/.tmp/research-queue-prototype
+
+  budgets:
+    B0:
+      gpus: 1
+      timeout_sec: 120
+      parameters:
+        examples: 8
+        seeds: 1
+    B1:
+      gpus: 2
+      timeout_sec: 600
+      parameters:
+        examples: 32
+        seeds: 2
+    B2:
+      gpus: 2
+      timeout_sec: 1800
+      parameters:
+        examples: 64
+        seeds: 3
