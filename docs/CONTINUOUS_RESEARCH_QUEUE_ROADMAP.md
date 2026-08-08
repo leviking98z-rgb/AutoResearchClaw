@@ -606,3 +606,27 @@ P2 功能只有在真实日志证明存在明确瓶颈时才实现。
 
 如果新设计需要重新引入大量 Stage、Actor、DAG、Agent 或状态副本，
 默认视为架构回退，必须先用生产日志证明其必要性。
+
+---
+
+## 9. 核心 Benchmark TODO
+
+核心架构评测已经冻结为 `PortfolioBench-2h`：
+
+```text
+固定 Idea 池
++ 相同 2 小时 / Token / GPU 上限
++ AutoResearchClaw-loop、RQ-Sequential、RQ-NoEarlyExit、RQ-Full
+→ 比较 Valid Conclusive Outcomes
+```
+
+唯一 headline 指标：
+
+```text
+VCO@2h = 两小时内完成的科学有效且结论明确的研究结果数量
+```
+
+必要辅助指标为 TTFV、Tokens/VCO、GPU-sec/VCO 和 False Accept Rate。
+完整协议、对比组、公平性约束、Evidence-Pack 评测和实施清单见：
+
+[`PORTFOLIO_BENCHMARK_TODO.md`](PORTFOLIO_BENCHMARK_TODO.md)。
