@@ -689,7 +689,7 @@ class Cifar10CalibrationAdapter:
             device=device,
         ).view(1, 3, 1, 1)
         std = torch.tensor(
-            [0.2470, 0.2435, 0.2616],
+            [0.2023, 0.1994, 0.2010],
             dtype=torch.float32,
             device=device,
         ).view(1, 3, 1, 1)
