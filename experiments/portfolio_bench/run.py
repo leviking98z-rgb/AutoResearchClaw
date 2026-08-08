@@ -126,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     suite_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
-    suite_root = args.shared_root.expanduser().resolve() / suite_id
+    suite_root = _lexical_absolute(args.shared_root) / suite_id
     suite_root.mkdir(parents=True, exist_ok=False)
     suite_manifest = {
         "schema_version": 1,
@@ -212,9 +212,7 @@ def _run_variant(
     run_id = f"{variant}-r{repeat:02d}"
     run_root = suite_root / run_id
     run_root.mkdir(parents=True, exist_ok=False)
-    state_dir = (
-        args.state_root.expanduser().resolve() / suite_id / run_id
-    )
+    state_dir = _lexical_absolute(args.state_root) / suite_id / run_id
     artifact_dir = run_root / "artifacts"
     ideas_path = run_root / "ideas.json"
     _write_json(ideas_path, ideas)
@@ -230,14 +228,14 @@ def _run_variant(
         )
     else:
         logits_cache = (
-            args.logits_cache.expanduser().resolve()
+            _lexical_absolute(args.logits_cache)
             if args.logits_cache is not None
             else None
         )
         benchmark = _real_benchmark(
             template=args.benchmark_template,
             run_root=run_root,
-            cache_root=args.real_cache_root.expanduser().resolve(),
+            cache_root=_lexical_absolute(args.real_cache_root),
         )
     benchmark_path.write_text(
         yaml.safe_dump(
@@ -323,6 +321,24 @@ def _run_variant(
         )
     ended = datetime.now(UTC)
     after = _resource_status() if args.mode == "real" else {}
+    manifest.update(
+        {
+            "returncode": completed.returncode,
+            "started_at": started.isoformat(),
+            "ended_at": ended.isoformat(),
+            "wall_seconds": (ended - started).total_seconds(),
+            "resource_status_after": after,
+            "resource_released": (
+                _resources_released(after) if args.mode == "real" else True
+            ),
+        }
+    )
+    _write_json(run_root / "manifest.json", manifest)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"{run_id} failed with return code {completed.returncode}; "
+            f"see {run_root / 'controller.log'}"
+        )
     if completed.returncode == 0:
         subprocess.run(
             [
@@ -355,23 +371,8 @@ def _run_variant(
         run_root / "portfolio",
         dirs_exist_ok=True,
     )
-    manifest.update(
-        {
-            "returncode": completed.returncode,
-            "started_at": started.isoformat(),
-            "ended_at": ended.isoformat(),
-            "wall_seconds": (ended - started).total_seconds(),
-            "resource_status_after": after,
-            "resource_released": _resources_released(after),
-            "portfolio_summary": report["summary"],
-        }
-    )
+    manifest["portfolio_summary"] = report["summary"]
     _write_json(run_root / "manifest.json", manifest)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            f"{run_id} failed with return code {completed.returncode}; "
-            f"see {run_root / 'controller.log'}"
-        )
     if args.mode == "real" and not manifest["resource_released"]:
         raise RuntimeError(f"{run_id} left a GPU allocation or request behind")
     return report
@@ -746,6 +747,12 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _lexical_absolute(path: Path) -> Path:
+    """Make a path absolute without resolving the /root/shared symlink."""
+
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
 
 
 def _write_json(path: Path, value: Any) -> None:
