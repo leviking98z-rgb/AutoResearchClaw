@@ -4,40 +4,39 @@
 from __future__ import annotations
 
 import json
-import time
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
-from researchclaw.hitl.file_wait import (
-    write_waiting,
-    write_response,
-    poll_for_response,
-    clear_waiting,
+from researchclaw.hitl.checksums import (
+    compute_sha256,
+    generate_manifest,
+    verify_manifest,
+    write_manifest,
 )
+from researchclaw.hitl.cost_guard import CostGuard
+from researchclaw.hitl.diff_view import (
+    diff_from_snapshot,
+    diff_summary,
+    format_diff_stats,
+    side_by_side_diff,
+    unified_diff,
+)
+from researchclaw.hitl.file_wait import (
+    clear_waiting,
+    poll_for_response,
+    write_response,
+    write_waiting,
+)
+from researchclaw.hitl.hooks import HookRegistry
 from researchclaw.hitl.intervention import (
     HumanAction,
     HumanInput,
     PauseReason,
     WaitingState,
 )
-from researchclaw.hitl.cost_guard import CostGuard, CostStatus
-from researchclaw.hitl.diff_view import (
-    unified_diff,
-    side_by_side_diff,
-    diff_summary,
-    format_diff_stats,
-    diff_from_snapshot,
-)
-from researchclaw.hitl.checksums import (
-    compute_sha256,
-    generate_manifest,
-    write_manifest,
-    verify_manifest,
-)
-from researchclaw.hitl.hooks import HookRegistry, HookResult
-
 
 # ══════════════════════════════════════════════════════════════════
 # File-based wait tests
@@ -83,6 +82,26 @@ class TestFileWait:
         t.start()
 
         result = poll_for_response(hitl_dir, poll_interval_sec=0.1, timeout_sec=5)
+        t.join()
+        assert result.action == HumanAction.REJECT
+
+    def test_poll_retries_partially_written_response(self, tmp_path: Path) -> None:
+        hitl_dir = tmp_path / "hitl"
+        hitl_dir.mkdir(parents=True)
+        response_path = hitl_dir / "response.json"
+
+        def delayed_write():
+            response_path.write_text("", encoding="utf-8")
+            time.sleep(0.2)
+            write_response(
+                hitl_dir,
+                HumanInput(action=HumanAction.REJECT, message="complete"),
+            )
+
+        t = threading.Thread(target=delayed_write)
+        t.start()
+
+        result = poll_for_response(hitl_dir, poll_interval_sec=0.05, timeout_sec=2)
         t.join()
         assert result.action == HumanAction.REJECT
 

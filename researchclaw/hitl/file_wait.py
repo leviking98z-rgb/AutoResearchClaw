@@ -16,7 +16,6 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any
 
 from researchclaw.hitl.intervention import (
     HumanAction,
@@ -44,9 +43,11 @@ def write_response(hitl_dir: Path, human_input: HumanInput) -> Path:
     """Write a response file (used by ``attach``, ``approve``, etc)."""
     hitl_dir.mkdir(parents=True, exist_ok=True)
     path = hitl_dir / "response.json"
-    path.write_text(
+    temporary = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+    temporary.write_text(
         json.dumps(human_input.to_dict(), indent=2), encoding="utf-8"
     )
+    temporary.replace(path)
     return path
 
 
@@ -104,7 +105,6 @@ def poll_for_response(
                 "Invalid response file (attempt %d/%d): %s",
                 consecutive_errors, max_consecutive_errors, exc,
             )
-            response_path.unlink(missing_ok=True)
             if consecutive_errors >= max_consecutive_errors:
                 logger.error("Too many invalid response files — aborting poll")
                 break
