@@ -143,6 +143,11 @@ class ResearchSpec:
     guardrail_metrics: tuple[MetricGuardrail, ...] = ()
     minimum_pairs: int = 1
     confidence_level: float = 0.95
+    calibration_split: str = ""
+    evaluation_split: str = ""
+    pairing_strategy: str = ""
+    require_per_example_argmax: bool = False
+    required_compute_accounting: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -153,6 +158,7 @@ class ResearchSpec:
             "validity_conditions",
             "compute_matching",
             "stopping_rules",
+            "required_compute_accounting",
         ):
             value[field_name] = list(value[field_name])
         return value
@@ -207,6 +213,21 @@ class ResearchSpec:
                     0.5,
                     float(value.get("confidence_level", 0.95) or 0.95),
                 ),
+            ),
+            calibration_split=str(
+                value.get("calibration_split", "") or ""
+            ).strip(),
+            evaluation_split=str(
+                value.get("evaluation_split", "") or ""
+            ).strip(),
+            pairing_strategy=str(
+                value.get("pairing_strategy", "") or ""
+            ).strip(),
+            require_per_example_argmax=bool(
+                value.get("require_per_example_argmax", False)
+            ),
+            required_compute_accounting=strings(
+                "required_compute_accounting"
             ),
         )
 

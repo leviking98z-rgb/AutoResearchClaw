@@ -30,6 +30,8 @@ research_queue:
     max_revisions_per_idea: 2
     max_runs_per_budget: 2
     max_steps_per_idea: 10
+    # Startup fails if a declared core path is impossible under the limits.
+    required_paths: [revise, b2]
     max_infra_retries: 1
     # Number of code-generation repairs before an invalid project is isolated.
     max_prepare_repairs: 1
@@ -90,6 +92,9 @@ research_queue:
     # later treatments can be evaluated on CPU without re-requesting a GPU.
     logits_cache: ""
     prefer_logits_cache: true
+    # Benchmark ablation only: bypass B0/B1 and send every admitted Idea to
+    # the frozen benchmark. Keep false for the normal early-exit queue.
+    direct_all_admitted: false
 
   # Best-effort searchable projection. SQLite and Idea artifacts remain the
   # scientific source of truth.

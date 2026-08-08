@@ -28,7 +28,8 @@ from urllib.parse import urlparse
 import numpy as np
 import yaml
 
-RESULT_SCHEMA_VERSION = 2
+RESULT_SCHEMA_VERSION = 4
+BASELINE_OBJECTIVE_EVALUATIONS = 401
 DEFAULT_DATASET_URL = (
     "https://hf-mirror.com/datasets/uoft-cs/cifar10/resolve/main/"
     "plain_text/test-00000-of-00001.parquet"
@@ -144,6 +145,7 @@ class BenchmarkResult:
     metrics: dict[str, float]
     uncertainty: dict[str, Any]
     per_seed: list[dict[str, Any]]
+    evidence: dict[str, Any]
     assets: dict[str, Any]
     usage: dict[str, Any]
     provenance: dict[str, Any]
@@ -272,7 +274,13 @@ def _summarize_rows(
 def _temperature_fit(logits: np.ndarray, labels: np.ndarray) -> float:
     # A deterministic bounded one-dimensional search is sufficient for this
     # fixed baseline and avoids adding scipy as a runtime dependency.
-    candidates = np.exp(np.linspace(math.log(0.05), math.log(10.0), 401))
+    candidates = np.exp(
+        np.linspace(
+            math.log(0.05),
+            math.log(10.0),
+            BASELINE_OBJECTIVE_EVALUATIONS,
+        )
+    )
     best_temperature = 1.0
     best_nll = math.inf
     for temperature in candidates:
@@ -285,6 +293,157 @@ def _temperature_fit(logits: np.ndarray, labels: np.ndarray) -> float:
             best_nll = metrics["nll"]
             best_temperature = float(temperature)
     return best_temperature
+
+
+def _prediction_hash(predictions: np.ndarray) -> str:
+    values = np.asarray(predictions, dtype="<i8")
+    return hashlib.sha256(values.tobytes(order="C")).hexdigest()
+
+
+def _evaluate_pair(
+    *,
+    seed: int,
+    calibration_logits: np.ndarray,
+    calibration_labels: np.ndarray,
+    evaluation_logits: np.ndarray,
+    evaluation_labels: np.ndarray,
+    treatment: Treatment,
+    ece_bins: int,
+) -> dict[str, Any]:
+    """Evaluate one frozen paired comparison and emit audit evidence."""
+
+    temperature = _temperature_fit(calibration_logits, calibration_labels)
+    baseline_logits = evaluation_logits / temperature
+    baseline_metrics = evaluate_probabilities(
+        _softmax(baseline_logits),
+        evaluation_labels,
+        bins=ece_bins,
+    )
+
+    fit_started = time.monotonic()
+    state = treatment.fit(
+        calibration_logits.copy(),
+        calibration_labels.copy(),
+    )
+    fit_seconds = time.monotonic() - fit_started
+    transform_started = time.monotonic()
+    transformed = np.asarray(
+        treatment.transform(evaluation_logits.copy(), state),
+        dtype=np.float64,
+    )
+    transform_seconds = time.monotonic() - transform_started
+    if transformed.shape != evaluation_logits.shape:
+        raise ContractError(
+            "treatment transformed logits must preserve shape "
+            f"{evaluation_logits.shape}, got {transformed.shape}"
+        )
+    if not np.isfinite(transformed).all():
+        raise ContractError("treatment transformed logits contain non-finite values")
+
+    treatment_metrics = evaluate_probabilities(
+        _softmax(transformed),
+        evaluation_labels,
+        bins=ece_bins,
+    )
+    baseline_predictions = baseline_logits.argmax(axis=1)
+    treatment_predictions = transformed.argmax(axis=1)
+    changed = int(np.count_nonzero(baseline_predictions != treatment_predictions))
+    matched_dimensions = (
+        "calibration_examples",
+        "evaluation_examples",
+        "model_forward_examples",
+    )
+    calibration_count = len(calibration_labels)
+    evaluation_count = len(evaluation_labels)
+    model_forward_examples = calibration_count + evaluation_count
+    return {
+        "seed": seed,
+        "temperature": temperature,
+        "baseline": baseline_metrics,
+        "treatment": treatment_metrics,
+        "effect_ece": baseline_metrics["ece"] - treatment_metrics["ece"],
+        "effect_nll": baseline_metrics["nll"] - treatment_metrics["nll"],
+        "effect_accuracy": (
+            treatment_metrics["accuracy"] - baseline_metrics["accuracy"]
+        ),
+        "evidence": {
+            "argmax_changed_count": changed,
+            "argmax_preserved": changed == 0,
+            "baseline_predictions_sha256": _prediction_hash(
+                baseline_predictions
+            ),
+            "treatment_predictions_sha256": _prediction_hash(
+                treatment_predictions
+            ),
+        },
+        "compute": {
+            "baseline": {
+                "calibration_examples": calibration_count,
+                "evaluation_examples": evaluation_count,
+                "model_forward_examples": model_forward_examples,
+                "objective_evaluations": BASELINE_OBJECTIVE_EVALUATIONS,
+            },
+            "treatment": {
+                "calibration_examples": calibration_count,
+                "evaluation_examples": evaluation_count,
+                "model_forward_examples": model_forward_examples,
+                # The narrow plugin API cannot independently audit arbitrary
+                # internal optimizer evaluations.  Do not claim this stronger
+                # capability in the BenchmarkProfile.
+                "objective_evaluations": None,
+                "fit_seconds": fit_seconds,
+                "transform_seconds": transform_seconds,
+            },
+            "matched_dimensions": list(matched_dimensions),
+        },
+    }
+
+
+def _evidence_pack(
+    rows: list[dict[str, Any]],
+    *,
+    config: BenchmarkConfig,
+) -> dict[str, Any]:
+    changed = sum(
+        int(dict(row.get("evidence", {})).get("argmax_changed_count", 0) or 0)
+        for row in rows
+    )
+    matched = [
+        "calibration_examples",
+        "evaluation_examples",
+        "model_forward_examples",
+    ]
+    return {
+        "protocol": {
+            "calibration_split": "clean",
+            "evaluation_split": (
+                "clean"
+                if config.corruption.strip().casefold() in {"", "none", "clean"}
+                else "corrupted"
+            ),
+            "corruption": config.corruption,
+            "corruption_severity": config.corruption_severity,
+            "pairing_strategy": "disjoint_example_blocks",
+            "independent_pairs": len(rows),
+        },
+        "argmax": {
+            "argmax_changed_count": changed,
+            "argmax_preserved": changed == 0,
+            "per_example_prediction_hashes": True,
+        },
+        "compute_accounting": {
+            "matched_dimensions": matched,
+            "all_declared_dimensions_matched": all(
+                set(matched)
+                <= set(dict(row.get("compute", {})).get("matched_dimensions", ()))
+                for row in rows
+            ),
+            "baseline_objective_evaluations_per_pair": (
+                BASELINE_OBJECTIVE_EVALUATIONS
+            ),
+            "treatment_objective_evaluations_per_pair": None,
+        },
+    }
 
 
 def _load_treatment(path: Path) -> Treatment:
@@ -565,6 +724,37 @@ def _corrupt(
     return np.clip(values, 0.0, 1.0)
 
 
+def _disjoint_pair_indices(
+    *,
+    total_examples: int,
+    seeds: tuple[int, ...],
+    calibration_examples: int,
+    evaluation_examples: int,
+) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    """Create frozen non-overlapping calibration/evaluation blocks."""
+
+    block_size = calibration_examples + evaluation_examples
+    required = block_size * len(seeds)
+    if required > total_examples:
+        raise ContractError(
+            "disjoint benchmark pairs require "
+            f"{required} examples, but the dataset contains {total_examples}"
+        )
+    digest = hashlib.sha256(
+        json.dumps(list(seeds), separators=(",", ":")).encode()
+    ).hexdigest()
+    order = np.arange(total_examples)
+    random.Random(int(digest[:16], 16)).shuffle(order)
+    pairs: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for index, seed in enumerate(seeds):
+        block = order[index * block_size : (index + 1) * block_size]
+        pairs[seed] = (
+            block[:calibration_examples],
+            block[calibration_examples:],
+        )
+    return pairs
+
+
 class Cifar10CalibrationAdapter:
     def __init__(self, config: BenchmarkConfig) -> None:
         self.config = config
@@ -612,26 +802,21 @@ class Cifar10CalibrationAdapter:
             dataset_root,
             dataset_format=self.config.dataset_format,
         )
-        required = self.config.calibration_examples + self.config.examples
-        if required > len(labels):
-            raise ContractError(
-                f"requested {required} CIFAR-10 examples but only {len(labels)} exist"
-            )
+        pairs = _disjoint_pair_indices(
+            total_examples=len(labels),
+            seeds=self.config.seeds,
+            calibration_examples=self.config.calibration_examples,
+            evaluation_examples=self.config.examples,
+        )
         treatment = _load_treatment(self.config.treatment_path)
         rows: list[dict[str, Any]] = []
         for seed in self.config.seeds:
-            order = np.arange(len(labels))
-            random.Random(seed).shuffle(order)
-            calibration_indices = order[: self.config.calibration_examples]
-            evaluation_indices = order[self.config.calibration_examples : required]
+            calibration_indices, evaluation_indices = pairs[seed]
+            # The calibration distribution is deliberately clean.  Only the
+            # held-out evaluation split receives the configured corruption.
             calibration_logits = self._infer(
                 model,
-                _corrupt(
-                    images[calibration_indices],
-                    seed=seed * 2 + 1,
-                    corruption=self.config.corruption,
-                    severity=self.config.corruption_severity,
-                ),
+                images[calibration_indices],
                 device=device,
                 torch=torch,
             )
@@ -648,43 +833,16 @@ class Cifar10CalibrationAdapter:
             )
             calibration_labels = labels[calibration_indices]
             evaluation_labels = labels[evaluation_indices]
-
-            temperature = _temperature_fit(calibration_logits, calibration_labels)
-            baseline_metrics = evaluate_probabilities(
-                _softmax(evaluation_logits / temperature),
-                evaluation_labels,
-                bins=self.config.ece_bins,
-            )
-            state = treatment.fit(
-                calibration_logits.copy(),
-                calibration_labels.copy(),
-            )
-            transformed = np.asarray(
-                treatment.transform(evaluation_logits.copy(), state),
-                dtype=np.float64,
-            )
-            if transformed.shape != evaluation_logits.shape:
-                raise ContractError(
-                    "treatment transformed logits must preserve shape "
-                    f"{evaluation_logits.shape}, got {transformed.shape}"
-                )
-            if not np.isfinite(transformed).all():
-                raise ContractError(
-                    "treatment transformed logits contain non-finite values"
-                )
-            treatment_metrics = evaluate_probabilities(
-                _softmax(transformed),
-                evaluation_labels,
-                bins=self.config.ece_bins,
-            )
             rows.append(
-                {
-                    "seed": seed,
-                    "temperature": temperature,
-                    "baseline": baseline_metrics,
-                    "treatment": treatment_metrics,
-                    "effect_ece": (baseline_metrics["ece"] - treatment_metrics["ece"]),
-                }
+                _evaluate_pair(
+                    seed=seed,
+                    calibration_logits=calibration_logits,
+                    calibration_labels=calibration_labels,
+                    evaluation_logits=evaluation_logits,
+                    evaluation_labels=evaluation_labels,
+                    treatment=treatment,
+                    ece_bins=self.config.ece_bins,
+                )
             )
         metrics, uncertainty = _summarize_rows(rows)
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -694,6 +852,7 @@ class Cifar10CalibrationAdapter:
             metrics=metrics,
             uncertainty=uncertainty,
             per_seed=rows,
+            evidence=_evidence_pack(rows, config=self.config),
             assets={
                 **dataset_assets,
                 "weights_sha256": weights_hash,
@@ -715,6 +874,14 @@ class Cifar10CalibrationAdapter:
                 "treatment_sha256": sha256_path(self.config.treatment_path),
                 "corruption": self.config.corruption,
                 "corruption_severity": self.config.corruption_severity,
+                "calibration_split": "clean",
+                "evaluation_split": (
+                    "clean"
+                    if self.config.corruption.strip().casefold()
+                    in {"", "none", "clean"}
+                    else "corrupted"
+                ),
+                "pairing_strategy": "disjoint_example_blocks",
             },
             artifacts=[str(result_path)],
         )
@@ -790,22 +957,19 @@ def build_logits_cache(
         dataset_root,
         dataset_format=config.dataset_format,
     )
-    required = config.calibration_examples + config.examples
+    pairs = _disjoint_pair_indices(
+        total_examples=len(labels),
+        seeds=config.seeds,
+        calibration_examples=config.calibration_examples,
+        evaluation_examples=config.examples,
+    )
     adapter = Cifar10CalibrationAdapter(config)
     arrays: dict[str, np.ndarray] = {}
     for seed in config.seeds:
-        order = np.arange(len(labels))
-        random.Random(seed).shuffle(order)
-        calibration_indices = order[: config.calibration_examples]
-        evaluation_indices = order[config.calibration_examples : required]
+        calibration_indices, evaluation_indices = pairs[seed]
         arrays[f"calibration_logits_{seed}"] = adapter._infer(
             model,
-            _corrupt(
-                images[calibration_indices],
-                seed=seed * 2 + 1,
-                corruption=config.corruption,
-                severity=config.corruption_severity,
-            ),
+            images[calibration_indices],
             device=device,
             torch=torch,
         )
@@ -825,7 +989,7 @@ def build_logits_cache(
     destination = Path(cache_path).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
-        "schema_version": 1,
+        "schema_version": 3,
         "seeds": list(config.seeds),
         "ece_bins": config.ece_bins,
         "assets": {
@@ -839,6 +1003,13 @@ def build_logits_cache(
             "corruption_severity": config.corruption_severity,
             "examples": config.examples,
             "calibration_examples": config.calibration_examples,
+            "calibration_split": "clean",
+            "evaluation_split": (
+                "clean"
+                if config.corruption.strip().casefold() in {"", "none", "clean"}
+                else "corrupted"
+            ),
+            "pairing_strategy": "disjoint_example_blocks",
         },
         "usage": {
             "device": str(device),
@@ -872,6 +1043,13 @@ def run_from_logits_cache(
         "corruption_severity": config.corruption_severity,
         "examples": config.examples,
         "calibration_examples": config.calibration_examples,
+        "calibration_split": "clean",
+        "evaluation_split": (
+            "clean"
+            if config.corruption.strip().casefold() in {"", "none", "clean"}
+            else "corrupted"
+        ),
+        "pairing_strategy": "disjoint_example_blocks",
     }
     if metadata.get("provenance") != expected:
         raise ContractError(
@@ -886,42 +1064,16 @@ def run_from_logits_cache(
         calibration_labels = np.asarray(cache[f"calibration_labels_{seed}"])
         evaluation_logits = np.asarray(cache[f"evaluation_logits_{seed}"])
         evaluation_labels = np.asarray(cache[f"evaluation_labels_{seed}"])
-        temperature = _temperature_fit(calibration_logits, calibration_labels)
-        baseline_metrics = evaluate_probabilities(
-            _softmax(evaluation_logits / temperature),
-            evaluation_labels,
-            bins=config.ece_bins,
-        )
-        state = treatment.fit(
-            calibration_logits.copy(),
-            calibration_labels.copy(),
-        )
-        transformed = np.asarray(
-            treatment.transform(evaluation_logits.copy(), state),
-            dtype=np.float64,
-        )
-        if transformed.shape != evaluation_logits.shape:
-            raise ContractError(
-                "treatment transformed logits must preserve shape "
-                f"{evaluation_logits.shape}, got {transformed.shape}"
-            )
-        if not np.isfinite(transformed).all():
-            raise ContractError(
-                "treatment transformed logits contain non-finite values"
-            )
-        treatment_metrics = evaluate_probabilities(
-            _softmax(transformed),
-            evaluation_labels,
-            bins=config.ece_bins,
-        )
         rows.append(
-            {
-                "seed": seed,
-                "temperature": temperature,
-                "baseline": baseline_metrics,
-                "treatment": treatment_metrics,
-                "effect_ece": baseline_metrics["ece"] - treatment_metrics["ece"],
-            }
+            _evaluate_pair(
+                seed=seed,
+                calibration_logits=calibration_logits,
+                calibration_labels=calibration_labels,
+                evaluation_logits=evaluation_logits,
+                evaluation_labels=evaluation_labels,
+                treatment=treatment,
+                ece_bins=config.ece_bins,
+            )
         )
     metrics, uncertainty = _summarize_rows(rows)
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -931,6 +1083,7 @@ def run_from_logits_cache(
         metrics=metrics,
         uncertainty=uncertainty,
         per_seed=rows,
+        evidence=_evidence_pack(rows, config=config),
         assets=dict(metadata.get("assets", {})),
         usage={
             "device": "cpu-logits-cache",
@@ -947,6 +1100,13 @@ def run_from_logits_cache(
             "treatment_sha256": sha256_path(config.treatment_path),
             "corruption": config.corruption,
             "corruption_severity": config.corruption_severity,
+            "calibration_split": "clean",
+            "evaluation_split": (
+                "clean"
+                if config.corruption.strip().casefold() in {"", "none", "clean"}
+                else "corrupted"
+            ),
+            "pairing_strategy": "disjoint_example_blocks",
             "logits_cache_sha256": sha256_path(cache_path),
         },
         artifacts=[str(result_path)],

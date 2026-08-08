@@ -12,6 +12,12 @@ from typing import Any
 
 from researchclaw.benchmark_adapter.cifar10_calibration import sha256_path
 
+from .benchmark_profile import (
+    BenchmarkCompatibility,
+    build_benchmark_plan,
+    load_benchmark_profile,
+    validate_benchmark_compatibility,
+)
 from .benchmark_runner import (
     benchmark_command,
     build_promoted_benchmark_config,
@@ -33,11 +39,6 @@ from .scientific_gate import (
 from .store import ResearchQueueStore
 from .treatment_preflight import preflight_treatment
 from .workers import TreatmentWorker, validate_python_sources
-
-TREATMENT_API = (
-    "build_treatment(); treatment.fit(calibration_logits, calibration_labels); "
-    "treatment.transform(evaluation_logits, state)"
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +160,20 @@ class BenchmarkPromotionBridge:
         self.treatment_worker = treatment_worker
         self.run_backend = run_backend
         self.max_gpus_per_run = max(1, int(max_gpus_per_run))
+        self.profile = load_benchmark_profile(
+            config.benchmark_id,
+            config.benchmark_config,
+        )
+        self.benchmark_plan = build_benchmark_plan(
+            profile=self.profile,
+            config_path=config.benchmark_config,
+        )
+
+    def compatibility(self, spec: ResearchSpec) -> BenchmarkCompatibility:
+        return validate_benchmark_compatibility(spec, self.profile)
+
+    def profile_dict(self) -> dict[str, Any]:
+        return self.profile.to_dict()
 
     async def promote(
         self,
@@ -172,6 +187,54 @@ class BenchmarkPromotionBridge:
             benchmark_root / "research_spec.json",
             spec.to_dict(),
         )
+        self.store.write_json_atomic(
+            benchmark_root / "benchmark_plan.json",
+            self.benchmark_plan,
+        )
+        compatibility = self.compatibility(spec)
+        self.store.write_json_atomic(
+            benchmark_root / "benchmark_compatibility.json",
+            compatibility.to_dict(),
+        )
+        if not compatibility.passed:
+            outcome = PromotionOutcome(
+                execution_passed=False,
+                scientific_valid=False,
+                hypothesis_supported=None,
+                promotion_decision="reject",
+                reason=(
+                    "ResearchSpec is incompatible with the frozen benchmark "
+                    "profile: " + "; ".join(compatibility.errors)
+                ),
+                benchmark_result={},
+                scientific_gate={
+                    "passed": False,
+                    "errors": list(compatibility.errors),
+                    "checks": dict(compatibility.checks),
+                },
+                usage={},
+                provenance={
+                    "idea_id": idea.idea_id,
+                    "benchmark_id": self.profile.benchmark_id,
+                    "benchmark_profile_version": self.profile.version,
+                    "research_spec_sha256": sha256_path(
+                        benchmark_root / "research_spec.json"
+                    ),
+                    "benchmark_plan_sha256": sha256_path(
+                        benchmark_root / "benchmark_plan.json"
+                    ),
+                },
+            )
+            self.store.write_json_atomic(
+                benchmark_root / "final_review.json",
+                outcome.to_dict(),
+            )
+            self.store.event(
+                "benchmark_compatibility_rejected",
+                idea_id=idea.idea_id,
+                errors=list(compatibility.errors),
+            )
+            return outcome
         usage: dict[str, Any] = {}
         feedback = ""
         source = ""
@@ -339,6 +402,10 @@ class BenchmarkPromotionBridge:
             "research_spec_sha256": sha256_path(benchmark_root / "research_spec.json"),
             "treatment_sha256": sha256_path(benchmark_root / "treatment.py"),
             "benchmark_config_sha256": sha256_path(runtime_config),
+            "benchmark_plan_sha256": sha256_path(
+                benchmark_root / "benchmark_plan.json"
+            ),
+            "benchmark_profile_version": self.profile.version,
             "benchmark_id": self.config.benchmark_id,
             "logits_cache_sha256": (
                 sha256_path(logits_cache)

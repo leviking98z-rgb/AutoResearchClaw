@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .benchmark_profile import TREATMENT_API
 from .config import ResearchQueueConfig
 from .execution import RunBackend
 from .models import (
@@ -27,7 +28,7 @@ from .models import (
     new_id,
     utc_now,
 )
-from .promotion import TREATMENT_API, BenchmarkPromotionBridge
+from .promotion import BenchmarkPromotionBridge
 from .research_memory import ResearchMemory
 from .scientific_gate import validate_research_spec
 from .store import ResearchQueueStore
@@ -336,14 +337,30 @@ class ResearchQueueController:
         candidates = self.store.list_ideas(statuses={IdeaStatus.CANDIDATE})
         for idea in candidates[:available]:
             idea.status = IdeaStatus.ACTIVE
-            idea.next_action = "prepare"
-            idea.last_reason = "admitted"
+            direct = bool(
+                self.config.promotion.enabled
+                and self.config.promotion.direct_all_admitted
+                and self.promotion_bridge is not None
+            )
+            idea.next_action = "scientific_gate" if direct else "prepare"
+            idea.last_reason = (
+                "admitted directly to frozen benchmark"
+                if direct
+                else "admitted"
+            )
             self.store.upsert_idea(idea)
             self.store.event(
                 "idea_admitted",
                 idea_id=idea.idea_id,
                 priority=idea.priority,
             )
+            if direct:
+                self.store.event(
+                    "idea_selected_for_promotion",
+                    idea_id=idea.idea_id,
+                    conclusion="not_piloted",
+                    reason="direct_all_admitted",
+                )
 
     def _start_active_idea_tasks(self) -> None:
         if self._token_budget_exhausted():
@@ -767,12 +784,19 @@ class ResearchQueueController:
         feedback = ""
         usage: dict[str, Any] = {}
         result = None
+        compatibility = None
+        benchmark_profile = (
+            self.promotion_bridge.profile_dict()
+            if self.promotion_bridge is not None
+            else {}
+        )
         for attempt in range(self.config.scientific_gate.max_repairs + 1):
             spec, current_usage = await self._call_llm(
                 self.spec_worker.build,
                 idea,
                 benchmark_id=self.config.promotion.benchmark_id,
                 treatment_api=TREATMENT_API,
+                benchmark_profile=benchmark_profile,
                 feedback=feedback,
             )
             for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
@@ -787,30 +811,65 @@ class ResearchQueueController:
                 spec,
                 benchmark_id=self.config.promotion.benchmark_id,
             )
+            compatibility = (
+                self.promotion_bridge.compatibility(spec)
+                if self.promotion_bridge is not None
+                else None
+            )
+            compatibility_errors = (
+                list(compatibility.errors) if compatibility is not None else []
+            )
             self.store.write_json_atomic(
                 benchmark_root / f"scientific-gate-{attempt + 1:02d}.json",
                 {
                     "research_spec": spec.to_dict(),
-                    "gate": result.to_dict(),
+                    "research_spec_gate": result.to_dict(),
+                    "benchmark_compatibility": (
+                        compatibility.to_dict()
+                        if compatibility is not None
+                        else {
+                            "passed": False,
+                            "errors": ["benchmark promotion bridge is unavailable"],
+                            "checks": {},
+                        }
+                    ),
                     "usage": current_usage,
                 },
             )
-            if result.passed:
+            if result.passed and compatibility is not None and compatibility.passed:
                 idea.research_spec = spec
                 self.store.write_json_atomic(
                     benchmark_root / "research_spec.json",
                     spec.to_dict(),
                 )
+                self.store.write_json_atomic(
+                    benchmark_root / "benchmark_plan.json",
+                    self.promotion_bridge.benchmark_plan,
+                )
+                self.store.write_json_atomic(
+                    benchmark_root / "benchmark_compatibility.json",
+                    compatibility.to_dict(),
+                )
                 break
+            all_errors = [*result.errors, *compatibility_errors]
             feedback = (
                 "Your ResearchSpec failed deterministic validation. Correct "
                 "only the listed issues and return a complete ResearchSpec. "
-                "Errors: " + "; ".join(result.errors)
+                "Errors: " + "; ".join(all_errors)
             )
-        if result is None or not result.passed or idea.research_spec is None:
+        if (
+            result is None
+            or not result.passed
+            or compatibility is None
+            or not compatibility.passed
+            or idea.research_spec is None
+        ):
+            gate_errors = list(result.errors) if result is not None else []
+            if compatibility is not None:
+                gate_errors.extend(compatibility.errors)
             reason = (
-                "; ".join(result.errors)
-                if result is not None
+                "; ".join(gate_errors)
+                if gate_errors
                 else "ResearchSpec generation failed"
             )
             self.store.event(
@@ -832,7 +891,10 @@ class ResearchQueueController:
         self.store.event(
             "scientific_gate_passed",
             idea_id=idea.idea_id,
-            gate=result.to_dict(),
+            gate={
+                "research_spec": result.to_dict(),
+                "benchmark_compatibility": compatibility.to_dict(),
+            },
             usage=usage,
         )
 
@@ -1170,6 +1232,7 @@ class ResearchQueueController:
                 self._next_generation_at - time.monotonic(),
             ),
             "producer_exhausted": self._producer_exhausted,
+            "path_reachability": self.config.path_reachability(),
             "usage": usage,
             "execution": self.run_backend.snapshot(),
         }

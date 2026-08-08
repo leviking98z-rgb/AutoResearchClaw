@@ -11,6 +11,10 @@ from pathlib import Path
 from .config import ResearchQueueConfig
 from .controller import ResearchQueueController
 from .execution import build_run_backend
+from .portfolio import (
+    compare_portfolio_reports,
+    write_portfolio_report,
+)
 from .promotion import BenchmarkPromotionBridge, re_review_artifacts
 from .research_memory import InfoHubResearchMemory
 from .store import ResearchQueueStore
@@ -43,6 +47,19 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("status")
     commands.add_parser("ideas")
     commands.add_parser("runs")
+    portfolio = commands.add_parser(
+        "portfolio",
+        help="Build VCO, funnel, latency, and cost reports from persisted state.",
+    )
+    portfolio.add_argument("--output-dir", type=Path)
+    portfolio.add_argument("--window-seconds", type=float, default=7200.0)
+    compare = commands.add_parser(
+        "compare",
+        help="Compare a candidate Portfolio report against a baseline report.",
+    )
+    compare.add_argument("baseline", type=Path)
+    compare.add_argument("candidate", type=Path)
+    compare.add_argument("--output", type=Path)
     rereview = commands.add_parser(
         "rereview",
         help="Reapply the deterministic scientific gate to persisted evidence.",
@@ -127,6 +144,21 @@ async def _run_controller(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "compare":
+        baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+        candidate = json.loads(args.candidate.read_text(encoding="utf-8"))
+        comparison = compare_portfolio_reports(baseline, candidate)
+        encoded = json.dumps(
+            comparison,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(encoded + "\n", encoding="utf-8")
+        print(encoded)
+        return 0
     config = ResearchQueueConfig.from_file(args.config)
     store = ResearchQueueStore(
         config.root,
@@ -154,6 +186,15 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
+    if args.command == "portfolio":
+        report = write_portfolio_report(
+            store,
+            args.output_dir or (config.root / "portfolio"),
+            system_id=config.system_id,
+            window_seconds=args.window_seconds,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
     if args.command == "rereview":
         outcome = re_review_artifacts(
             idea_dir=args.idea_dir,
@@ -174,6 +215,12 @@ def main(argv: list[str] | None = None) -> int:
             until_idle=args.until_idle,
         )
     )
+    portfolio_report = write_portfolio_report(
+        store,
+        config.root / "portfolio",
+        system_id=config.system_id,
+    )
+    snapshot["portfolio"] = portfolio_report["summary"]
     print(json.dumps(snapshot, ensure_ascii=False, indent=2))
     return 0
 

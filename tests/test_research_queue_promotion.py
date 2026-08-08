@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+from researchclaw.research_queue.benchmark_profile import TREATMENT_API
 from researchclaw.research_queue.config import BenchmarkPromotionConfig
 from researchclaw.research_queue.models import (
     IdeaProposal,
@@ -72,6 +73,12 @@ class RecordingBenchmarkBackend:
                         "accuracy": 0.7,
                         "nll": 0.9,
                     },
+                    "evidence": {
+                        "argmax_preserved": True,
+                        "argmax_changed_count": 0,
+                        "baseline_predictions_sha256": "a",
+                        "treatment_predictions_sha256": "a",
+                    },
                 },
                 {
                     "baseline": {
@@ -84,8 +91,34 @@ class RecordingBenchmarkBackend:
                         "accuracy": 0.7,
                         "nll": 0.9,
                     },
+                    "evidence": {
+                        "argmax_preserved": True,
+                        "argmax_changed_count": 0,
+                        "baseline_predictions_sha256": "b",
+                        "treatment_predictions_sha256": "b",
+                    },
                 },
             ],
+            "evidence": {
+                "protocol": {
+                    "calibration_split": "clean",
+                    "evaluation_split": "corrupted",
+                    "pairing_strategy": "disjoint_example_blocks",
+                },
+                "argmax": {
+                    "argmax_preserved": True,
+                    "argmax_changed_count": 0,
+                    "per_example_prediction_hashes": True,
+                },
+                "compute_accounting": {
+                    "matched_dimensions": [
+                        "calibration_examples",
+                        "evaluation_examples",
+                        "model_forward_examples",
+                    ],
+                    "all_declared_dimensions_matched": True,
+                },
+            },
         }
         (output_dir / "result.json").write_text(json.dumps(result))
         return RunResult(
@@ -105,6 +138,12 @@ class FailingTreatmentWorker:
     def build(self, idea, *, spec, feedback):
         del idea, spec, feedback
         raise ValueError("structured treatment invalid")
+
+
+class NeverTreatmentWorker:
+    def build(self, idea, *, spec, feedback):
+        del idea, spec, feedback
+        raise AssertionError("incompatible ResearchSpec reached treatment generation")
 
 
 def test_promotion_bridge_generates_treatment_and_separates_outcome(
@@ -146,7 +185,7 @@ benchmark:
         compute_matching=("same logits and labels",),
         stopping_rules=("reject when ECE does not improve",),
         benchmark_id="cifar10_calibration",
-        treatment_api="fit/transform",
+        treatment_api=TREATMENT_API,
         primary_requires_effect_ci=True,
         guardrail_metrics=(
             MetricGuardrail(
@@ -162,6 +201,15 @@ benchmark:
             ),
         ),
         minimum_pairs=2,
+        calibration_split="clean",
+        evaluation_split="corrupted",
+        pairing_strategy="disjoint_example_blocks",
+        require_per_example_argmax=True,
+        required_compute_accounting=(
+            "calibration_examples",
+            "evaluation_examples",
+            "model_forward_examples",
+        ),
     )
     backend = RecordingBenchmarkBackend()
     bridge = BenchmarkPromotionBridge(
@@ -228,7 +276,7 @@ benchmark:
         compute_matching=("same logits and labels",),
         stopping_rules=("reject when ECE does not improve",),
         benchmark_id="cifar10_calibration",
-        treatment_api="fit/transform",
+        treatment_api=TREATMENT_API,
         primary_requires_effect_ci=True,
         guardrail_metrics=(
             MetricGuardrail(
@@ -244,6 +292,15 @@ benchmark:
             ),
         ),
         minimum_pairs=2,
+        calibration_split="clean",
+        evaluation_split="corrupted",
+        pairing_strategy="disjoint_example_blocks",
+        require_per_example_argmax=True,
+        required_compute_accounting=(
+            "calibration_examples",
+            "evaluation_examples",
+            "model_forward_examples",
+        ),
     )
     backend = RecordingBenchmarkBackend()
     bridge = BenchmarkPromotionBridge(
@@ -419,3 +476,88 @@ def test_re_review_artifacts_rewrites_both_final_reviews(tmp_path) -> None:
     ):
         saved = json.loads(path.read_text())
         assert saved["promotion_decision"] == "reject"
+
+
+def test_promotion_rejects_incompatible_spec_before_treatment_or_gpu(
+    tmp_path,
+) -> None:
+    template = tmp_path / "benchmark.yaml"
+    template.write_text(
+        """
+benchmark:
+  cache_dir: cache
+  output_dir: output
+  treatment_path: treatment.py
+  seeds: [17, 29]
+  device: cuda
+  require_cuda: true
+""".lstrip()
+    )
+    store = ResearchQueueStore(tmp_path / "state")
+    store.initialize()
+    idea = IdeaRecord.from_proposal(
+        IdeaProposal(
+            title="Impossible pair count",
+            question="Does it improve?",
+            hypothesis="It lowers ECE.",
+            treatment="Adaptive calibration.",
+            control="Temperature scaling.",
+            primary_metric="ECE",
+        )
+    )
+    store.upsert_idea(idea)
+    spec = ResearchSpec(
+        question=idea.question,
+        hypothesis=idea.hypothesis,
+        treatment=idea.treatment,
+        control=idea.control,
+        primary_metric="ece",
+        metric_direction=MetricDirection.MINIMIZE,
+        guardrails=("accuracy unchanged", "NLL no worse"),
+        validity_conditions=("frozen held-out split",),
+        compute_matching=("same model logits",),
+        stopping_rules=("reject invalid evidence",),
+        benchmark_id="cifar10_calibration",
+        treatment_api=TREATMENT_API,
+        minimum_pairs=5,
+        primary_requires_effect_ci=True,
+        guardrail_metrics=(
+            MetricGuardrail(
+                metric="nll",
+                direction=MetricDirection.MINIMIZE,
+                require_effect_ci=True,
+            ),
+        ),
+        calibration_split="clean",
+        evaluation_split="corrupted",
+        pairing_strategy="disjoint_example_blocks",
+        require_per_example_argmax=True,
+        required_compute_accounting=(
+            "calibration_examples",
+            "evaluation_examples",
+            "model_forward_examples",
+        ),
+    )
+    backend = RecordingBenchmarkBackend()
+    bridge = BenchmarkPromotionBridge(
+        config=BenchmarkPromotionConfig(
+            enabled=True,
+            benchmark_config=str(template),
+        ),
+        store=store,
+        treatment_worker=NeverTreatmentWorker(),
+        run_backend=backend,
+        max_gpus_per_run=1,
+    )
+
+    outcome = asyncio.run(bridge.promote(idea, spec=spec))
+
+    assert outcome.execution_passed is False
+    assert "requires 5 independent pairs" in outcome.reason
+    assert backend.runs == []
+    benchmark_root = store.idea_dir(idea.idea_id) / "benchmark"
+    assert not (benchmark_root / "treatment.py").exists()
+    compatibility = json.loads(
+        (benchmark_root / "benchmark_compatibility.json").read_text()
+    )
+    assert compatibility["checks"]["minimum_pairs_available"] is False

@@ -80,6 +80,7 @@ class ResearchSpecWorker(Protocol):
         *,
         benchmark_id: str,
         treatment_api: str,
+        benchmark_profile: Mapping[str, Any],
         feedback: str,
     ) -> tuple[ResearchSpec, dict[str, Any]]: ...
 
@@ -262,6 +263,7 @@ class LLMResearchSpecWorker:
         *,
         benchmark_id: str,
         treatment_api: str,
+        benchmark_profile: Mapping[str, Any],
         feedback: str,
     ) -> tuple[ResearchSpec, dict[str, Any]]:
         result = self.role.call(
@@ -270,6 +272,8 @@ IDEA:
 {json.dumps(idea.to_dict(), ensure_ascii=False, indent=2)}
 
 TARGET BENCHMARK: {benchmark_id}
+FROZEN BENCHMARK CAPABILITIES:
+{json.dumps(dict(benchmark_profile), ensure_ascii=False, indent=2)}
 TREATMENT API:
 {treatment_api}
 
@@ -288,6 +292,15 @@ Return a strict ResearchSpec:
   "primary_requires_effect_ci": true,
   "minimum_pairs": 5,
   "confidence_level": 0.95,
+  "calibration_split": "clean",
+  "evaluation_split": "corrupted",
+  "pairing_strategy": "disjoint_example_blocks",
+  "require_per_example_argmax": true,
+  "required_compute_accounting": [
+    "calibration_examples",
+    "evaluation_examples",
+    "model_forward_examples"
+  ],
   "guardrail_metrics": [
     {{
       "metric": "accuracy|nll",
@@ -317,12 +330,16 @@ Return a strict ResearchSpec:
 For CIFAR-10 calibration:
 - use ECE as the primary metric and minimize it;
 - set minimum_effect to 0 and require a paired 95% effect CI;
-- require at least 5 independent seed/model pairs;
+- require at least 5 disjoint example-block pairs with independent corruption
+  seeds;
 - require exact per-pair accuracy equality;
+- require evidence that every evaluation example preserves its argmax class;
 - require NLL to be no worse, with a paired 95% effect CI;
 - treatment and baseline must use identical logits, calibration labels,
   evaluation split, seeds, and model;
 - the treatment must not access evaluation labels.
+Do not request a metric, split, pair count, evidence type, or compute
+attestation that is absent from FROZEN BENCHMARK CAPABILITIES.
 """.strip(),
             max_tokens=2600,
             temperature=0.1,
@@ -465,9 +482,14 @@ class SimulatedResearchSpecWorker:
         *,
         benchmark_id: str,
         treatment_api: str,
+        benchmark_profile: Mapping[str, Any],
         feedback: str,
     ) -> tuple[ResearchSpec, dict[str, Any]]:
         del feedback
+        available_pairs = max(
+            1,
+            int(benchmark_profile.get("available_pairs", 1) or 1),
+        )
         return (
             ResearchSpec(
                 question=idea.question,
@@ -499,8 +521,28 @@ class SimulatedResearchSpecWorker:
                         require_effect_ci=True,
                     ),
                 ),
-                minimum_pairs=5,
+                minimum_pairs=min(5, available_pairs),
                 confidence_level=0.95,
+                calibration_split=str(
+                    benchmark_profile.get("calibration_split", "clean")
+                    or "clean"
+                ),
+                evaluation_split=str(
+                    benchmark_profile.get("evaluation_split", "corrupted")
+                    or "corrupted"
+                ),
+                pairing_strategy=str(
+                    benchmark_profile.get(
+                        "pairing_strategy",
+                        "disjoint_example_blocks",
+                    )
+                    or "disjoint_example_blocks"
+                ),
+                require_per_example_argmax=True,
+                required_compute_accounting=tuple(
+                    str(item)
+                    for item in benchmark_profile.get("compute_accounting", ())
+                ),
             ),
             {},
         )

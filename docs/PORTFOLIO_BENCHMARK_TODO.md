@@ -1,6 +1,6 @@
 # PortfolioBench-2h：核心架构 Benchmark TODO
 
-状态：**TODO / 尚未产出正式对比结果**
+状态：**实现中 / 已完成确定性 smoke，尚未产出正式真实模型三重复结果**
 
 本文冻结 Continuous Research Queue 的核心评测协议。目标不是比较谁生成
 的论文数量最多，也不是用 GPU 利用率作为成功标准，而是回答：
@@ -306,38 +306,39 @@ Correct verdict        inconclusive / reject
 ### P0：冻结协议和输入
 
 - [ ] 冻结当前 Research Queue 实验 commit；
-- [ ] 创建并评审 16 个固定 Idea；
-- [ ] 给 Idea pool、Benchmark config 和模型配置生成 hash；
-- [ ] 冻结统一 Token、GPU 和 wall-time 上限；
-- [ ] 明确每个系统如何判定 terminal outcome。
+- [x] 创建 16 个固定、版本化 Idea；
+- [x] 给 Idea pool、Benchmark config 和模型配置生成 hash；
+- [x] 冻结统一 Token、GPU 和 wall-time 上限；
+- [x] 明确 Queue 系统如何判定 terminal outcome。
 
 ### P0：实现 PortfolioBench runner
 
-- [ ] 新建 `experiments/portfolio_bench/`；
-- [ ] 实现统一 framework adapter 协议；
+- [x] 新建 `experiments/portfolio_bench/`；
+- [x] 实现 Queue variant runner 和统一 Portfolio report；
 - [ ] 实现 `AutoResearchClaw-loop` wrapper；
-- [ ] 实现 `RQ-Sequential` 配置；
-- [ ] 实现 `RQ-NoEarlyExit` 配置；
-- [ ] 实现 `RQ-Full` 配置；
-- [ ] 统一导出 outcome、Token、GPU 和事件时间线；
-- [ ] 自动验证 GPU 最终释放。
+- [x] 实现 `RQ-Sequential` 配置；
+- [x] 实现 `RQ-NoEarlyExit` 配置；
+- [x] 实现 `RQ-Full` 配置；
+- [x] 统一导出 outcome、Token、GPU 和事件时间线；
+- [x] real runner 自动验证 GPU 最终释放。
 
 ### P0：定义判定和聚合
 
-- [ ] 实现 VCO 判定器；
-- [ ] 实现 TTFV；
-- [ ] 实现 Token/VCO 和 GPU-sec/VCO；
-- [ ] 实现 False Accept Rate；
-- [ ] 对 `VCO=0` 和无 accept 情况做明确处理；
-- [ ] 输出 machine-readable `summary.json`。
+- [x] 实现 VCO 判定器；
+- [x] 实现 TTFV；
+- [x] 实现 Token/VCO 和 GPU-sec/VCO；
+- [x] 实现 False Accept Rate；
+- [x] 对 `VCO=0` 和无 accept 情况做明确处理；
+- [x] 输出 machine-readable `summary.json`。
 
 ### P1：科学门禁 Benchmark
 
-- [ ] 创建 Evidence-Pack schema；
-- [ ] 制作 20–30 个 gold packs；
+- [x] 创建 Evidence-Pack schema；
+- [x] 制作 25 个版本化 gold packs；
 - [ ] 增加双人或双模型独立 gold review；
-- [ ] 运行 LLM-only、legacy、deterministic gate 三组；
-- [ ] 输出混淆矩阵和错误案例分析。
+- [ ] 运行 LLM-only reviewer；
+- [x] 运行 legacy mean-only 与 deterministic gate；
+- [x] 输出逐案例决策、False Accept/Reject 和准确率。
 
 ### P1：ARC-Bench 接入
 
@@ -382,3 +383,34 @@ Correct verdict        inconclusive / reject
 
 在正式结果产生前，文档和介绍中必须将其表述为**待验证假设**，不能写成
 已证实结论。
+
+---
+
+## 11. 当前非正式 smoke 结果
+
+这些结果只验证 runner、状态机和指标，不是论文主结果。
+
+### 11.1 8 秒、16 Idea 的确定性架构 smoke
+
+使用 synthetic workers 和固定 CPU logits fixture：
+
+| Variant | VCO@8s | TTFV |
+|---|---:|---:|
+| RQ-Sequential | 6 | 1.625s |
+| RQ-NoEarlyExit | 16 | 1.502s |
+| RQ-Full | 10 | 2.515s |
+
+RQ-Full 相比 RQ-Sequential 的 VCO 提高 `4 / 6 = 66.7%`。TTFV 反而慢
+约 0.89 秒，说明并发提高吞吐量，但第一条 Idea 经过完整 B0/B1/B2 时会有
+额外排队和科学门禁开销。NoEarlyExit 在零 GPU fixture 上最快，但这个
+smoke 无法测量它在真实 Benchmark 中浪费的 GPU 成本。
+
+### 11.2 25 个 Evidence Pack
+
+| Reviewer | Verdict accuracy | False accepts / accepts | False Accept Rate |
+|---|---:|---:|---:|
+| legacy mean-only | 24.0% | 19 / 23 | 82.6% |
+| deterministic gate | 100.0% | 0 / 4 | 0.0% |
+
+该结果证明确定性门禁修复了“只看 aggregate ECE 改善就 accept”的已知
+错误模式。还需要增加 LLM-only reviewer 和独立 gold review。

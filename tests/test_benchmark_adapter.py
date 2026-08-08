@@ -8,6 +8,7 @@ import pytest
 from researchclaw.benchmark_adapter.cifar10_calibration import (
     BenchmarkConfig,
     ContractError,
+    _disjoint_pair_indices,
     _load_cifar10_test,
     _load_treatment,
     evaluate_probabilities,
@@ -36,6 +37,37 @@ def test_paired_bootstrap_mean_interval_is_deterministic() -> None:
     assert interval == paired_bootstrap_mean_interval([0.1, 0.2, 0.3, 0.4, 0.5])
     assert interval[0] > 0
     assert interval[0] <= 0.3 <= interval[1]
+
+
+def test_pair_indices_are_frozen_and_disjoint() -> None:
+    first = _disjoint_pair_indices(
+        total_examples=100,
+        seeds=(17, 29, 43, 59, 71),
+        calibration_examples=5,
+        evaluation_examples=5,
+    )
+    second = _disjoint_pair_indices(
+        total_examples=100,
+        seeds=(17, 29, 43, 59, 71),
+        calibration_examples=5,
+        evaluation_examples=5,
+    )
+    observed: set[int] = set()
+    for seed in first:
+        calibration, evaluation = first[seed]
+        assert np.array_equal(calibration, second[seed][0])
+        assert np.array_equal(evaluation, second[seed][1])
+        current = set(calibration.tolist()) | set(evaluation.tolist())
+        assert observed.isdisjoint(current)
+        observed.update(current)
+
+    with pytest.raises(ContractError, match="disjoint"):
+        _disjoint_pair_indices(
+            total_examples=20,
+            seeds=(17, 29, 43),
+            calibration_examples=5,
+            evaluation_examples=5,
+        )
 
 
 def test_treatment_plugin_contract_and_hash(tmp_path) -> None:
@@ -149,7 +181,7 @@ benchmark:
     rng = np.random.default_rng(3)
     cache = tmp_path / "logits.npz"
     metadata = {
-        "schema_version": 1,
+        "schema_version": 3,
         "seeds": [17],
         "ece_bins": 3,
         "assets": {"model_name": "fake"},
@@ -158,6 +190,9 @@ benchmark:
             "corruption_severity": 0.04,
             "examples": 4,
             "calibration_examples": 4,
+            "calibration_split": "clean",
+            "evaluation_split": "corrupted",
+            "pairing_strategy": "disjoint_example_blocks",
         },
     }
     np.savez_compressed(
@@ -176,3 +211,6 @@ benchmark:
     assert result.usage["gpu_count"] == 0
     assert np.isfinite(result.metrics["effect_nll"])
     assert result.metrics["effect_accuracy"] == pytest.approx(0.0)
+    assert result.evidence["protocol"]["calibration_split"] == "clean"
+    assert result.evidence["protocol"]["evaluation_split"] == "corrupted"
+    assert result.evidence["argmax"]["argmax_preserved"] is True

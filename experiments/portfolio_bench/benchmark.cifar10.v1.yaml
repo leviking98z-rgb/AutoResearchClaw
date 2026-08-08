@@ -1,0 +1,26 @@
+benchmark:
+  # The runner rewrites these three paths into its immutable run directory.
+  cache_dir: cache
+  output_dir: placeholder-output
+  treatment_path: placeholder-treatment.py
+  dataset_url: https://hf-mirror.com/datasets/uoft-cs/cifar10/resolve/main/plain_text/test-00000-of-00001.parquet
+  dataset_sha256: 841389e6f2d64f28bf17310e430aebac20ec3ba611a3c5e231dc93c645ce84de
+  dataset_format: parquet
+  weights_url: https://github.com/chenyaofo/pytorch-cifar-models/releases/download/resnet/cifar10_resnet20-4118986f.pt
+  weights_sha256: 4118986f0df73003d572b0e397f0ac7b3f60af1f31aff3d2da164536e36f6ec8
+  model_source_repo: https://github.com/chenyaofo/pytorch-cifar-models.git
+  model_source_commit: 786c16252c0fc58ee9adac063f8337cc4a7a497a
+  model_source_archive: cache/model-source-786c16252c0fc58ee9adac063f8337cc4a7a497a.tar.gz
+  model_source_archive_sha256: 9d937598517e4b2abe91e1dd26921ce6c6e0146dcecbc471ee09628f53a2d768
+  model_name: cifar10_resnet20
+  examples: 500
+  calibration_examples: 500
+  seeds: [17, 29, 43, 59, 71]
+  corruption: gaussian_noise
+  corruption_severity: 0.04
+  batch_size: 256
+  ece_bins: 15
+  device: cuda
+  require_cuda: true
+  allow_downloads: false
+  timeout_sec: 1200

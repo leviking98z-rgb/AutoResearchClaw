@@ -41,6 +41,15 @@ def _spec() -> ResearchSpec:
         ),
         primary_requires_effect_ci=True,
         minimum_pairs=2,
+        calibration_split="clean",
+        evaluation_split="corrupted",
+        pairing_strategy="disjoint_example_blocks",
+        require_per_example_argmax=True,
+        required_compute_accounting=(
+            "calibration_examples",
+            "evaluation_examples",
+            "model_forward_examples",
+        ),
     )
 
 
@@ -72,12 +81,44 @@ def test_scientific_result_separates_execution_validity_and_support() -> None:
             {
                 "baseline": {"ece": 0.08, "accuracy": 0.7, "nll": 1.0},
                 "treatment": {"ece": 0.04, "accuracy": 0.7, "nll": 0.9},
+                "evidence": {
+                    "argmax_preserved": True,
+                    "argmax_changed_count": 0,
+                    "baseline_predictions_sha256": "a",
+                    "treatment_predictions_sha256": "a",
+                },
             },
             {
                 "baseline": {"ece": 0.08, "accuracy": 0.7, "nll": 1.0},
                 "treatment": {"ece": 0.04, "accuracy": 0.7, "nll": 0.9},
+                "evidence": {
+                    "argmax_preserved": True,
+                    "argmax_changed_count": 0,
+                    "baseline_predictions_sha256": "b",
+                    "treatment_predictions_sha256": "b",
+                },
             },
         ],
+        "evidence": {
+            "protocol": {
+                "calibration_split": "clean",
+                "evaluation_split": "corrupted",
+                "pairing_strategy": "disjoint_example_blocks",
+            },
+            "argmax": {
+                "argmax_preserved": True,
+                "argmax_changed_count": 0,
+                "per_example_prediction_hashes": True,
+            },
+            "compute_accounting": {
+                "matched_dimensions": [
+                    "calibration_examples",
+                    "evaluation_examples",
+                    "model_forward_examples",
+                ],
+                "all_declared_dimensions_matched": True,
+            },
+        },
     }
 
     gate = validate_benchmark_result(spec, result)
@@ -203,8 +244,14 @@ def test_scientific_result_accepts_complete_machine_contract() -> None:
         {
             "baseline": {"ece": 0.08, "accuracy": 0.7, "nll": 1.0},
             "treatment": {"ece": 0.04, "accuracy": 0.7, "nll": 0.9},
+            "evidence": {
+                "argmax_preserved": True,
+                "argmax_changed_count": 0,
+                "baseline_predictions_sha256": f"baseline-{index}",
+                "treatment_predictions_sha256": f"treatment-{index}",
+            },
         }
-        for _ in range(5)
+        for index in range(5)
     ]
     result = {
         "status": "ok",
@@ -221,6 +268,26 @@ def test_scientific_result_accepts_complete_machine_contract() -> None:
             "effect_nll_ci": [0.1, 0.1],
         },
         "per_seed": rows,
+        "evidence": {
+            "protocol": {
+                "calibration_split": "clean",
+                "evaluation_split": "corrupted",
+                "pairing_strategy": "disjoint_example_blocks",
+            },
+            "argmax": {
+                "argmax_preserved": True,
+                "argmax_changed_count": 0,
+                "per_example_prediction_hashes": True,
+            },
+            "compute_accounting": {
+                "matched_dimensions": [
+                    "calibration_examples",
+                    "evaluation_examples",
+                    "model_forward_examples",
+                ],
+                "all_declared_dimensions_matched": True,
+            },
+        },
     }
 
     gate = validate_benchmark_result(spec, result)
@@ -228,6 +295,62 @@ def test_scientific_result_accepts_complete_machine_contract() -> None:
     assert gate.passed
     assert gate.checks["primary_effect_ci_supports_hypothesis"] is True
     assert gate.checks["nll_effect_ci_passed"] is True
+
+
+def test_scientific_result_rejects_equal_accuracy_with_changed_argmax() -> None:
+    spec = _spec()
+    rows = [
+        {
+            "baseline": {"ece": 0.08, "accuracy": 0.5, "nll": 1.0},
+            "treatment": {"ece": 0.04, "accuracy": 0.5, "nll": 0.9},
+            "evidence": {
+                "argmax_preserved": index == 0,
+                "argmax_changed_count": 0 if index == 0 else 2,
+                "baseline_predictions_sha256": f"base-{index}",
+                "treatment_predictions_sha256": f"treatment-{index}",
+            },
+        }
+        for index in range(2)
+    ]
+    result = {
+        "status": "ok",
+        "metrics": {
+            "baseline_ece": 0.08,
+            "treatment_ece": 0.04,
+            "baseline_accuracy": 0.5,
+            "treatment_accuracy": 0.5,
+            "baseline_nll": 1.0,
+            "treatment_nll": 0.9,
+        },
+        "uncertainty": {"effect_ece_ci": [0.04, 0.04]},
+        "per_seed": rows,
+        "evidence": {
+            "protocol": {
+                "calibration_split": "clean",
+                "evaluation_split": "corrupted",
+                "pairing_strategy": "disjoint_example_blocks",
+            },
+            "argmax": {
+                "argmax_preserved": False,
+                "argmax_changed_count": 2,
+                "per_example_prediction_hashes": True,
+            },
+            "compute_accounting": {
+                "matched_dimensions": [
+                    "calibration_examples",
+                    "evaluation_examples",
+                    "model_forward_examples",
+                ],
+                "all_declared_dimensions_matched": True,
+            },
+        },
+    }
+
+    gate = validate_benchmark_result(spec, result)
+
+    assert gate.passed is False
+    assert gate.checks["per_example_argmax_attested"] is False
+    assert any("argmax" in error for error in gate.errors)
 
 
 def test_generated_treatment_preflight_and_static_gate(tmp_path) -> None:

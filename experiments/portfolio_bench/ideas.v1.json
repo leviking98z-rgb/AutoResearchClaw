@@ -1,0 +1,178 @@
+[
+  {
+    "title": "Margin-adaptive temperature scaling",
+    "question": "Can top-two logit margin condition a rank-preserving temperature and improve calibration under Gaussian corruption?",
+    "hypothesis": "A shrinkage-regularized margin-conditioned temperature lowers paired ECE versus scalar temperature scaling without worse NLL or changed argmax.",
+    "treatment": "Fit a bounded monotone mapping from clean-calibration top-two margin to a positive per-example temperature, shrunk toward one global temperature.",
+    "control": "Scalar temperature scaling fit on the identical clean calibration logits and labels.",
+    "primary_metric": "ece",
+    "priority": 0.9,
+    "tags": ["calibration", "margin"],
+    "metadata": {"scenario": "positive", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Entropy-binned shrinkage scaling",
+    "question": "Does entropy-conditioned shrinkage improve post-hoc calibration under corruption?",
+    "hypothesis": "A small number of entropy bins with temperatures shrunk to a global fit lowers ECE while preserving predictions and NLL.",
+    "treatment": "Fit bounded temperatures for quantile bins of clean-calibration predictive entropy with global shrinkage.",
+    "control": "Scalar temperature scaling under the same calibration examples and optimization budget.",
+    "primary_metric": "ece",
+    "priority": 0.88,
+    "tags": ["calibration", "entropy"],
+    "metadata": {"scenario": "positive", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Logit-norm conditional scaling",
+    "question": "Can logit norm identify overconfidence modes induced by Gaussian corruption?",
+    "hypothesis": "A bounded logit-norm-conditioned scalar multiplier improves ECE over global temperature scaling without changing class ranking.",
+    "treatment": "Fit a regularized affine function of centered logit norm that produces one positive scalar per example.",
+    "control": "One global scalar temperature fit on identical clean calibration logits.",
+    "primary_metric": "ece",
+    "priority": 0.87,
+    "tags": ["calibration", "logit-norm"],
+    "metadata": {"scenario": "positive", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Top-confidence spline temperature",
+    "question": "Does a low-capacity monotone function of maximum confidence improve shifted calibration?",
+    "hypothesis": "A three-knot monotone confidence-to-temperature function reduces ECE with no NLL or argmax regression.",
+    "treatment": "Fit three bounded temperatures over clean-calibration confidence knots and linearly interpolate a positive per-example scale.",
+    "control": "Scalar temperature scaling fit to the same clean calibration split.",
+    "primary_metric": "ece",
+    "priority": 0.86,
+    "tags": ["calibration", "confidence"],
+    "metadata": {"scenario": "positive", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Trimmed-loss robust temperature",
+    "question": "Can robustly fitting temperature reduce sensitivity to mislabeled calibration examples?",
+    "hypothesis": "Trimming the largest calibration NLL contributions yields lower corrupted-set ECE than ordinary scalar temperature scaling.",
+    "treatment": "Fit one temperature by deterministic trimmed NLL and bounded search on the identical calibration logits.",
+    "control": "Ordinary scalar temperature scaling with the same candidate grid.",
+    "primary_metric": "ece",
+    "priority": 0.82,
+    "tags": ["calibration", "robustness"],
+    "metadata": {"scenario": "negative", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Huberized calibration temperature",
+    "question": "Does Huberizing example losses improve robustness of temperature fitting?",
+    "hypothesis": "A Huberized calibration objective improves ECE without degrading NLL on corrupted evaluation data.",
+    "treatment": "Fit a global positive temperature using a deterministic bounded Huberized loss over clean calibration examples.",
+    "control": "Standard scalar NLL temperature scaling with the same bounded search grid.",
+    "primary_metric": "ece",
+    "priority": 0.81,
+    "tags": ["calibration", "robust-objective"],
+    "metadata": {"scenario": "negative", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Median bootstrap temperature",
+    "question": "Can aggregation across deterministic calibration bootstraps stabilize temperature scaling?",
+    "hypothesis": "The median of temperatures fitted on fixed bootstrap subsets reduces ECE variance and mean ECE.",
+    "treatment": "Fit temperatures on fixed deterministic bootstrap index sets and use their median scalar.",
+    "control": "One scalar temperature fit once to all calibration examples.",
+    "primary_metric": "ece",
+    "priority": 0.8,
+    "tags": ["calibration", "bootstrap"],
+    "metadata": {"scenario": "negative", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Jackknife-averaged temperature",
+    "question": "Does deterministic jackknife aggregation improve temperature stability under shift?",
+    "hypothesis": "Averaging leave-block-out temperature estimates lowers paired ECE while retaining NLL.",
+    "treatment": "Partition calibration data into fixed blocks, fit leave-block-out temperatures, and aggregate their log values.",
+    "control": "Scalar temperature scaling on the full identical calibration data.",
+    "primary_metric": "ece",
+    "priority": 0.79,
+    "tags": ["calibration", "jackknife"],
+    "metadata": {"scenario": "negative", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Regularized classwise temperatures",
+    "question": "Can strongly regularized classwise temperatures outperform a global temperature?",
+    "hypothesis": "Classwise temperatures shrunk toward a global value lower ECE without altering argmax.",
+    "treatment": "Fit per-class positive scales with strong shrinkage and convert them to a single rank-preserving example scale.",
+    "control": "Scalar temperature scaling on identical logits and labels.",
+    "primary_metric": "ece",
+    "priority": 0.78,
+    "tags": ["calibration", "classwise"],
+    "metadata": {"scenario": "revise", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Margin-entropy interaction scaling",
+    "question": "Is a low-rank interaction between margin and entropy useful for shifted calibration?",
+    "hypothesis": "A bounded two-feature scale improves ECE beyond scalar temperature scaling without guardrail violations.",
+    "treatment": "Fit a regularized positive scale from standardized margin, entropy, and one interaction term.",
+    "control": "Scalar temperature scaling with identical data and seeds.",
+    "primary_metric": "ece",
+    "priority": 0.77,
+    "tags": ["calibration", "interaction"],
+    "metadata": {"scenario": "revise", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Confidence-tail adaptive scaling",
+    "question": "Can separately treating only the high-confidence tail improve ECE under corruption?",
+    "hypothesis": "A tail-specific temperature shrunk to a global temperature improves ECE and NLL.",
+    "treatment": "Fit one global and one high-confidence-tail temperature with deterministic threshold and shrinkage.",
+    "control": "A single global temperature on the same calibration split.",
+    "primary_metric": "ece",
+    "priority": 0.76,
+    "tags": ["calibration", "tail"],
+    "metadata": {"scenario": "revise", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Low-margin selective rescaling",
+    "question": "Does rescaling only ambiguous examples improve corrupted calibration?",
+    "hypothesis": "A bounded low-margin-specific scale lowers ECE without any prediction change.",
+    "treatment": "Fit a global temperature plus one shrunk scale for a fixed low-margin quantile.",
+    "control": "Scalar temperature scaling on identical clean calibration logits.",
+    "primary_metric": "ece",
+    "priority": 0.75,
+    "tags": ["calibration", "ambiguity"],
+    "metadata": {"scenario": "revise", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Two-resolution confidence binning",
+    "question": "Do coarse and fine confidence partitions provide complementary calibration signals?",
+    "hypothesis": "A shrinkage blend of two- and four-bin temperatures improves ECE over a global scalar.",
+    "treatment": "Fit deterministic two-bin and four-bin temperatures and shrink their log-scale blend to the global fit.",
+    "control": "Scalar temperature scaling with identical calibration examples.",
+    "primary_metric": "ece",
+    "priority": 0.74,
+    "tags": ["calibration", "binning"],
+    "metadata": {"scenario": "run_more", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Cross-fit temperature aggregation",
+    "question": "Can fixed cross-fitting reduce overfitting in post-hoc temperature selection?",
+    "hypothesis": "Geometric aggregation of fixed-fold temperature estimates reduces held-out ECE.",
+    "treatment": "Fit temperatures on deterministic folds and geometrically aggregate them without evaluation-label access.",
+    "control": "Scalar temperature scaling fit once to all clean calibration examples.",
+    "primary_metric": "ece",
+    "priority": 0.73,
+    "tags": ["calibration", "cross-fit"],
+    "metadata": {"scenario": "run_more", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Target-entropy temperature fitting",
+    "question": "Can matching a robust calibration entropy target improve corrupted-set calibration?",
+    "hypothesis": "A bounded temperature matching a trimmed correct-class confidence target lowers ECE.",
+    "treatment": "Fit one positive temperature to match a robust target derived only from clean calibration logits and labels.",
+    "control": "NLL-optimal scalar temperature scaling on the same inputs.",
+    "primary_metric": "ece",
+    "priority": 0.7,
+    "tags": ["calibration", "entropy-target"],
+    "metadata": {"scenario": "inconclusive", "sleep_sec": 0.12}
+  },
+  {
+    "title": "Calibration-loss ensemble scale",
+    "question": "Does blending temperatures from NLL and calibration-gap objectives improve robustness?",
+    "hypothesis": "A fixed shrinkage blend of two independently fitted scalar temperatures lowers ECE without worse NLL.",
+    "treatment": "Fit bounded scalar temperatures under NLL and a differentiable calibration-gap proxy, then geometrically blend them.",
+    "control": "NLL-only scalar temperature scaling using the same clean calibration examples.",
+    "primary_metric": "ece",
+    "priority": 0.69,
+    "tags": ["calibration", "objective-ensemble"],
+    "metadata": {"scenario": "inconclusive", "sleep_sec": 0.12}
+  }
+]

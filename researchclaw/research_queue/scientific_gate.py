@@ -41,6 +41,7 @@ def research_spec_from_idea(
 ) -> ResearchSpec:
     if idea.research_spec is not None:
         return idea.research_spec
+    is_cifar = benchmark_id == "cifar10_calibration"
     return ResearchSpec(
         question=idea.question,
         hypothesis=idea.hypothesis,
@@ -68,6 +69,19 @@ def research_spec_from_idea(
                 metric="accuracy",
                 direction=MetricDirection.MAXIMIZE,
             ),
+        ),
+        calibration_split="clean" if is_cifar else "",
+        evaluation_split="corrupted" if is_cifar else "",
+        pairing_strategy="disjoint_example_blocks" if is_cifar else "",
+        require_per_example_argmax=is_cifar,
+        required_compute_accounting=(
+            (
+                "calibration_examples",
+                "evaluation_examples",
+                "model_forward_examples",
+            )
+            if is_cifar
+            else ()
         ),
     )
 
@@ -144,6 +158,31 @@ def validate_research_spec(
             errors.append(
                 "cifar10_calibration requires guardrail_metrics, "
                 "minimum_pairs >= 2, and primary_requires_effect_ci=true"
+            )
+        required_compute = {
+            "calibration_examples",
+            "evaluation_examples",
+            "model_forward_examples",
+        }
+        declared_compute = {
+            _normalized_name(item)
+            for item in spec.required_compute_accounting
+        }
+        checks["has_frozen_protocol_contract"] = bool(
+            _normalized_name(spec.calibration_split) == "clean"
+            and _normalized_name(spec.evaluation_split) == "corrupted"
+            and _normalized_name(spec.pairing_strategy)
+            == "disjoint_example_blocks"
+            and spec.require_per_example_argmax
+            and required_compute <= declared_compute
+        )
+        if not checks["has_frozen_protocol_contract"]:
+            errors.append(
+                "cifar10_calibration requires clean calibration, corrupted "
+                "evaluation, disjoint example-block pairs, per-example "
+                "argmax evidence, and compute "
+                "accounting for calibration_examples, evaluation_examples, "
+                "and model_forward_examples"
             )
 
     combined = " ".join(
@@ -225,6 +264,90 @@ def validate_benchmark_result(
             "insufficient independent pairs: "
             f"required {spec.minimum_pairs}, observed {len(per_seed)}"
         )
+
+    evidence_raw = result.get("evidence", {})
+    evidence = dict(evidence_raw) if isinstance(evidence_raw, Mapping) else {}
+    protocol_raw = evidence.get("protocol", {})
+    protocol = (
+        dict(protocol_raw) if isinstance(protocol_raw, Mapping) else {}
+    )
+    if spec.calibration_split:
+        observed = str(protocol.get("calibration_split", "") or "")
+        checks["calibration_split_attested"] = (
+            _normalized_name(observed)
+            == _normalized_name(spec.calibration_split)
+        )
+        if not checks["calibration_split_attested"]:
+            errors.append(
+                "benchmark protocol did not attest required calibration split "
+                f"{spec.calibration_split!r}; observed {observed!r}"
+            )
+    if spec.evaluation_split:
+        observed = str(protocol.get("evaluation_split", "") or "")
+        checks["evaluation_split_attested"] = (
+            _normalized_name(observed)
+            == _normalized_name(spec.evaluation_split)
+        )
+        if not checks["evaluation_split_attested"]:
+            errors.append(
+                "benchmark protocol did not attest required evaluation split "
+                f"{spec.evaluation_split!r}; observed {observed!r}"
+            )
+    if spec.pairing_strategy:
+        observed = str(protocol.get("pairing_strategy", "") or "")
+        checks["pairing_strategy_attested"] = (
+            _normalized_name(observed)
+            == _normalized_name(spec.pairing_strategy)
+        )
+        if not checks["pairing_strategy_attested"]:
+            errors.append(
+                "benchmark protocol did not attest required pairing strategy "
+                f"{spec.pairing_strategy!r}; observed {observed!r}"
+            )
+
+    if spec.require_per_example_argmax:
+        argmax_raw = evidence.get("argmax", {})
+        argmax = dict(argmax_raw) if isinstance(argmax_raw, Mapping) else {}
+        per_pair_argmax = bool(per_seed) and all(
+            isinstance(row, Mapping)
+            and isinstance(row.get("evidence"), Mapping)
+            and row["evidence"].get("argmax_preserved") is True
+            and _zero_count(row["evidence"].get("argmax_changed_count"))
+            and bool(row["evidence"].get("baseline_predictions_sha256"))
+            and bool(row["evidence"].get("treatment_predictions_sha256"))
+            for row in per_seed
+        )
+        checks["per_example_argmax_attested"] = (
+            argmax.get("argmax_preserved") is True
+            and _zero_count(argmax.get("argmax_changed_count"))
+            and argmax.get("per_example_prediction_hashes") is True
+            and per_pair_argmax
+        )
+        if not checks["per_example_argmax_attested"]:
+            errors.append(
+                "benchmark did not prove per-example argmax preservation"
+            )
+
+    if spec.required_compute_accounting:
+        compute_raw = evidence.get("compute_accounting", {})
+        compute = dict(compute_raw) if isinstance(compute_raw, Mapping) else {}
+        observed_dimensions = {
+            _normalized_name(str(item))
+            for item in compute.get("matched_dimensions", ())
+        }
+        required_dimensions = {
+            _normalized_name(item) for item in spec.required_compute_accounting
+        }
+        checks["compute_matching_attested"] = (
+            compute.get("all_declared_dimensions_matched") is True
+            and required_dimensions <= observed_dimensions
+        )
+        if not checks["compute_matching_attested"]:
+            missing = sorted(required_dimensions - observed_dimensions)
+            errors.append(
+                "benchmark did not attest required compute matching"
+                + (f": missing {', '.join(missing)}" if missing else "")
+            )
 
     if spec.primary_requires_effect_ci:
         interval = _effect_interval(
@@ -420,6 +543,11 @@ def _finite_float(value: Any) -> float | None:
     return number if isfinite(number) else None
 
 
+def _zero_count(value: Any) -> bool:
+    number = _finite_float(value)
+    return number == 0.0
+
+
 def _beneficial_effect(
     baseline: float,
     treatment: float,
@@ -579,6 +707,10 @@ def _metric_key(value: str) -> str:
             return key
     token = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
     return token or "primary"
+
+
+def _normalized_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().casefold()).strip("_")
 
 
 def _infer_metric_direction(primary_metric: str) -> MetricDirection:

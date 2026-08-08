@@ -49,6 +49,7 @@ class QueueLimits:
     max_infra_retries: int = 1
     max_prepare_repairs: int = 1
     duplicate_threshold: float = 0.78
+    required_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +109,7 @@ class BenchmarkPromotionConfig:
     runtime_python: str = "python"
     logits_cache: str = ""
     prefer_logits_cache: bool = True
+    direct_all_admitted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +185,19 @@ class ResearchQueueConfig:
             "research_queue",
         )
         limits_raw = _mapping(data.get("limits"), "limits")
+        required_paths_raw = limits_raw.get("required_paths", ())
+        if isinstance(required_paths_raw, str):
+            required_paths = tuple(
+                item.strip().casefold()
+                for item in required_paths_raw.split(",")
+                if item.strip()
+            )
+        else:
+            required_paths = tuple(
+                str(item).strip().casefold()
+                for item in (required_paths_raw or ())
+                if str(item).strip()
+            )
         limits = QueueLimits(
             candidate_target=int(limits_raw.get("candidate_target", 6)),
             generation_batch_size=int(limits_raw.get("generation_batch_size", 2)),
@@ -199,6 +214,7 @@ class ResearchQueueConfig:
             max_infra_retries=int(limits_raw.get("max_infra_retries", 1)),
             max_prepare_repairs=int(limits_raw.get("max_prepare_repairs", 1)),
             duplicate_threshold=float(limits_raw.get("duplicate_threshold", 0.78)),
+            required_paths=required_paths,
         )
         concurrency_raw = _mapping(
             data.get("concurrency"),
@@ -331,6 +347,9 @@ class ResearchQueueConfig:
             ),
             logits_cache=resolved_optional_path("logits_cache"),
             prefer_logits_cache=bool(promotion_raw.get("prefer_logits_cache", True)),
+            direct_all_admitted=bool(
+                promotion_raw.get("direct_all_admitted", False)
+            ),
         )
         memory_raw = _mapping(data.get("research_memory"), "research_memory")
         research_memory = ResearchMemoryConfig(
@@ -407,6 +426,21 @@ class ResearchQueueConfig:
             return Path(self.brief_file).read_text(encoding="utf-8").strip()
         return self.brief.strip()
 
+    def path_reachability(self) -> dict[str, bool]:
+        """Report whether bounded action paths fit the configured step budget."""
+
+        return {
+            "run_more": (
+                self.limits.max_runs_per_budget >= 2
+                and self.limits.max_steps_per_idea >= 4
+            ),
+            "revise": (
+                self.limits.max_revisions_per_idea >= 2
+                and self.limits.max_steps_per_idea >= 6
+            ),
+            "b2": self.limits.max_steps_per_idea >= 7,
+        }
+
     def validate(self) -> None:
         if self.limits.candidate_target < 1:
             raise ValueError("candidate_target must be positive")
@@ -428,6 +462,22 @@ class ResearchQueueConfig:
             raise ValueError("max_steps_per_idea must be positive")
         if self.limits.max_prepare_repairs < 0:
             raise ValueError("max_prepare_repairs cannot be negative")
+        known_paths = set(self.path_reachability())
+        unknown_paths = sorted(set(self.limits.required_paths) - known_paths)
+        if unknown_paths:
+            raise ValueError(
+                "unknown limits.required_paths: " + ", ".join(unknown_paths)
+            )
+        unreachable = [
+            name
+            for name in self.limits.required_paths
+            if not self.path_reachability()[name]
+        ]
+        if unreachable:
+            raise ValueError(
+                "configured action paths are unreachable under current "
+                "revision/step limits: " + ", ".join(unreachable)
+            )
         if self.concurrency.max_llm_jobs < 1:
             raise ValueError("max_llm_jobs must be positive")
         if self.concurrency.max_run_jobs < 1:
@@ -477,6 +527,15 @@ class ResearchQueueConfig:
                     )
             if self.promotion.max_promotions < 1:
                 raise ValueError("promotion.max_promotions must be positive")
+            if (
+                self.promotion.direct_all_admitted
+                and self.limits.max_total_ideas > 0
+                and self.promotion.max_promotions < self.limits.max_total_ideas
+            ):
+                raise ValueError(
+                    "direct_all_admitted requires max_promotions >= "
+                    "limits.max_total_ideas"
+                )
             if self.execution.backend == "clusterbridge":
                 benchmark_path = Path(self.promotion.benchmark_config)
                 if not str(benchmark_path).startswith("/root/shared/"):
