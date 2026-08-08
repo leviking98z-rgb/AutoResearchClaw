@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 import numpy as np
 import yaml
 
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
 DEFAULT_DATASET_URL = (
     "https://hf-mirror.com/datasets/uoft-cs/cifar10/resolve/main/"
     "plain_text/test-00000-of-00001.parquet"
@@ -142,7 +142,7 @@ class BenchmarkConfig:
 class BenchmarkResult:
     status: str
     metrics: dict[str, float]
-    uncertainty: dict[str, float]
+    uncertainty: dict[str, Any]
     per_seed: list[dict[str, Any]]
     assets: dict[str, Any]
     usage: dict[str, Any]
@@ -207,6 +207,66 @@ def evaluate_probabilities(
                 float(correct[mask].mean()) - float(confidence[mask].mean())
             )
     return {"ece": float(ece), "nll": nll, "accuracy": accuracy}
+
+
+def paired_bootstrap_mean_interval(
+    values: np.ndarray | list[float],
+    *,
+    confidence_level: float = 0.95,
+    samples: int = 10000,
+) -> list[float]:
+    """Return a deterministic percentile interval for a paired mean effect."""
+
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1 or len(array) < 2 or not np.isfinite(array).all():
+        raise ContractError("paired effect CI requires at least two finite values")
+    if not 0.5 <= confidence_level < 1.0:
+        raise ContractError("confidence_level must be in [0.5, 1.0)")
+    rng = np.random.default_rng(0)
+    indices = rng.integers(0, len(array), size=(samples, len(array)))
+    means = array[indices].mean(axis=1)
+    alpha = 1.0 - confidence_level
+    lower, upper = np.quantile(
+        means,
+        [alpha / 2.0, 1.0 - alpha / 2.0],
+    )
+    return [float(lower), float(upper)]
+
+
+def _summarize_rows(
+    rows: list[dict[str, Any]],
+) -> tuple[dict[str, float], dict[str, Any]]:
+    metrics: dict[str, float] = {}
+    uncertainty: dict[str, Any] = {}
+    for method in ("baseline", "treatment"):
+        for metric in ("ece", "nll", "accuracy"):
+            values = np.asarray(
+                [row[method][metric] for row in rows],
+                dtype=np.float64,
+            )
+            metrics[f"{method}_{metric}"] = float(values.mean())
+            uncertainty[f"{method}_{metric}_std"] = float(
+                values.std(ddof=1) if len(values) > 1 else 0.0
+            )
+    for metric in ("ece", "nll", "accuracy"):
+        effects = np.asarray(
+            [
+                row["baseline"][metric] - row["treatment"][metric]
+                if metric in {"ece", "nll"}
+                else row["treatment"][metric] - row["baseline"][metric]
+                for row in rows
+            ],
+            dtype=np.float64,
+        )
+        metrics[f"effect_{metric}"] = float(effects.mean())
+        uncertainty[f"effect_{metric}_std"] = float(
+            effects.std(ddof=1) if len(effects) > 1 else 0.0
+        )
+        if len(effects) > 1:
+            uncertainty[f"effect_{metric}_ci"] = paired_bootstrap_mean_interval(
+                effects,
+            )
+    return metrics, uncertainty
 
 
 def _temperature_fit(logits: np.ndarray, labels: np.ndarray) -> float:
@@ -626,23 +686,7 @@ class Cifar10CalibrationAdapter:
                     "effect_ece": (baseline_metrics["ece"] - treatment_metrics["ece"]),
                 }
             )
-        metrics: dict[str, float] = {}
-        uncertainty: dict[str, float] = {}
-        for method in ("baseline", "treatment"):
-            for metric in ("ece", "nll", "accuracy"):
-                values = np.asarray(
-                    [row[method][metric] for row in rows],
-                    dtype=np.float64,
-                )
-                metrics[f"{method}_{metric}"] = float(values.mean())
-                uncertainty[f"{method}_{metric}_std"] = float(
-                    values.std(ddof=1) if len(values) > 1 else 0.0
-                )
-        effects = np.asarray([row["effect_ece"] for row in rows], dtype=np.float64)
-        metrics["effect_ece"] = float(effects.mean())
-        uncertainty["effect_ece_std"] = float(
-            effects.std(ddof=1) if len(effects) > 1 else 0.0
-        )
+        metrics, uncertainty = _summarize_rows(rows)
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         result_path = self.config.output_dir / "result.json"
         result = BenchmarkResult(
@@ -702,6 +746,216 @@ class Cifar10CalibrationAdapter:
                 logits = model((batch - mean) / std)
                 outputs.append(logits.detach().cpu().numpy())
         return np.concatenate(outputs, axis=0).astype(np.float64)
+
+
+def build_logits_cache(
+    path: str | Path,
+    *,
+    cache_path: str | Path,
+) -> dict[str, Any]:
+    """Materialize pinned per-seed logits so treatments can iterate without GPU."""
+
+    config = BenchmarkConfig.from_file(path)
+    started = time.monotonic()
+    import torch
+
+    if config.require_cuda and not torch.cuda.is_available():
+        raise ContractError("CUDA is required but unavailable")
+    device = torch.device(
+        config.device if config.device != "cuda" or torch.cuda.is_available() else "cpu"
+    )
+    dataset_root, dataset_assets = _ensure_dataset(config)
+    weights = config.cache_dir / "models" / Path(urlparse(config.weights_url).path).name
+    weights_hash = _ensure_file(
+        url=config.weights_url,
+        path=weights,
+        expected_sha256=config.weights_sha256,
+        allow_downloads=config.allow_downloads,
+        label="pretrained model weights",
+    )
+    source_root, source_commit = _ensure_model_source(config)
+    sys.path.insert(0, str(source_root))
+    try:
+        package = __import__("pytorch_cifar_models")
+        factory = getattr(package, config.model_name)
+        model = factory(pretrained=False)
+    finally:
+        try:
+            sys.path.remove(str(source_root))
+        except ValueError:
+            pass
+    model.load_state_dict(torch.load(weights, map_location="cpu"))
+    model.eval().to(device)
+    images, labels = _load_cifar10_test(
+        dataset_root,
+        dataset_format=config.dataset_format,
+    )
+    required = config.calibration_examples + config.examples
+    adapter = Cifar10CalibrationAdapter(config)
+    arrays: dict[str, np.ndarray] = {}
+    for seed in config.seeds:
+        order = np.arange(len(labels))
+        random.Random(seed).shuffle(order)
+        calibration_indices = order[: config.calibration_examples]
+        evaluation_indices = order[config.calibration_examples : required]
+        arrays[f"calibration_logits_{seed}"] = adapter._infer(
+            model,
+            _corrupt(
+                images[calibration_indices],
+                seed=seed * 2 + 1,
+                corruption=config.corruption,
+                severity=config.corruption_severity,
+            ),
+            device=device,
+            torch=torch,
+        )
+        arrays[f"calibration_labels_{seed}"] = labels[calibration_indices]
+        arrays[f"evaluation_logits_{seed}"] = adapter._infer(
+            model,
+            _corrupt(
+                images[evaluation_indices],
+                seed=seed * 2 + 2,
+                corruption=config.corruption,
+                severity=config.corruption_severity,
+            ),
+            device=device,
+            torch=torch,
+        )
+        arrays[f"evaluation_labels_{seed}"] = labels[evaluation_indices]
+    destination = Path(cache_path).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "schema_version": 1,
+        "seeds": list(config.seeds),
+        "ece_bins": config.ece_bins,
+        "assets": {
+            **dataset_assets,
+            "weights_sha256": weights_hash,
+            "model_source_commit": source_commit,
+            "model_name": config.model_name,
+        },
+        "provenance": {
+            "corruption": config.corruption,
+            "corruption_severity": config.corruption_severity,
+            "examples": config.examples,
+            "calibration_examples": config.calibration_examples,
+        },
+        "usage": {
+            "device": str(device),
+            "gpu_count": int(device.type == "cuda"),
+            "wall_seconds": time.monotonic() - started,
+        },
+    }
+    arrays["metadata_json"] = np.asarray(
+        json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+    )
+    np.savez_compressed(destination, **arrays)
+    return metadata
+
+
+def run_from_logits_cache(
+    path: str | Path,
+    *,
+    cache_path: str | Path,
+) -> BenchmarkResult:
+    """Evaluate one treatment from a trusted pinned logits cache on CPU."""
+
+    config = BenchmarkConfig.from_file(path)
+    started = time.monotonic()
+    cache = np.load(
+        Path(cache_path).expanduser().resolve(),
+        allow_pickle=False,
+    )
+    metadata = json.loads(str(cache["metadata_json"].item()))
+    expected = {
+        "corruption": config.corruption,
+        "corruption_severity": config.corruption_severity,
+        "examples": config.examples,
+        "calibration_examples": config.calibration_examples,
+    }
+    if metadata.get("provenance") != expected:
+        raise ContractError(
+            "logits cache provenance does not match benchmark configuration"
+        )
+    if tuple(metadata.get("seeds", ())) != tuple(config.seeds):
+        raise ContractError("logits cache seeds do not match benchmark configuration")
+    treatment = _load_treatment(config.treatment_path)
+    rows: list[dict[str, Any]] = []
+    for seed in config.seeds:
+        calibration_logits = np.asarray(cache[f"calibration_logits_{seed}"])
+        calibration_labels = np.asarray(cache[f"calibration_labels_{seed}"])
+        evaluation_logits = np.asarray(cache[f"evaluation_logits_{seed}"])
+        evaluation_labels = np.asarray(cache[f"evaluation_labels_{seed}"])
+        temperature = _temperature_fit(calibration_logits, calibration_labels)
+        baseline_metrics = evaluate_probabilities(
+            _softmax(evaluation_logits / temperature),
+            evaluation_labels,
+            bins=config.ece_bins,
+        )
+        state = treatment.fit(
+            calibration_logits.copy(),
+            calibration_labels.copy(),
+        )
+        transformed = np.asarray(
+            treatment.transform(evaluation_logits.copy(), state),
+            dtype=np.float64,
+        )
+        if transformed.shape != evaluation_logits.shape:
+            raise ContractError(
+                "treatment transformed logits must preserve shape "
+                f"{evaluation_logits.shape}, got {transformed.shape}"
+            )
+        if not np.isfinite(transformed).all():
+            raise ContractError(
+                "treatment transformed logits contain non-finite values"
+            )
+        treatment_metrics = evaluate_probabilities(
+            _softmax(transformed),
+            evaluation_labels,
+            bins=config.ece_bins,
+        )
+        rows.append(
+            {
+                "seed": seed,
+                "temperature": temperature,
+                "baseline": baseline_metrics,
+                "treatment": treatment_metrics,
+                "effect_ece": baseline_metrics["ece"] - treatment_metrics["ece"],
+            }
+        )
+    metrics, uncertainty = _summarize_rows(rows)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    result_path = config.output_dir / "result.json"
+    result = BenchmarkResult(
+        status="ok",
+        metrics=metrics,
+        uncertainty=uncertainty,
+        per_seed=rows,
+        assets=dict(metadata.get("assets", {})),
+        usage={
+            "device": "cpu-logits-cache",
+            "gpu_count": 0,
+            "wall_seconds": time.monotonic() - started,
+            "examples_per_seed": config.examples,
+            "calibration_examples_per_seed": config.calibration_examples,
+            "seeds": len(config.seeds),
+        },
+        provenance={
+            "adapter": "Cifar10CalibrationAdapter",
+            "adapter_schema_version": RESULT_SCHEMA_VERSION,
+            "treatment_path": str(config.treatment_path),
+            "treatment_sha256": sha256_path(config.treatment_path),
+            "corruption": config.corruption,
+            "corruption_severity": config.corruption_severity,
+            "logits_cache_sha256": sha256_path(cache_path),
+        },
+        artifacts=[str(result_path)],
+    )
+    result_path.write_text(
+        json.dumps(result.to_dict(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return result
 
 
 def run_from_file(path: str | Path) -> BenchmarkResult:

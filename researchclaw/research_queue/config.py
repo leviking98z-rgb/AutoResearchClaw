@@ -73,6 +73,7 @@ class QueueExecution:
     python_executable: str = "python"
     simulation: bool = True
     allowed_python_imports: tuple[str, ...] = ("numpy",)
+    remote_pythonpath: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +83,38 @@ class QueueGPU:
     poll_interval_sec: float = 1.0
     pass_env: tuple[str, ...] = ()
     resource_manager: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ScientificGateConfig:
+    enabled: bool = False
+    require_structured_spec: bool = True
+    max_repairs: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class BenchmarkPromotionConfig:
+    enabled: bool = False
+    benchmark_id: str = "cifar10_calibration"
+    benchmark_config: str = ""
+    trigger_conclusions: tuple[str, ...] = ("positive", "inconclusive")
+    minimum_priority: float = 0.0
+    minimum_effect: float = 0.0
+    max_promotions: int = 1
+    max_treatment_repairs: int = 1
+    preflight_examples: int = 96
+    preflight_classes: int = 10
+    preflight_timeout_sec: float = 20.0
+    runtime_python: str = "python"
+    logits_cache: str = ""
+    prefer_logits_cache: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchMemoryConfig:
+    enabled: bool = False
+    url: str = "http://127.0.0.1:8077"
+    timeout_sec: float = 10.0
 
 
 def _default_budgets() -> dict[BudgetLevel, BudgetSpec]:
@@ -117,6 +150,11 @@ class ResearchQueueConfig:
     models: QueueModels = field(default_factory=QueueModels)
     execution: QueueExecution = field(default_factory=QueueExecution)
     gpu: QueueGPU = field(default_factory=QueueGPU)
+    scientific_gate: ScientificGateConfig = field(default_factory=ScientificGateConfig)
+    promotion: BenchmarkPromotionConfig = field(
+        default_factory=BenchmarkPromotionConfig
+    )
+    research_memory: ResearchMemoryConfig = field(default_factory=ResearchMemoryConfig)
     budgets: dict[BudgetLevel, BudgetSpec] = field(default_factory=_default_budgets)
 
     @property
@@ -211,6 +249,9 @@ class ResearchQueueConfig:
             ),
             simulation=bool(execution_raw.get("simulation", True)),
             allowed_python_imports=allowed_python_imports,
+            remote_pythonpath=str(
+                execution_raw.get("remote_pythonpath", "") or ""
+            ).strip(),
         )
         gpu_raw = _mapping(data.get("gpu"), "gpu")
         pass_env_raw = gpu_raw.get("pass_env", ())
@@ -231,6 +272,74 @@ class ResearchQueueConfig:
                 gpu_raw.get("resource_manager"),
                 "gpu.resource_manager",
             ),
+        )
+        gate_raw = _mapping(data.get("scientific_gate"), "scientific_gate")
+        scientific_gate = ScientificGateConfig(
+            enabled=bool(gate_raw.get("enabled", False)),
+            require_structured_spec=bool(gate_raw.get("require_structured_spec", True)),
+            max_repairs=max(0, int(gate_raw.get("max_repairs", 1))),
+        )
+        promotion_raw = _mapping(data.get("promotion"), "promotion")
+        trigger_raw = promotion_raw.get(
+            "trigger_conclusions",
+            ("positive", "inconclusive"),
+        )
+        if isinstance(trigger_raw, str):
+            trigger_conclusions = tuple(
+                item.strip() for item in trigger_raw.split(",") if item.strip()
+            )
+        else:
+            trigger_conclusions = tuple(
+                str(item).strip() for item in (trigger_raw or ()) if str(item).strip()
+            )
+
+        def resolved_optional_path(name: str) -> str:
+            raw_value = str(promotion_raw.get(name, "") or "").strip()
+            if raw_value and not Path(raw_value).expanduser().is_absolute():
+                return str((base / raw_value).resolve())
+            return raw_value
+
+        promotion = BenchmarkPromotionConfig(
+            enabled=bool(promotion_raw.get("enabled", False)),
+            benchmark_id=str(
+                promotion_raw.get("benchmark_id", "cifar10_calibration")
+                or "cifar10_calibration"
+            ).strip(),
+            benchmark_config=resolved_optional_path("benchmark_config"),
+            trigger_conclusions=trigger_conclusions,
+            minimum_priority=float(promotion_raw.get("minimum_priority", 0.0)),
+            minimum_effect=float(promotion_raw.get("minimum_effect", 0.0)),
+            max_promotions=max(0, int(promotion_raw.get("max_promotions", 1))),
+            max_treatment_repairs=max(
+                0,
+                int(promotion_raw.get("max_treatment_repairs", 1)),
+            ),
+            preflight_examples=max(
+                8,
+                int(promotion_raw.get("preflight_examples", 96)),
+            ),
+            preflight_classes=max(
+                2,
+                int(promotion_raw.get("preflight_classes", 10)),
+            ),
+            preflight_timeout_sec=max(
+                1.0,
+                float(promotion_raw.get("preflight_timeout_sec", 20.0)),
+            ),
+            runtime_python=str(
+                promotion_raw.get("runtime_python", "python") or "python"
+            ),
+            logits_cache=resolved_optional_path("logits_cache"),
+            prefer_logits_cache=bool(promotion_raw.get("prefer_logits_cache", True)),
+        )
+        memory_raw = _mapping(data.get("research_memory"), "research_memory")
+        research_memory = ResearchMemoryConfig(
+            enabled=bool(memory_raw.get("enabled", False)),
+            url=str(
+                memory_raw.get("url", "http://127.0.0.1:8077")
+                or "http://127.0.0.1:8077"
+            ),
+            timeout_sec=float(memory_raw.get("timeout_sec", 10.0)),
         )
         budgets = _default_budgets()
         budgets_raw = _mapping(data.get("budgets"), "budgets")
@@ -277,6 +386,9 @@ class ResearchQueueConfig:
             models=models,
             execution=execution,
             gpu=gpu,
+            scientific_gate=scientific_gate,
+            promotion=promotion,
+            research_memory=research_memory,
             budgets=budgets,
         )
         config.validate()
@@ -332,6 +444,48 @@ class ResearchQueueConfig:
             raise ValueError("max_gpus_per_run cannot exceed max_total_gpus")
         if self.execution.backend not in {"local", "clusterbridge"}:
             raise ValueError("execution.backend must be local or clusterbridge")
+        if (
+            self.execution.backend == "clusterbridge"
+            and self.execution.remote_pythonpath
+            and not self.execution.remote_pythonpath.startswith("/root/shared/")
+        ):
+            raise ValueError(
+                "clusterbridge execution.remote_pythonpath must be under /root/shared"
+            )
+        if self.scientific_gate.max_repairs < 0:
+            raise ValueError("scientific_gate.max_repairs cannot be negative")
+        if self.promotion.enabled:
+            if not self.scientific_gate.enabled:
+                raise ValueError("promotion requires scientific_gate.enabled")
+            if not self.promotion.benchmark_config:
+                raise ValueError("promotion.benchmark_config is required when enabled")
+            if not Path(self.promotion.benchmark_config).is_file():
+                raise ValueError(
+                    "promotion.benchmark_config does not exist: "
+                    f"{self.promotion.benchmark_config}"
+                )
+            if self.promotion.benchmark_id == "cifar10_calibration":
+                from researchclaw.benchmark_adapter.cifar10_calibration import (
+                    BenchmarkConfig,
+                )
+
+                benchmark = BenchmarkConfig.from_file(self.promotion.benchmark_config)
+                if len(benchmark.seeds) < 2:
+                    raise ValueError(
+                        "cifar10_calibration requires at least 2 benchmark "
+                        "seeds to compute a paired effect interval"
+                    )
+            if self.promotion.max_promotions < 1:
+                raise ValueError("promotion.max_promotions must be positive")
+            if self.execution.backend == "clusterbridge":
+                benchmark_path = Path(self.promotion.benchmark_config)
+                if not str(benchmark_path).startswith("/root/shared/"):
+                    raise ValueError(
+                        "clusterbridge promotion.benchmark_config must be "
+                        "under /root/shared"
+                    )
+        if self.research_memory.timeout_sec <= 0:
+            raise ValueError("research_memory.timeout_sec must be positive")
         for level, budget in self.budgets.items():
             if budget.gpus < 0:
                 raise ValueError(f"{level.value}.gpus cannot be negative")

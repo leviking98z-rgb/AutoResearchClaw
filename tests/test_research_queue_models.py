@@ -125,6 +125,48 @@ def test_config_rejects_nonpositive_llm_call_timeout() -> None:
         raise AssertionError("nonpositive llm_call_timeout_sec should fail")
 
 
+def test_config_requires_scientific_gate_for_promotion(tmp_path) -> None:
+    benchmark = tmp_path / "benchmark.yaml"
+    benchmark.write_text("benchmark: {}\n")
+    try:
+        ResearchQueueConfig.from_mapping(
+            {
+                "research_queue": {
+                    "promotion": {
+                        "enabled": True,
+                        "benchmark_config": str(benchmark),
+                    }
+                }
+            }
+        )
+    except ValueError as exc:
+        assert "scientific_gate" in str(exc)
+    else:
+        raise AssertionError("promotion without scientific gate should fail")
+
+
+def test_config_rejects_single_seed_confirmatory_benchmark(tmp_path) -> None:
+    benchmark = tmp_path / "benchmark.yaml"
+    benchmark.write_text("benchmark:\n  seeds: [17]\n")
+    try:
+        ResearchQueueConfig.from_mapping(
+            {
+                "research_queue": {
+                    "scientific_gate": {"enabled": True},
+                    "promotion": {
+                        "enabled": True,
+                        "benchmark_id": "cifar10_calibration",
+                        "benchmark_config": str(benchmark),
+                    },
+                }
+            }
+        )
+    except ValueError as exc:
+        assert "at least 2 benchmark seeds" in str(exc)
+    else:
+        raise AssertionError("single-seed benchmark should fail validation")
+
+
 def test_static_idea_producer_reports_exhaustion() -> None:
     proposal = IdeaProposal(
         title="Finite",

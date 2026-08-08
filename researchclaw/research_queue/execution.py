@@ -178,7 +178,7 @@ class LocalRunBackend:
                 "gpu_seconds": run.requested_gpus * (time.monotonic() - started),
             }
             return result
-        except (OSError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001
             return RunResult(
                 ok=False,
                 error=f"{type(exc).__name__}: {exc}",
@@ -206,7 +206,15 @@ class LocalRunBackend:
 
 
 class ClusterBridgeRunBackend:
-    """Small adapter over the existing elastic ClusterBridge implementation."""
+    """Hybrid adapter over local CPU execution and elastic ClusterBridge GPUs.
+
+    The queue intentionally uses one configured execution backend for the
+    whole controller.  That must not mean every Run needs a physical GPU:
+    B0/B1 NumPy pilots and logits-cache benchmarks are CPU work.  Sending a
+    zero-GPU Run through the GPU manager used to wait forever for a broker that
+    correctly remains absent at zero demand.  Route those Runs through the
+    same local subprocess contract instead.
+    """
 
     def __init__(
         self,
@@ -217,6 +225,7 @@ class ClusterBridgeRunBackend:
     ) -> None:
         self.manager = manager
         self.slot_pool = slot_pool
+        self.local_backend = LocalRunBackend(slot_pool=slot_pool)
         self.poll_interval_sec = max(0.1, float(poll_interval_sec))
         self._active: dict[str, tuple[Any, int]] = {}
         self._broker_reconcile_lock = asyncio.Lock()
@@ -231,6 +240,13 @@ class ClusterBridgeRunBackend:
         output_dir: Path,
         env: Mapping[str, str],
     ) -> RunResult:
+        if run.requested_gpus <= 0:
+            return await self.local_backend.run(
+                run,
+                revision_dir=revision_dir,
+                output_dir=output_dir,
+                env=env,
+            )
         lease = await self.slot_pool.acquire(run.requested_gpus)
         output_dir.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
@@ -347,6 +363,7 @@ class ClusterBridgeRunBackend:
         )
 
     async def close(self) -> None:
+        await self.local_backend.close()
         self.manager.reconcile(
             required_gpus=0,
             pending_gpu_jobs=0,
@@ -363,6 +380,7 @@ class ClusterBridgeRunBackend:
             "backend": "clusterbridge",
             "logical_total_gpus": self.slot_pool.total_gpus,
             "logical_used_gpus": self.slot_pool.used,
+            "local_cpu_runs": self.local_backend.running,
             "active_runs": len(self._active),
             "routed_results": len(self._completed_payloads),
             "resource_manager": self.manager.snapshot(),
@@ -439,6 +457,8 @@ def build_run_backend(config: ResearchQueueConfig) -> RunBackend:
         for name in config.gpu.pass_env
         if (value := os.environ.get(name)) is not None
     }
+    if config.execution.remote_pythonpath:
+        task_env["PYTHONPATH"] = config.execution.remote_pythonpath
     manager = ResourceManagedGPUManager(
         gpu_config,
         task_env=task_env,
@@ -466,6 +486,15 @@ def _resolve_command(
         if candidate.exists():
             resolved[1] = str(candidate)
     return tuple(resolved)
+
+
+def resolve_command(
+    command: tuple[str, ...],
+    revision_dir: Path,
+) -> tuple[str, ...]:
+    """Public command resolver shared by generated and benchmark Runs."""
+
+    return _resolve_command(command, revision_dir)
 
 
 def _local_cuda_devices(count: int) -> str:

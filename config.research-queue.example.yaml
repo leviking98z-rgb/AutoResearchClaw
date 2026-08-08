@@ -58,6 +58,45 @@ research_queue:
     # third-party top-level modules here.
     allowed_python_imports:
       - numpy
+    # ClusterBridge workers cannot see a controller-only checkout. Sync or
+    # install researchclaw under shared storage and point PYTHONPATH there.
+    remote_pythonpath: ""
+
+  # Optional bridge from a synthetic pilot Idea to a real pinned benchmark.
+  # Keep disabled for generic prototype runs.
+  scientific_gate:
+    enabled: false
+    require_structured_spec: true
+    max_repairs: 1
+
+  promotion:
+    enabled: false
+    benchmark_id: cifar10_calibration
+    # A pinned adapter config. For ClusterBridge this path must be visible under
+    # /root/shared on both the controller and GPU node. Use at least 2 seeds
+    # for a smoke-test CI and at least 5 for a confirmatory ResearchSpec.
+    benchmark_config: ""
+    trigger_conclusions: [positive, inconclusive]
+    minimum_priority: 0.0
+    minimum_effect: 0.0
+    max_promotions: 1
+    max_treatment_repairs: 1
+    preflight_examples: 96
+    preflight_classes: 10
+    preflight_timeout_sec: 20
+    # Use the node environment containing torch/pyarrow for real GPU runs.
+    runtime_python: /opt/conda/envs/torch-base/bin/python
+    # Optional pinned logits cache. Once built by a real GPU inference pass,
+    # later treatments can be evaluated on CPU without re-requesting a GPU.
+    logits_cache: ""
+    prefer_logits_cache: true
+
+  # Best-effort searchable projection. SQLite and Idea artifacts remain the
+  # scientific source of truth.
+  research_memory:
+    enabled: false
+    url: http://127.0.0.1:8077
+    timeout_sec: 10
 
   gpu:
     # Logical maximum. local mode only simulates slots; clusterbridge mode

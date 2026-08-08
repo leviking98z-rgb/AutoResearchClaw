@@ -27,10 +27,14 @@ from .models import (
     new_id,
     utc_now,
 )
+from .promotion import TREATMENT_API, BenchmarkPromotionBridge
+from .research_memory import ResearchMemory
+from .scientific_gate import validate_research_spec
 from .store import ResearchQueueStore
 from .workers import (
     IdeaProducer,
     PreparationWorker,
+    ResearchSpecWorker,
     ReviewWorker,
     materialize_revision,
     title_similarity,
@@ -51,6 +55,9 @@ class ResearchQueueController:
         preparer: PreparationWorker,
         reviewer: ReviewWorker,
         run_backend: RunBackend,
+        spec_worker: ResearchSpecWorker | None = None,
+        promotion_bridge: BenchmarkPromotionBridge | None = None,
+        research_memory: ResearchMemory | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -58,6 +65,9 @@ class ResearchQueueController:
         self.preparer = preparer
         self.reviewer = reviewer
         self.run_backend = run_backend
+        self.spec_worker = spec_worker
+        self.promotion_bridge = promotion_bridge
+        self.research_memory = research_memory
         self.store.initialize()
         self._llm_slots = asyncio.Semaphore(config.concurrency.max_llm_jobs)
         self._run_slots = asyncio.Semaphore(config.concurrency.max_run_jobs)
@@ -352,20 +362,27 @@ class ResearchQueueController:
             idea = self.store.get_idea(idea_id)
             if idea is None or idea.status is not IdeaStatus.ACTIVE:
                 return
-            if idea.step_count >= self.config.limits.max_steps_per_idea:
+            action = idea.next_action or "prepare"
+            if (
+                action in {"prepare", "run", "review"}
+                and idea.step_count >= self.config.limits.max_steps_per_idea
+            ):
                 self._conclude(
                     idea,
                     Conclusion.INCONCLUSIVE,
                     "maximum prototype steps reached",
                 )
                 return
-            action = idea.next_action or "prepare"
             if action == "prepare":
                 await self._prepare(idea)
             elif action == "run":
                 await self._run(idea)
             elif action == "review":
                 await self._review(idea)
+            elif action == "scientific_gate":
+                await self._scientific_gate(idea)
+            elif action == "promote":
+                await self._promote(idea)
             else:
                 raise ValueError(f"unknown next_action: {action}")
 
@@ -690,9 +707,22 @@ class ResearchQueueController:
             idea.current_budget = BudgetLevel.B0
             idea.next_action = "prepare"
         elif decision.action is ReviewAction.CONCLUDE:
+            conclusion = decision.conclusion or Conclusion.INCONCLUSIVE
+            if self._should_promote(idea, conclusion):
+                idea.conclusion = conclusion
+                idea.last_reason = decision.reason
+                idea.next_action = "scientific_gate"
+                self.store.upsert_idea(idea)
+                self.store.event(
+                    "idea_selected_for_promotion",
+                    idea_id=idea.idea_id,
+                    conclusion=conclusion.value,
+                    reason=decision.reason,
+                )
+                return
             self._conclude(
                 idea,
-                decision.conclusion or Conclusion.INCONCLUSIVE,
+                conclusion,
                 decision.reason,
             )
             return
@@ -700,6 +730,154 @@ class ResearchQueueController:
             raise ValueError(f"unsupported decision {decision.action}")
         idea.last_reason = decision.reason
         self.store.upsert_idea(idea)
+
+    def _should_promote(
+        self,
+        idea: IdeaRecord,
+        conclusion: Conclusion,
+    ) -> bool:
+        if self.promotion_bridge is None or not self.config.promotion.enabled:
+            return False
+        if idea.priority < self.config.promotion.minimum_priority:
+            return False
+        if conclusion.value not in set(self.config.promotion.trigger_conclusions):
+            return False
+        selected = {
+            str(event.get("idea_id", ""))
+            for event in self.store.list_events(limit=100000)
+            if event.get("event") == "idea_selected_for_promotion"
+        }
+        return len(selected) < self.config.promotion.max_promotions
+
+    async def _scientific_gate(self, idea: IdeaRecord) -> None:
+        if self.spec_worker is None:
+            self._conclude(
+                idea,
+                Conclusion.INCONCLUSIVE,
+                "scientific gate enabled without a ResearchSpec worker",
+            )
+            return
+        benchmark_root = self.store.idea_dir(idea.idea_id) / "benchmark"
+        benchmark_root.mkdir(parents=True, exist_ok=True)
+        self.store.event(
+            "scientific_gate_started",
+            idea_id=idea.idea_id,
+            benchmark_id=self.config.promotion.benchmark_id,
+        )
+        feedback = ""
+        usage: dict[str, Any] = {}
+        result = None
+        for attempt in range(self.config.scientific_gate.max_repairs + 1):
+            spec, current_usage = await self._call_llm(
+                self.spec_worker.build,
+                idea,
+                benchmark_id=self.config.promotion.benchmark_id,
+                treatment_api=TREATMENT_API,
+                feedback=feedback,
+            )
+            for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                usage[name] = int(usage.get(name, 0) or 0) + int(
+                    current_usage.get(name, 0) or 0
+                )
+            if current_usage.get("model"):
+                usage["model"] = current_usage["model"]
+            idea.total_tokens += int(current_usage.get("total_tokens", 0) or 0)
+            self.store.upsert_idea(idea)
+            result = validate_research_spec(
+                spec,
+                benchmark_id=self.config.promotion.benchmark_id,
+            )
+            self.store.write_json_atomic(
+                benchmark_root / f"scientific-gate-{attempt + 1:02d}.json",
+                {
+                    "research_spec": spec.to_dict(),
+                    "gate": result.to_dict(),
+                    "usage": current_usage,
+                },
+            )
+            if result.passed:
+                idea.research_spec = spec
+                self.store.write_json_atomic(
+                    benchmark_root / "research_spec.json",
+                    spec.to_dict(),
+                )
+                break
+            feedback = (
+                "Your ResearchSpec failed deterministic validation. Correct "
+                "only the listed issues and return a complete ResearchSpec. "
+                "Errors: " + "; ".join(result.errors)
+            )
+        if result is None or not result.passed or idea.research_spec is None:
+            reason = (
+                "; ".join(result.errors)
+                if result is not None
+                else "ResearchSpec generation failed"
+            )
+            self.store.event(
+                "scientific_gate_rejected",
+                idea_id=idea.idea_id,
+                reason=reason,
+                usage=usage,
+            )
+            self._conclude(
+                idea,
+                Conclusion.INCONCLUSIVE,
+                f"scientific contract rejected: {reason}",
+            )
+            return
+        idea.next_action = "promote"
+        idea.last_reason = "scientific contract accepted"
+        idea.step_count += 1
+        self.store.upsert_idea(idea)
+        self.store.event(
+            "scientific_gate_passed",
+            idea_id=idea.idea_id,
+            gate=result.to_dict(),
+            usage=usage,
+        )
+
+    async def _promote(self, idea: IdeaRecord) -> None:
+        if self.promotion_bridge is None or idea.research_spec is None:
+            self._conclude(
+                idea,
+                Conclusion.INCONCLUSIVE,
+                "promotion requested without bridge or ResearchSpec",
+            )
+            return
+        self.store.event(
+            "promotion_started",
+            idea_id=idea.idea_id,
+            benchmark_id=self.config.promotion.benchmark_id,
+        )
+        outcome = await self.promotion_bridge.promote(
+            idea,
+            spec=idea.research_spec,
+        )
+        idea.total_tokens += int(
+            outcome.usage.get("total_tokens", 0) or 0
+        )
+        idea.step_count += 1
+        final_conclusion = (
+            Conclusion.POSITIVE
+            if outcome.hypothesis_supported is True
+            and outcome.scientific_valid
+            else (
+                Conclusion.NEGATIVE
+                if outcome.hypothesis_supported is False
+                and outcome.scientific_valid
+                else Conclusion.INCONCLUSIVE
+            )
+        )
+        idea.conclusion = final_conclusion
+        self.store.write_json_atomic(
+            self.store.idea_dir(idea.idea_id) / "final_review.json",
+            outcome.to_dict(),
+        )
+        self._conclude(
+            idea,
+            final_conclusion,
+            outcome.reason,
+        )
 
     def _has_step_budget(self, idea: IdeaRecord, *, required: int) -> bool:
         return (
@@ -718,13 +896,13 @@ class ResearchQueueController:
         idea.next_action = ""
         idea.last_reason = reason
         self.store.upsert_idea(idea)
-        self._write_research_note(idea)
         self.store.event(
             "idea_concluded",
             idea_id=idea.idea_id,
             conclusion=conclusion.value,
             reason=reason,
         )
+        self._write_research_note(idea)
 
     def _audit_usage(self) -> dict[str, Any]:
         totals = {
@@ -911,7 +1089,43 @@ class ResearchQueueController:
             "- Raw runs: `runs/`",
         ]
         path = self.store.idea_dir(idea.idea_id) / "research_note.md"
+        if idea.research_spec is not None:
+            lines += [
+                "",
+                "## ResearchSpec",
+                "",
+                "```json",
+                json.dumps(
+                    idea.research_spec.to_dict(),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "```",
+            ]
+        final_review_path = self.store.idea_dir(idea.idea_id) / "final_review.json"
+        if final_review_path.is_file():
+            lines += [
+                "",
+                "## Real benchmark final review",
+                "",
+                "```json",
+                final_review_path.read_text(encoding="utf-8").strip(),
+                "```",
+            ]
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if self.research_memory is not None:
+            result = self.research_memory.reconcile(idea)
+            self.store.event(
+                (
+                    "research_memory_synced"
+                    if result.ok
+                    else "research_memory_sync_failed"
+                ),
+                idea_id=idea.idea_id,
+                external_id=result.external_id,
+                error=result.error,
+            )
         return path
 
     async def _drain(self) -> None:

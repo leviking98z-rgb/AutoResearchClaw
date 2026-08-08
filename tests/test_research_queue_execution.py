@@ -5,10 +5,12 @@ import json
 import sys
 from types import SimpleNamespace
 
+from researchclaw.research_queue.config import ResearchQueueConfig
 from researchclaw.research_queue.execution import (
     ClusterBridgeRunBackend,
     GPUSlotPool,
     LocalRunBackend,
+    build_run_backend,
 )
 from researchclaw.research_queue.models import BudgetLevel, RunRecord
 
@@ -191,3 +193,122 @@ def test_clusterbridge_backend_routes_parallel_results_to_owning_run(
         assert manager.closed
 
     asyncio.run(scenario())
+
+
+def test_clusterbridge_backend_runs_zero_gpu_work_locally(tmp_path) -> None:
+    class NoBrokerManager:
+        broker = None
+
+        def __init__(self) -> None:
+            self.demands = []
+            self.closed = False
+
+        def bootstrap(self, *, required_gpus=0):
+            self.demands.append({"required_gpus": required_gpus})
+
+        def reconcile(self, **kwargs):
+            self.demands.append(dict(kwargs))
+            return False
+
+        def close(self):
+            self.closed = True
+
+        def snapshot(self):
+            return {"closed": self.closed}
+
+    async def scenario() -> None:
+        manager = NoBrokerManager()
+        backend = ClusterBridgeRunBackend(
+            manager=manager,
+            slot_pool=GPUSlotPool(1),
+            poll_interval_sec=0.001,
+        )
+        revision = tmp_path / "revision"
+        output = tmp_path / "output"
+        revision.mkdir()
+        (revision / "experiment.py").write_text(
+            """
+import json, os, pathlib
+out = pathlib.Path(os.environ["RESEARCH_QUEUE_OUTPUT_DIR"])
+out.mkdir(parents=True, exist_ok=True)
+(out / "result.json").write_text(json.dumps({
+    "status": "ok",
+    "metrics": {"cpu": True},
+    "usage": {"budget_parameters": {"examples": 8}}
+}))
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        run = RunRecord(
+            run_id="run-cpu",
+            idea_id="idea-cpu",
+            revision=1,
+            budget=BudgetLevel.B0,
+            requested_gpus=0,
+            timeout_sec=10,
+            command=(sys.executable, "experiment.py"),
+            output_dir=str(output),
+        )
+
+        result = await backend.run(
+            run,
+            revision_dir=revision,
+            output_dir=output,
+            env={"RESEARCH_QUEUE_OUTPUT_DIR": str(output)},
+        )
+
+        assert result.ok
+        assert result.metrics == {"cpu": True}
+        assert result.usage["gpu_count"] == 0
+        # Zero-demand work must not ask the ClusterBridge control plane for an
+        # allocation or wait for a GPU broker.
+        assert manager.demands == [{"required_gpus": 0}]
+        await backend.close()
+        assert manager.closed
+
+    asyncio.run(scenario())
+
+
+def test_clusterbridge_backend_passes_shared_remote_pythonpath(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    captured = {}
+
+    class FakeManager:
+        def __init__(self, gpu_config, *, task_env, task_namespace):
+            captured["gpu_config"] = gpu_config
+            captured["task_env"] = task_env
+            captured["task_namespace"] = task_namespace
+            self.broker = None
+
+        def bootstrap(self, *, required_gpus=0):
+            del required_gpus
+
+    monkeypatch.setattr(
+        "researchclaw.research_queue.execution.ResourceManagedGPUManager",
+        FakeManager,
+    )
+    config = ResearchQueueConfig.from_mapping(
+        {
+            "research_queue": {
+                "enabled": True,
+                "state_dir": str(tmp_path / "state"),
+                "execution": {
+                    "backend": "clusterbridge",
+                    "remote_pythonpath": "/root/shared/runtime-source",
+                },
+                "gpu": {
+                    "max_total_gpus": 1,
+                    "max_gpus_per_run": 1,
+                    "resource_manager": {"owner": "owner"},
+                },
+            }
+        }
+    )
+
+    backend = build_run_backend(config)
+
+    assert captured["task_env"]["PYTHONPATH"] == "/root/shared/runtime-source"
+    assert backend.manager is not None

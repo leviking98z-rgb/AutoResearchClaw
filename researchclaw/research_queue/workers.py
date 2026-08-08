@@ -20,11 +20,16 @@ from .models import (
     GenerationBatch,
     IdeaProposal,
     IdeaRecord,
+    MetricDirection,
+    MetricGuardrail,
+    MetricRelation,
     PreparedRevision,
+    ResearchSpec,
     ReviewAction,
     ReviewDecision,
     RunRecord,
 )
+from .scientific_gate import validate_research_spec
 
 
 def usage_from_result(result: Any) -> dict[str, Any]:
@@ -66,6 +71,27 @@ class ReviewWorker(Protocol):
         history: Sequence[RunRecord],
         limits: Mapping[str, Any],
     ) -> ReviewDecision: ...
+
+
+class ResearchSpecWorker(Protocol):
+    def build(
+        self,
+        idea: IdeaRecord,
+        *,
+        benchmark_id: str,
+        treatment_api: str,
+        feedback: str,
+    ) -> tuple[ResearchSpec, dict[str, Any]]: ...
+
+
+class TreatmentWorker(Protocol):
+    def build(
+        self,
+        idea: IdeaRecord,
+        *,
+        spec: ResearchSpec,
+        feedback: str,
+    ) -> tuple[str, dict[str, Any]]: ...
 
 
 def _proposal_errors(value: Mapping[str, Any]) -> list[str]:
@@ -207,6 +233,299 @@ Return:
         return GenerationBatch(
             ideas=proposals,
             usage=usage_from_result(result),
+        )
+
+
+def _research_spec_errors(value: Mapping[str, Any]) -> list[str]:
+    try:
+        spec = ResearchSpec.from_mapping(value)
+    except (TypeError, ValueError) as exc:
+        return [f"invalid research spec: {exc}"]
+    return list(validate_research_spec(spec).errors)
+
+
+class LLMResearchSpecWorker:
+    def __init__(self, *, client: Any) -> None:
+        self.role = StructuredRole(
+            client=client,
+            system=(
+                "You are a conservative research director. Convert one Idea "
+                "into a precise executable scientific contract. Return JSON only."
+            ),
+            validator=_research_spec_errors,
+            max_attempts=2,
+        )
+
+    def build(
+        self,
+        idea: IdeaRecord,
+        *,
+        benchmark_id: str,
+        treatment_api: str,
+        feedback: str,
+    ) -> tuple[ResearchSpec, dict[str, Any]]:
+        result = self.role.call(
+            f"""
+IDEA:
+{json.dumps(idea.to_dict(), ensure_ascii=False, indent=2)}
+
+TARGET BENCHMARK: {benchmark_id}
+TREATMENT API:
+{treatment_api}
+
+FEEDBACK:
+{feedback or "none"}
+
+Return a strict ResearchSpec:
+{{
+  "question": "...",
+  "hypothesis": "...",
+  "treatment": "...",
+  "control": "...",
+  "primary_metric": "ece|nll|accuracy",
+  "metric_direction": "minimize|maximize",
+  "minimum_effect": 0.0,
+  "primary_requires_effect_ci": true,
+  "minimum_pairs": 5,
+  "confidence_level": 0.95,
+  "guardrail_metrics": [
+    {{
+      "metric": "accuracy|nll",
+      "direction": "maximize|minimize",
+      "relation": "no_worse|equal",
+      "tolerance": 0.0,
+      "require_effect_ci": false,
+      "per_pair": false
+    }}
+  ],
+  "guardrails": [
+    "explicit metric/threshold conditions"
+  ],
+  "validity_conditions": [
+    "conditions required before scientific comparison is valid"
+  ],
+  "compute_matching": [
+    "how treatment and control use identical data and compute"
+  ],
+  "stopping_rules": [
+    "when to reject or stop"
+  ],
+  "benchmark_id": "{benchmark_id}",
+  "treatment_api": "{treatment_api}"
+}}
+
+For CIFAR-10 calibration:
+- use ECE as the primary metric and minimize it;
+- set minimum_effect to 0 and require a paired 95% effect CI;
+- require at least 5 independent seed/model pairs;
+- require exact per-pair accuracy equality;
+- require NLL to be no worse, with a paired 95% effect CI;
+- treatment and baseline must use identical logits, calibration labels,
+  evaluation split, seeds, and model;
+- the treatment must not access evaluation labels.
+""".strip(),
+            max_tokens=2600,
+            temperature=0.1,
+        )
+        spec = ResearchSpec.from_mapping(result.value)
+        return spec, usage_from_result(result)
+
+
+def _treatment_errors(value: Mapping[str, Any]) -> list[str]:
+    source = str(value.get("treatment_source", "") or "")
+    if not source.strip():
+        return ["missing treatment_source"]
+    errors = validate_python_sources(
+        {"treatment.py": source},
+        allowed_imports=("numpy",),
+    )
+    try:
+        tree = ast.parse(source, filename="treatment.py")
+    except SyntaxError:
+        return errors
+    definitions = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    if "build_treatment" not in definitions:
+        errors.append("treatment.py must define build_treatment()")
+    forbidden_names = {
+        "eval",
+        "exec",
+        "open",
+        "compile",
+        "__import__",
+        "getattr",
+        "setattr",
+        "delattr",
+    }
+    forbidden_modules = {
+        "os",
+        "pathlib",
+        "subprocess",
+        "socket",
+        "requests",
+        "httpx",
+        "urllib",
+        "importlib",
+        "builtins",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in forbidden_names:
+            errors.append(f"treatment.py uses forbidden name {node.id!r}")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".", 1)[0] in forbidden_modules:
+                    errors.append(
+                        f"treatment.py imports forbidden module {alias.name!r}"
+                    )
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and node.module.split(".", 1)[0] in forbidden_modules
+        ):
+            errors.append(f"treatment.py imports forbidden module {node.module!r}")
+    lowered = source.casefold()
+    if "evaluation_labels" in lowered or "test_labels" in lowered:
+        errors.append("treatment.py may not reference evaluation labels")
+    return list(dict.fromkeys(errors))
+
+
+class LLMTreatmentWorker:
+    def __init__(self, *, client: Any) -> None:
+        self.role = StructuredRole(
+            client=client,
+            system=(
+                "You implement one narrow calibration treatment plugin. "
+                "Return one complete JSON object and no prose."
+            ),
+            validator=_treatment_errors,
+            max_attempts=2,
+        )
+
+    def build(
+        self,
+        idea: IdeaRecord,
+        *,
+        spec: ResearchSpec,
+        feedback: str,
+    ) -> tuple[str, dict[str, Any]]:
+        result = self.role.call(
+            f"""
+IDEA:
+{json.dumps(idea.to_dict(), ensure_ascii=False, indent=2)}
+
+RESEARCH SPEC:
+{json.dumps(spec.to_dict(), ensure_ascii=False, indent=2)}
+
+FEEDBACK:
+{feedback or "none"}
+
+Implement treatment.py with exactly this public contract:
+
+class Treatment:
+    def fit(self, calibration_logits, calibration_labels):
+        # Return JSON/pickle-free in-memory state.
+        ...
+
+    def transform(self, logits, state):
+        # Return finite transformed logits with exactly the input shape.
+        ...
+
+def build_treatment():
+    return Treatment()
+
+Constraints:
+- only import numpy;
+- no files, network, subprocesses, environment variables, dynamic imports,
+  eval, exec, or package installation;
+- do not access evaluation labels;
+- preserve class ordering and output shape;
+- be deterministic;
+- implement the ResearchSpec treatment rather than the baseline;
+- use numerically stable operations.
+
+Return:
+{{
+  "method_summary": "...",
+  "treatment_source": "complete Python source"
+}}
+""".strip(),
+            max_tokens=6000,
+            temperature=0.15,
+        )
+        return str(result.value["treatment_source"]), usage_from_result(result)
+
+
+class SimulatedResearchSpecWorker:
+    def build(
+        self,
+        idea: IdeaRecord,
+        *,
+        benchmark_id: str,
+        treatment_api: str,
+        feedback: str,
+    ) -> tuple[ResearchSpec, dict[str, Any]]:
+        del feedback
+        return (
+            ResearchSpec(
+                question=idea.question,
+                hypothesis=idea.hypothesis,
+                treatment=idea.treatment,
+                control=idea.control,
+                primary_metric="ece",
+                metric_direction=MetricDirection.MINIMIZE,
+                guardrails=("accuracy must not decrease", "report nll"),
+                validity_conditions=(
+                    "treatment and baseline use identical held-out logits",
+                ),
+                compute_matching=("same calibration data and evaluation split",),
+                stopping_rules=("reject when ECE does not improve",),
+                benchmark_id=benchmark_id,
+                treatment_api=treatment_api,
+                minimum_effect=0.0,
+                primary_requires_effect_ci=True,
+                guardrail_metrics=(
+                    MetricGuardrail(
+                        metric="accuracy",
+                        direction=MetricDirection.MAXIMIZE,
+                        relation=MetricRelation.EQUAL,
+                        per_pair=True,
+                    ),
+                    MetricGuardrail(
+                        metric="nll",
+                        direction=MetricDirection.MINIMIZE,
+                        require_effect_ci=True,
+                    ),
+                ),
+                minimum_pairs=5,
+                confidence_level=0.95,
+            ),
+            {},
+        )
+
+
+class SimulatedTreatmentWorker:
+    def build(
+        self,
+        idea: IdeaRecord,
+        *,
+        spec: ResearchSpec,
+        feedback: str,
+    ) -> tuple[str, dict[str, Any]]:
+        del idea, spec, feedback
+        return (
+            (
+                "class IdentityTreatment:\n"
+                "    def fit(self, calibration_logits, calibration_labels):\n"
+                "        return {}\n\n"
+                "    def transform(self, logits, state):\n"
+                "        return logits\n\n\n"
+                "def build_treatment():\n"
+                "    return IdentityTreatment()\n"
+            ),
+            {},
         )
 
 
@@ -786,7 +1105,13 @@ def validate_proposal(proposal: IdeaProposal) -> list[str]:
 
 def build_workers(
     config: ResearchQueueConfig,
-) -> tuple[IdeaProducer, PreparationWorker, ReviewWorker]:
+) -> tuple[
+    IdeaProducer,
+    PreparationWorker,
+    ReviewWorker,
+    ResearchSpecWorker,
+    TreatmentWorker,
+]:
     if config.execution.simulation:
         proposals = [
             {
@@ -832,6 +1157,8 @@ def build_workers(
                 python_executable=config.execution.python_executable
             ),
             SimulatedReviewWorker(),
+            SimulatedResearchSpecWorker(),
+            SimulatedTreatmentWorker(),
         )
     from researchclaw.autoresearch_v2.llm import RoleRouter
 
@@ -854,4 +1181,6 @@ def build_workers(
             allowed_python_imports=config.execution.allowed_python_imports,
         ),
         LLMReviewWorker(client=router.decision),
+        LLMResearchSpecWorker(client=router.decision),
+        LLMTreatmentWorker(client=router.worker),
     )

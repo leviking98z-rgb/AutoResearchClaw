@@ -61,6 +61,156 @@ class RunStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class MetricDirection(str, Enum):
+    MAXIMIZE = "maximize"
+    MINIMIZE = "minimize"
+
+
+class MetricRelation(str, Enum):
+    """Machine-executable relation for a secondary metric."""
+
+    NO_WORSE = "no_worse"
+    EQUAL = "equal"
+
+
+@dataclass(frozen=True, slots=True)
+class MetricGuardrail:
+    """One deterministic metric constraint in a ResearchSpec."""
+
+    metric: str
+    direction: MetricDirection
+    relation: MetricRelation = MetricRelation.NO_WORSE
+    tolerance: float = 0.0
+    require_effect_ci: bool = False
+    per_pair: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "metric": self.metric,
+            "direction": self.direction.value,
+            "relation": self.relation.value,
+            "tolerance": self.tolerance,
+            "require_effect_ci": self.require_effect_ci,
+            "per_pair": self.per_pair,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> MetricGuardrail:
+        return cls(
+            metric=str(value.get("metric", "") or "").strip(),
+            direction=MetricDirection(
+                str(
+                    value.get(
+                        "direction",
+                        MetricDirection.MAXIMIZE.value,
+                    )
+                    or MetricDirection.MAXIMIZE.value
+                ).strip()
+            ),
+            relation=MetricRelation(
+                str(
+                    value.get(
+                        "relation",
+                        MetricRelation.NO_WORSE.value,
+                    )
+                    or MetricRelation.NO_WORSE.value
+                ).strip()
+            ),
+            tolerance=max(0.0, float(value.get("tolerance", 0.0) or 0.0)),
+            require_effect_ci=bool(value.get("require_effect_ci", False)),
+            per_pair=bool(value.get("per_pair", False)),
+        )
+
+
+@dataclass(slots=True)
+class ResearchSpec:
+    """Executable scientific contract attached to one Idea."""
+
+    question: str
+    hypothesis: str
+    treatment: str
+    control: str
+    primary_metric: str
+    metric_direction: MetricDirection
+    guardrails: tuple[str, ...] = ()
+    validity_conditions: tuple[str, ...] = ()
+    compute_matching: tuple[str, ...] = ()
+    stopping_rules: tuple[str, ...] = ()
+    benchmark_id: str = ""
+    treatment_api: str = ""
+    minimum_effect: float = 0.0
+    primary_requires_effect_ci: bool = False
+    guardrail_metrics: tuple[MetricGuardrail, ...] = ()
+    minimum_pairs: int = 1
+    confidence_level: float = 0.95
+
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["metric_direction"] = self.metric_direction.value
+        value["guardrail_metrics"] = [item.to_dict() for item in self.guardrail_metrics]
+        for field_name in (
+            "guardrails",
+            "validity_conditions",
+            "compute_matching",
+            "stopping_rules",
+        ):
+            value[field_name] = list(value[field_name])
+        return value
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> ResearchSpec:
+        def strings(name: str) -> tuple[str, ...]:
+            raw = value.get(name, ())
+            if isinstance(raw, str):
+                return (raw.strip(),) if raw.strip() else ()
+            return tuple(str(item).strip() for item in (raw or ()) if str(item).strip())
+
+        direction_raw = str(
+            value.get("metric_direction", MetricDirection.MAXIMIZE.value)
+            or MetricDirection.MAXIMIZE.value
+        ).strip()
+        guardrail_metrics_raw = value.get("guardrail_metrics", ())
+        if isinstance(guardrail_metrics_raw, Mapping):
+            guardrail_metrics_raw = (guardrail_metrics_raw,)
+        return cls(
+            question=str(value.get("question", "") or "").strip(),
+            hypothesis=str(value.get("hypothesis", "") or "").strip(),
+            treatment=str(value.get("treatment", "") or "").strip(),
+            control=str(value.get("control", "") or "").strip(),
+            primary_metric=str(value.get("primary_metric", "") or "").strip(),
+            metric_direction=MetricDirection(direction_raw),
+            guardrails=strings("guardrails"),
+            validity_conditions=strings("validity_conditions"),
+            compute_matching=strings("compute_matching"),
+            stopping_rules=strings("stopping_rules"),
+            benchmark_id=str(value.get("benchmark_id", "") or "").strip(),
+            treatment_api=str(value.get("treatment_api", "") or "").strip(),
+            minimum_effect=max(
+                0.0,
+                float(value.get("minimum_effect", 0.0) or 0.0),
+            ),
+            primary_requires_effect_ci=bool(
+                value.get("primary_requires_effect_ci", False)
+            ),
+            guardrail_metrics=tuple(
+                MetricGuardrail.from_mapping(item)
+                for item in (guardrail_metrics_raw or ())
+                if isinstance(item, Mapping)
+            ),
+            minimum_pairs=max(
+                1,
+                int(value.get("minimum_pairs", 1) or 1),
+            ),
+            confidence_level=min(
+                0.999,
+                max(
+                    0.5,
+                    float(value.get("confidence_level", 0.95) or 0.95),
+                ),
+            ),
+        )
+
+
 @dataclass(slots=True)
 class IdeaProposal:
     title: str
@@ -69,12 +219,16 @@ class IdeaProposal:
     treatment: str
     control: str
     primary_metric: str
+    research_spec: ResearchSpec | None = None
     tags: tuple[str, ...] = ()
     priority: float = 0.5
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
+        value["research_spec"] = (
+            self.research_spec.to_dict() if self.research_spec is not None else None
+        )
         value["tags"] = list(self.tags)
         return value
 
@@ -87,6 +241,7 @@ class IdeaProposal:
             tags = tuple(
                 str(item).strip() for item in (tags_raw or ()) if str(item).strip()
             )
+        spec_raw = value.get("research_spec")
         return cls(
             title=str(value.get("title", "") or "").strip(),
             question=str(value.get("question", "") or "").strip(),
@@ -94,6 +249,11 @@ class IdeaProposal:
             treatment=str(value.get("treatment", "") or "").strip(),
             control=str(value.get("control", "") or "").strip(),
             primary_metric=str(value.get("primary_metric", "") or "").strip(),
+            research_spec=(
+                ResearchSpec.from_mapping(spec_raw)
+                if isinstance(spec_raw, Mapping)
+                else None
+            ),
             tags=tags,
             priority=float(value.get("priority", 0.5) or 0.5),
             metadata=dict(value.get("metadata", {}) or {}),
@@ -116,6 +276,7 @@ class IdeaRecord:
     treatment: str
     control: str
     primary_metric: str
+    research_spec: ResearchSpec | None = None
     tags: tuple[str, ...] = ()
     priority: float = 0.5
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -142,6 +303,7 @@ class IdeaRecord:
             treatment=proposal.treatment,
             control=proposal.control,
             primary_metric=proposal.primary_metric,
+            research_spec=proposal.research_spec,
             tags=proposal.tags,
             priority=max(0.0, min(1.0, proposal.priority)),
             metadata=proposal.metadata,
@@ -149,6 +311,9 @@ class IdeaRecord:
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
+        value["research_spec"] = (
+            self.research_spec.to_dict() if self.research_spec is not None else None
+        )
         value["tags"] = list(self.tags)
         value["status"] = self.status.value
         value["conclusion"] = (
@@ -160,6 +325,7 @@ class IdeaRecord:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> IdeaRecord:
         conclusion_raw = value.get("conclusion")
+        spec_raw = value.get("research_spec")
         return cls(
             idea_id=str(value["idea_id"]),
             title=str(value.get("title", "") or ""),
@@ -168,6 +334,11 @@ class IdeaRecord:
             treatment=str(value.get("treatment", "") or ""),
             control=str(value.get("control", "") or ""),
             primary_metric=str(value.get("primary_metric", "") or ""),
+            research_spec=(
+                ResearchSpec.from_mapping(spec_raw)
+                if isinstance(spec_raw, Mapping)
+                else None
+            ),
             tags=tuple(str(item) for item in value.get("tags", ()) or ()),
             priority=float(value.get("priority", 0.5) or 0.5),
             metadata=dict(value.get("metadata", {}) or {}),
