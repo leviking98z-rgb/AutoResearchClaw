@@ -763,3 +763,82 @@ def test_escalation_is_rejected_when_no_review_step_would_remain(
     assert saved.status is IdeaStatus.CONCLUDED
     assert saved.conclusion is Conclusion.INCONCLUSIVE
     assert "insufficient step budget" in saved.last_reason
+
+
+def test_real_run_rejects_missing_budget_parameter_attestation(
+    tmp_path,
+) -> None:
+    class MissingAttestationBackend:
+        async def run(self, run, *, revision_dir, output_dir, env):
+            del run, revision_dir, output_dir, env
+            return RunResult(
+                ok=True,
+                metrics={"effect": 0.1},
+                usage={},
+            )
+
+        async def close(self):
+            return None
+
+        def snapshot(self):
+            return {}
+
+    config = ResearchQueueConfig.from_mapping(
+        {
+            "research_queue": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "limits": {
+                    "candidate_target": 1,
+                    "generation_batch_size": 1,
+                    "max_active_ideas": 1,
+                    "max_total_ideas": 1,
+                    "max_infra_retries": 0,
+                },
+                "execution": {"simulation": False},
+                "gpu": {
+                    "max_total_gpus": 0,
+                    "max_gpus_per_run": 0,
+                },
+                "budgets": {
+                    "B0": {
+                        "gpus": 0,
+                        "timeout_sec": 10,
+                        "parameters": {"seeds": 3},
+                    }
+                },
+            }
+        }
+    )
+    store = ResearchQueueStore(tmp_path)
+    store.initialize()
+    idea = IdeaRecord.from_proposal(_proposal("Budget attestation", "positive"))
+    idea.status = IdeaStatus.ACTIVE
+    idea.current_revision = 1
+    idea.next_action = "run"
+    store.upsert_idea(idea)
+    store.write_revision(
+        idea.idea_id,
+        1,
+        PreparedRevision(
+            revision=1,
+            command=(sys.executable, "experiment.py"),
+            requested_gpus=0,
+            timeout_sec=10,
+            plan={"source_files": {"experiment.py": "print(1)\n"}},
+        ).to_dict(),
+    )
+    controller = ResearchQueueController(
+        config=config,
+        store=store,
+        producer=StaticIdeaProducer([]),
+        preparer=SimulatedPreparationWorker(python_executable=sys.executable),
+        reviewer=SimulatedReviewWorker(),
+        run_backend=MissingAttestationBackend(),
+    )
+
+    asyncio.run(controller._run(idea))
+
+    run = store.list_runs(idea_id=idea.idea_id)[0]
+    assert run.status.value == "failed"
+    assert "budget parameters" in run.error

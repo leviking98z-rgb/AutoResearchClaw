@@ -109,6 +109,10 @@ def _prepare_errors(value: Mapping[str, Any]) -> list[str]:
         errors.append("source_files must be a non-empty object")
     elif not any(str(path).endswith(".py") for path in source_files):
         errors.append("source_files must contain a Python file")
+    elif "RESEARCH_QUEUE_BUDGET_JSON" not in "\n".join(
+        str(content) for content in source_files.values()
+    ):
+        errors.append("source_files must consume RESEARCH_QUEUE_BUDGET_JSON")
     requested_gpus = int(value.get("requested_gpus", 0) or 0)
     if requested_gpus < 0:
         errors.append("requested_gpus cannot be negative")
@@ -254,6 +258,9 @@ REVIEW FEEDBACK:
 Build the cheapest executable experiment that compares Treatment and Control.
 The project runs from its revision directory. It MUST write result.json in the
 directory supplied by environment variable RESEARCH_QUEUE_OUTPUT_DIR.
+It MUST parse RESEARCH_QUEUE_BUDGET_JSON at runtime and apply its `parameters`
+to the actual workload. Do not hardcode the current B0 values: the same
+immutable revision will be re-run at B1/B2 with different parameters.
 result.json must contain:
 {{
   "status": "ok",
@@ -263,7 +270,10 @@ result.json must contain:
     "control_value": number,
     "effect": number
   }},
-  "artifacts": []
+  "artifacts": [],
+  "usage": {{
+    "budget_parameters": "the exact parameters object parsed from RESEARCH_QUEUE_BUDGET_JSON"
+  }}
 }}
 
 Use only declared local dependencies. Do not download huge models or datasets

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import signal
 from pathlib import Path
 
 from .config import ResearchQueueConfig
@@ -68,6 +69,30 @@ def build_controller(
     )
 
 
+async def _run_controller(
+    controller: ResearchQueueController,
+    *,
+    max_seconds: float | None,
+    until_idle: bool,
+) -> dict[str, object]:
+    loop = asyncio.get_running_loop()
+    installed: list[signal.Signals] = []
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(signum, controller.request_stop)
+        except (NotImplementedError, RuntimeError):
+            continue
+        installed.append(signum)
+    try:
+        return await controller.run(
+            max_seconds=max_seconds,
+            until_idle=until_idle,
+        )
+    finally:
+        for signum in installed:
+            loop.remove_signal_handler(signum)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = ResearchQueueConfig.from_file(args.config)
@@ -104,7 +129,8 @@ def main(argv: list[str] | None = None) -> int:
         ideas_json=args.ideas_json,
     )
     snapshot = asyncio.run(
-        controller.run(
+        _run_controller(
+            controller,
             max_seconds=args.max_seconds,
             until_idle=args.until_idle,
         )

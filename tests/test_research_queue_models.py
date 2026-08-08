@@ -183,7 +183,9 @@ def test_llm_preparer_accepts_no_previous_revision(tmp_path) -> None:
                         '"control":"B","primary_metric":"score",'
                         '"requested_gpus":0,"timeout_sec":10,'
                         '"command":["python","experiment.py"],'
-                        '"source_files":{"experiment.py":"print(1)"},'
+                        '"source_files":{"experiment.py":'
+                        '"import os\\nprint(os.environ['
+                        '\\"RESEARCH_QUEUE_BUDGET_JSON\\"])\\n"},'
                         '"plan":{"cheap_test":"test"}}'
                     ),
                     "model": "fake",
@@ -220,3 +222,56 @@ def test_llm_preparer_accepts_no_previous_revision(tmp_path) -> None:
 
     assert prepared.revision == 1
     assert prepared.plan["method_summary"] == "test"
+
+
+def test_llm_preparer_rejects_hardcoded_budget_parameters() -> None:
+    class FakeClient:
+        def chat(self, messages, **kwargs):
+            del messages, kwargs
+            return type(
+                "Response",
+                (),
+                {
+                    "content": (
+                        '{"method_summary":"test","treatment":"A",'
+                        '"control":"B","primary_metric":"score",'
+                        '"requested_gpus":0,"timeout_sec":10,'
+                        '"command":["python","experiment.py"],'
+                        '"source_files":{"experiment.py":"print(1)"},'
+                        '"plan":{"cheap_test":"test"}}'
+                    ),
+                    "model": "fake",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            )()
+
+    idea = IdeaRecord.from_proposal(
+        IdeaProposal(
+            title="Hardcoded",
+            question="Question?",
+            hypothesis="Hypothesis",
+            treatment="A",
+            control="B",
+            primary_metric="score",
+        )
+    )
+    worker = LLMPreparationWorker(
+        client=FakeClient(),
+        python_executable="python",
+        max_gpus_per_run=0,
+    )
+
+    try:
+        worker.prepare(
+            idea,
+            revision=1,
+            budget=ResearchQueueConfig().budget(BudgetLevel.B0),
+            previous_revision=None,
+            feedback="",
+        )
+    except ValueError as exc:
+        assert "RESEARCH_QUEUE_BUDGET_JSON" in str(exc)
+    else:
+        raise AssertionError("hardcoded budget parameters should fail")

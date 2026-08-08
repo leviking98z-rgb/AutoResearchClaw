@@ -486,6 +486,19 @@ class ResearchQueueController:
                     ),
                 },
             )
+        expected_parameters = budget.parameters
+        applied_parameters = result.usage.get("budget_parameters")
+        if (
+            not self.config.execution.simulation
+            and result.ok
+            and applied_parameters != expected_parameters
+        ):
+            result.ok = False
+            result.error = (
+                "experiment did not attest the exact applied budget "
+                f"parameters: expected {expected_parameters!r}, "
+                f"got {applied_parameters!r}"
+            )
         run.result = result.to_dict()
         run.error = result.error
         run.finished_at = utc_now()
