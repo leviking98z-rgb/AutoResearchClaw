@@ -38,8 +38,11 @@ class BudgetSpec:
 class QueueLimits:
     candidate_target: int = 6
     generation_batch_size: int = 2
+    generation_interval_sec: float = 0.0
+    generation_max_batches: int = 0
     max_active_ideas: int = 4
     max_total_ideas: int = 0
+    max_total_tokens: int = 0
     max_revisions_per_idea: int = 2
     max_runs_per_budget: int = 2
     max_steps_per_idea: int = 10
@@ -52,6 +55,7 @@ class QueueConcurrency:
     max_llm_jobs: int = 2
     max_run_jobs: int = 4
     poll_interval_sec: float = 0.1
+    llm_call_timeout_sec: float = 1800.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,8 +146,13 @@ class ResearchQueueConfig:
         limits = QueueLimits(
             candidate_target=int(limits_raw.get("candidate_target", 6)),
             generation_batch_size=int(limits_raw.get("generation_batch_size", 2)),
+            generation_interval_sec=float(
+                limits_raw.get("generation_interval_sec", 0.0)
+            ),
+            generation_max_batches=int(limits_raw.get("generation_max_batches", 0)),
             max_active_ideas=int(limits_raw.get("max_active_ideas", 4)),
             max_total_ideas=int(limits_raw.get("max_total_ideas", 0)),
+            max_total_tokens=int(limits_raw.get("max_total_tokens", 0)),
             max_revisions_per_idea=int(limits_raw.get("max_revisions_per_idea", 2)),
             max_runs_per_budget=int(limits_raw.get("max_runs_per_budget", 2)),
             max_steps_per_idea=int(limits_raw.get("max_steps_per_idea", 10)),
@@ -158,6 +167,9 @@ class ResearchQueueConfig:
             max_llm_jobs=int(concurrency_raw.get("max_llm_jobs", 2)),
             max_run_jobs=int(concurrency_raw.get("max_run_jobs", 4)),
             poll_interval_sec=float(concurrency_raw.get("poll_interval_sec", 0.1)),
+            llm_call_timeout_sec=float(
+                concurrency_raw.get("llm_call_timeout_sec", 1800.0)
+            ),
         )
         models_raw = _mapping(data.get("models"), "models")
         model_config = str(
@@ -270,8 +282,14 @@ class ResearchQueueConfig:
             raise ValueError("candidate_target must be positive")
         if self.limits.generation_batch_size < 1:
             raise ValueError("generation_batch_size must be positive")
+        if self.limits.generation_interval_sec < 0:
+            raise ValueError("generation_interval_sec cannot be negative")
+        if self.limits.generation_max_batches < 0:
+            raise ValueError("generation_max_batches cannot be negative")
         if self.limits.max_active_ideas < 1:
             raise ValueError("max_active_ideas must be positive")
+        if self.limits.max_total_tokens < 0:
+            raise ValueError("max_total_tokens cannot be negative")
         if self.limits.max_revisions_per_idea < 1:
             raise ValueError("max_revisions_per_idea must be positive")
         if self.limits.max_runs_per_budget < 1:
@@ -282,6 +300,10 @@ class ResearchQueueConfig:
             raise ValueError("max_llm_jobs must be positive")
         if self.concurrency.max_run_jobs < 1:
             raise ValueError("max_run_jobs must be positive")
+        if self.concurrency.poll_interval_sec <= 0:
+            raise ValueError("poll_interval_sec must be positive")
+        if self.concurrency.llm_call_timeout_sec <= 0:
+            raise ValueError("llm_call_timeout_sec must be positive")
         if self.gpu.max_total_gpus < 0:
             raise ValueError("max_total_gpus cannot be negative")
         if self.gpu.max_gpus_per_run < 0:

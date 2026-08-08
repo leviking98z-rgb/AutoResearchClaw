@@ -9,7 +9,7 @@ from researchclaw.research_queue.models import (
     IdeaRecord,
     IdeaStatus,
 )
-from researchclaw.research_queue.workers import StaticIdeaProducer
+from researchclaw.research_queue.workers import LLMPreparationWorker, StaticIdeaProducer
 
 
 def test_budget_levels_advance_in_one_direction() -> None:
@@ -61,6 +61,66 @@ def test_config_resolves_relative_paths(tmp_path) -> None:
     assert config.models.researchclaw_config == str(tmp_path / "models.yaml")
 
 
+def test_config_rejects_negative_total_token_limit() -> None:
+    try:
+        ResearchQueueConfig.from_mapping(
+            {
+                "research_queue": {
+                    "limits": {"max_total_tokens": -1},
+                }
+            }
+        )
+    except ValueError as exc:
+        assert "max_total_tokens" in str(exc)
+    else:
+        raise AssertionError("negative max_total_tokens should fail validation")
+
+
+def test_config_rejects_negative_generation_interval() -> None:
+    try:
+        ResearchQueueConfig.from_mapping(
+            {
+                "research_queue": {
+                    "limits": {"generation_interval_sec": -0.1},
+                }
+            }
+        )
+    except ValueError as exc:
+        assert "generation_interval_sec" in str(exc)
+    else:
+        raise AssertionError("negative generation_interval_sec should fail")
+
+
+def test_config_rejects_negative_generation_max_batches() -> None:
+    try:
+        ResearchQueueConfig.from_mapping(
+            {
+                "research_queue": {
+                    "limits": {"generation_max_batches": -1},
+                }
+            }
+        )
+    except ValueError as exc:
+        assert "generation_max_batches" in str(exc)
+    else:
+        raise AssertionError("negative generation_max_batches should fail")
+
+
+def test_config_rejects_nonpositive_llm_call_timeout() -> None:
+    try:
+        ResearchQueueConfig.from_mapping(
+            {
+                "research_queue": {
+                    "concurrency": {"llm_call_timeout_sec": 0},
+                }
+            }
+        )
+    except ValueError as exc:
+        assert "llm_call_timeout_sec" in str(exc)
+    else:
+        raise AssertionError("nonpositive llm_call_timeout_sec should fail")
+
+
 def test_static_idea_producer_reports_exhaustion() -> None:
     proposal = IdeaProposal(
         title="Finite",
@@ -108,3 +168,55 @@ def test_cycling_static_idea_titles_remain_unique_across_batches() -> None:
     ]
     assert first.exhausted is False
     assert second.exhausted is False
+
+
+def test_llm_preparer_accepts_no_previous_revision(tmp_path) -> None:
+    class FakeClient:
+        def chat(self, messages, **kwargs):
+            del messages, kwargs
+            return type(
+                "Response",
+                (),
+                {
+                    "content": (
+                        '{"method_summary":"test","treatment":"A",'
+                        '"control":"B","primary_metric":"score",'
+                        '"requested_gpus":0,"timeout_sec":10,'
+                        '"command":["python","experiment.py"],'
+                        '"source_files":{"experiment.py":"print(1)"},'
+                        '"plan":{"cheap_test":"test"}}'
+                    ),
+                    "model": "fake",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            )()
+
+    idea = IdeaRecord.from_proposal(
+        IdeaProposal(
+            title="Prepare",
+            question="Question?",
+            hypothesis="Hypothesis",
+            treatment="A",
+            control="B",
+            primary_metric="score",
+        )
+    )
+    worker = LLMPreparationWorker(
+        client=FakeClient(),
+        python_executable="python",
+        max_gpus_per_run=0,
+        max_tokens=4321,
+    )
+
+    prepared = worker.prepare(
+        idea,
+        revision=1,
+        budget=ResearchQueueConfig().budget(BudgetLevel.B0),
+        previous_revision=None,
+        feedback="",
+    )
+
+    assert prepared.revision == 1
+    assert prepared.plan["method_summary"] == "test"

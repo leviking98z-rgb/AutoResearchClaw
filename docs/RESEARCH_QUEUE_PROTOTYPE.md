@@ -29,6 +29,15 @@ generate -> admit -> prepare -> run(B0/B1/B2) -> review -> conclude -> refill
 - `state_dir` and `artifact_dir` can be separated: keep SQLite/event state on
   local disk and place immutable revisions/runs on shared CephFS for
   ClusterBridge workers;
+- unattended real-model canaries can set `limits.max_total_tokens`; reaching
+  the cap stops new work and closes the backend instead of spending
+  indefinitely;
+- `limits.generation_interval_sec` spaces Idea batches over a long canary
+  instead of consuming the whole Idea and token budget immediately;
+- `limits.generation_max_batches` is a hard paid-generation-call cap,
+  independent of how many proposals deterministic gates accept;
+- `concurrency.llm_call_timeout_sec` bounds each provider/CLI call so one
+  hung model request cannot pin an Idea indefinitely;
 - every concluded Idea writes a local `research_note.md`.
 
 It does not provide production restart adoption, long-lived leases, InfoHub,

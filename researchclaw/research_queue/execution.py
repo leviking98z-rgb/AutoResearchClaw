@@ -126,6 +126,19 @@ class LocalRunBackend:
                     process.communicate(),
                     timeout=run.timeout_sec,
                 )
+            except asyncio.CancelledError:
+                # A controller deadline or service stop must not leave a
+                # generated experiment running after its logical Run has been
+                # cancelled. Reap it before propagating cancellation.
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                stdout, stderr = await process.communicate()
+                stdout_path.write_bytes(stdout)
+                stderr_path.write_bytes(stderr)
+                raise
             except TimeoutError:
                 process.kill()
                 stdout, stderr = await process.communicate()

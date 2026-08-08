@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections import Counter
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -54,13 +57,87 @@ class ResearchQueueController:
         self.preparer = preparer
         self.reviewer = reviewer
         self.run_backend = run_backend
+        self.store.initialize()
         self._llm_slots = asyncio.Semaphore(config.concurrency.max_llm_jobs)
         self._run_slots = asyncio.Semaphore(config.concurrency.max_run_jobs)
         self._idea_tasks: dict[str, asyncio.Task[None]] = {}
         self._generation_task: asyncio.Task[None] | None = None
+        self._next_generation_at = 0.0
+        (
+            self._generation_batches_started,
+            self._next_generation_at,
+        ) = self._restore_generation_schedule()
         self._producer_exhausted = False
         self._stop = asyncio.Event()
         self._started = False
+
+    async def _call_llm(self, function: Any, /, *args: Any, **kwargs: Any) -> Any:
+        """Run one blocking provider call with a controller-level deadline.
+
+        The backend has its own network timeout, but the queue also needs a
+        finite bound so a malformed CLI/provider interaction cannot pin one
+        Idea forever during an unattended canary.
+        """
+
+        async with self._llm_slots:
+            future = asyncio.create_task(
+                asyncio.to_thread(function, *args, **kwargs),
+            )
+            done, _ = await asyncio.wait(
+                {future},
+                timeout=self.config.concurrency.llm_call_timeout_sec,
+            )
+            if done:
+                return future.result()
+            # asyncio cannot forcibly stop work already executing in a thread.
+            # Keep a reference and consume its eventual result/exception while
+            # releasing the Idea loop; the provider's own finite timeout reaps
+            # the underlying request.
+            future.add_done_callback(self._consume_background_result)
+            raise TimeoutError(
+                f"LLM call exceeded {self.config.concurrency.llm_call_timeout_sec:.1f}s"
+            )
+
+    @staticmethod
+    def _consume_background_result(task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            return
+
+    def _restore_generation_schedule(self) -> tuple[int, float]:
+        """Resume paid-generation throttling from durable event history."""
+
+        events = self.store.list_events(limit=100000)
+        generation_events = [
+            item for item in events if item.get("event") == "idea_generation_started"
+        ]
+        if not generation_events:
+            # Backward compatibility for states created before the explicit
+            # start event existed.
+            generation_events = [
+                item
+                for item in events
+                if item.get("event")
+                in {"idea_generation_completed", "idea_generation_failed"}
+            ]
+        if not generation_events:
+            return 0, 0.0
+        latest = generation_events[-1]
+        timestamp = str(latest.get("timestamp", "") or "")
+        try:
+            started_at = datetime.fromisoformat(timestamp)
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=UTC)
+            ready_at = started_at + timedelta(
+                seconds=self.config.limits.generation_interval_sec
+            )
+            delay = max(0.0, (ready_at - datetime.now(UTC)).total_seconds())
+        except ValueError:
+            delay = self.config.limits.generation_interval_sec
+        return len(generation_events), time.monotonic() + delay
 
     async def run(
         self,
@@ -97,6 +174,7 @@ class ResearchQueueController:
 
     async def tick(self) -> None:
         self._collect_finished_tasks()
+        self._enforce_token_budget()
         self._admit_candidates()
         self._start_active_idea_tasks()
         self._ensure_candidate_supply()
@@ -144,6 +222,16 @@ class ResearchQueueController:
     def _ensure_candidate_supply(self) -> None:
         if self._generation_task is not None or self._producer_exhausted:
             return
+        if self._token_budget_exhausted():
+            return
+        if (
+            self.config.limits.generation_max_batches > 0
+            and self._generation_batches_started
+            >= self.config.limits.generation_max_batches
+        ):
+            return
+        if time.monotonic() < self._next_generation_at:
+            return
         limits = self.config.limits
         total = self.store.count_ideas()
         if limits.max_total_ideas > 0 and total >= limits.max_total_ideas:
@@ -159,6 +247,13 @@ class ResearchQueueController:
             requested = min(requested, limits.max_total_ideas - total)
         if requested <= 0:
             return
+        self._next_generation_at = time.monotonic() + limits.generation_interval_sec
+        self._generation_batches_started += 1
+        self.store.event(
+            "idea_generation_started",
+            batch_number=self._generation_batches_started,
+            requested=requested,
+        )
         self._generation_task = asyncio.create_task(
             self._generate(requested),
             name="research-queue-generate",
@@ -166,12 +261,11 @@ class ResearchQueueController:
 
     async def _generate(self, requested: int) -> None:
         existing = self.store.list_ideas()
-        async with self._llm_slots:
-            batch: GenerationBatch = await asyncio.to_thread(
-                self.producer.generate,
-                requested,
-                existing=existing,
-            )
+        batch: GenerationBatch = await self._call_llm(
+            self.producer.generate,
+            requested,
+            existing=existing,
+        )
         if batch.exhausted:
             self._producer_exhausted = True
         accepted = 0
@@ -222,6 +316,8 @@ class ResearchQueueController:
         return ""
 
     def _admit_candidates(self) -> None:
+        if self._token_budget_exhausted():
+            return
         active_count = self.store.count_ideas(IdeaStatus.ACTIVE)
         available = self.config.limits.max_active_ideas - active_count
         if available <= 0:
@@ -239,6 +335,8 @@ class ResearchQueueController:
             )
 
     def _start_active_idea_tasks(self) -> None:
+        if self._token_budget_exhausted():
+            return
         active = self.store.list_ideas(statuses={IdeaStatus.ACTIVE})
         for idea in active:
             if idea.idea_id in self._idea_tasks:
@@ -290,15 +388,20 @@ class ResearchQueueController:
             idea_id=idea.idea_id,
             revision=revision,
         )
-        async with self._llm_slots:
-            prepared: PreparedRevision = await asyncio.to_thread(
-                self.preparer.prepare,
-                idea,
-                revision=revision,
-                budget=self.config.budget(idea.current_budget),
-                previous_revision=previous,
-                feedback=idea.last_reason,
-            )
+        prepared: PreparedRevision = await self._call_llm(
+            self.preparer.prepare,
+            idea,
+            revision=revision,
+            budget=self.config.budget(idea.current_budget),
+            previous_revision=previous,
+            feedback=idea.last_reason,
+        )
+        idea.total_tokens += int(prepared.usage.get("total_tokens", 0) or 0)
+        # Persist metered usage before deterministic validation/materialization.
+        # If either step rejects the model output, the generic task-failure path
+        # reloads the Idea from the store; without this checkpoint the tokens
+        # already spent by the real provider disappear from accounting.
+        self.store.upsert_idea(idea)
         if prepared.revision != revision:
             raise ValueError("preparer returned the wrong revision number")
         if prepared.requested_gpus > self.config.gpu.max_gpus_per_run:
@@ -308,7 +411,6 @@ class ResearchQueueController:
         idea.current_revision = revision
         idea.next_action = "run"
         idea.step_count += 1
-        idea.total_tokens += int(prepared.usage.get("total_tokens", 0) or 0)
         idea.last_reason = f"revision {revision} prepared"
         self.store.upsert_idea(idea)
         self.store.event(
@@ -428,16 +530,18 @@ class ResearchQueueController:
             "max_runs_per_budget": (self.config.limits.max_runs_per_budget),
             "max_steps_per_idea": self.config.limits.max_steps_per_idea,
         }
-        async with self._llm_slots:
-            decision: ReviewDecision = await asyncio.to_thread(
-                self.reviewer.review,
-                idea,
-                run=latest,
-                history=history,
-                limits=limits,
-            )
+        decision: ReviewDecision = await self._call_llm(
+            self.reviewer.review,
+            idea,
+            run=latest,
+            history=history,
+            limits=limits,
+        )
         idea.total_tokens += int(decision.usage.get("total_tokens", 0) or 0)
         idea.step_count += 1
+        # Keep provider usage durable even if a future deterministic review
+        # transition rejects the returned decision.
+        self.store.upsert_idea(idea)
         self._apply_review(idea, decision, history)
         self.store.event(
             "review_completed",
@@ -519,6 +623,125 @@ class ResearchQueueController:
             conclusion=conclusion.value,
             reason=reason,
         )
+
+    def _audit_usage(self) -> dict[str, Any]:
+        totals = {
+            "calls": 0,
+            "successful_calls": 0,
+            "failed_calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        by_tier: dict[str, dict[str, Any]] = {}
+        by_model: dict[str, dict[str, Any]] = {}
+        by_role: dict[str, dict[str, Any]] = {}
+        audit_root = self.config.root / "llm-audit"
+        for path in sorted(audit_root.glob("*/calls.jsonl*")):
+            if not path.is_file():
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            fallback_tier = path.parent.name or "unknown"
+            for line in lines:
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    # A concurrently appended final line is retried on the
+                    # next snapshot/tick after it becomes complete.
+                    continue
+                if not isinstance(value, Mapping):
+                    continue
+                tier = str(value.get("tier", fallback_tier) or fallback_tier)
+                model = str(value.get("model", "unknown") or "unknown")
+                role = str(value.get("role", "unknown") or "unknown")
+                for table, key in (
+                    (by_tier, tier),
+                    (by_model, model),
+                    (by_role, role),
+                ):
+                    row = table.setdefault(
+                        key,
+                        {
+                            "calls": 0,
+                            "successful_calls": 0,
+                            "failed_calls": 0,
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0,
+                        },
+                    )
+                    self._add_audit_call(row, value)
+                self._add_audit_call(totals, value)
+        return {
+            **totals,
+            "by_tier": self._usage_rows(by_tier, "tier"),
+            "by_model": self._usage_rows(by_model, "model"),
+            "by_role": self._usage_rows(by_role, "role"),
+        }
+
+    @staticmethod
+    def _add_audit_call(
+        row: dict[str, Any],
+        value: Mapping[str, Any],
+    ) -> None:
+        row["calls"] += 1
+        if value.get("outcome") == "success":
+            row["successful_calls"] += 1
+        else:
+            row["failed_calls"] += 1
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            row[field] += max(0, int(value.get(field, 0) or 0))
+
+    @staticmethod
+    def _usage_rows(
+        table: Mapping[str, Mapping[str, Any]],
+        key_name: str,
+    ) -> list[dict[str, Any]]:
+        return [{key_name: key, **dict(value)} for key, value in sorted(table.items())]
+
+    def _usage_snapshot(self) -> dict[str, Any]:
+        ideas = self.store.list_ideas()
+        idea_accounted_tokens = sum(max(0, idea.total_tokens) for idea in ideas)
+        audit = self._audit_usage()
+        audit_tokens = int(audit["total_tokens"])
+        # Both sources describe the same calls. Use the greater durable view
+        # rather than summing them: Idea accounting gives per-Idea attribution,
+        # while audit accounting also captures rejected generations and model
+        # responses that fail before a result object can be persisted.
+        total_tokens = max(idea_accounted_tokens, audit_tokens)
+        return {
+            "total_tokens": total_tokens,
+            "idea_accounted_tokens": idea_accounted_tokens,
+            "audit_tokens": audit_tokens,
+            "max_total_tokens": self.config.limits.max_total_tokens,
+            "token_budget_exhausted": (
+                self.config.limits.max_total_tokens > 0
+                and total_tokens >= self.config.limits.max_total_tokens
+            ),
+            "gpu_seconds": sum(max(0.0, idea.gpu_seconds) for idea in ideas),
+            "llm": audit,
+        }
+
+    def _total_tokens(self) -> int:
+        return int(self._usage_snapshot()["total_tokens"])
+
+    def _token_budget_exhausted(self) -> bool:
+        limit = self.config.limits.max_total_tokens
+        return limit > 0 and self._total_tokens() >= limit
+
+    def _enforce_token_budget(self) -> None:
+        if not self._token_budget_exhausted():
+            return
+        if not self._stop.is_set():
+            self.store.event(
+                "token_budget_exhausted",
+                total_tokens=self._total_tokens(),
+                max_total_tokens=self.config.limits.max_total_tokens,
+            )
+        self._stop.set()
 
     def _write_research_note(self, idea: IdeaRecord) -> Path:
         runs = self.store.list_runs(idea_id=idea.idea_id)
@@ -609,6 +832,7 @@ class ResearchQueueController:
 
     def snapshot(self) -> dict[str, Any]:
         store = self.store.snapshot()
+        usage = self._usage_snapshot()
         conclusions = Counter(
             idea.conclusion.value
             for idea in self.store.list_ideas(statuses={IdeaStatus.CONCLUDED})
@@ -623,6 +847,13 @@ class ResearchQueueController:
             "generation_running": bool(
                 self._generation_task is not None and not self._generation_task.done()
             ),
+            "generation_batches_started": self._generation_batches_started,
+            "generation_max_batches": (self.config.limits.generation_max_batches),
+            "next_generation_in_sec": max(
+                0.0,
+                self._next_generation_at - time.monotonic(),
+            ),
             "producer_exhausted": self._producer_exhausted,
+            "usage": usage,
             "execution": self.run_backend.snapshot(),
         }

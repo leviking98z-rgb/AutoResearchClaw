@@ -16,9 +16,17 @@ research_queue:
   limits:
     candidate_target: 6
     generation_batch_size: 2
+    # Minimum delay between generation batches. Use e.g. 21600 for four
+    # bounded waves during a 24-hour unattended canary.
+    generation_interval_sec: 0
+    # 0 means unlimited. A 24-hour canary can set 4 to guarantee no more than
+    # four paid generation calls even if a batch is rejected.
+    generation_max_batches: 0
     max_active_ideas: 4
     # Zero means continuous. Set a finite number for --until-idle tests.
     max_total_ideas: 0
+    # Hard stop for unattended real-LLM canaries. Zero disables the cap.
+    max_total_tokens: 0
     max_revisions_per_idea: 2
     max_runs_per_budget: 2
     max_steps_per_idea: 10
@@ -29,6 +37,7 @@ research_queue:
     max_llm_jobs: 2
     max_run_jobs: 4
     poll_interval_sec: 0.1
+    llm_call_timeout_sec: 1800
 
   models:
     researchclaw_config: config.rsi.yaml

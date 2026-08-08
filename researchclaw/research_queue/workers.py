@@ -212,9 +212,11 @@ class LLMPreparationWorker:
         client: Any,
         python_executable: str,
         max_gpus_per_run: int,
+        max_tokens: int = 8000,
     ) -> None:
         self.python_executable = python_executable
         self.max_gpus_per_run = max(0, int(max_gpus_per_run))
+        self.max_tokens = max(1000, int(max_tokens))
         self.role = StructuredRole(
             client=client,
             system=(
@@ -244,7 +246,7 @@ BUDGET TEMPLATE:
 {json.dumps(budget.to_dict(), ensure_ascii=False, indent=2)}
 
 PREVIOUS REVISION:
-{json.dumps(previous_revision or {{}}, ensure_ascii=False, indent=2)}
+{json.dumps(previous_revision or {}, ensure_ascii=False, indent=2)}
 
 REVIEW FEEDBACK:
 {feedback or "none"}
@@ -285,7 +287,7 @@ Return:
   }}
 }}
 """.strip(),
-            max_tokens=12000,
+            max_tokens=self.max_tokens,
             temperature=0.25,
         )
         value = result.value
