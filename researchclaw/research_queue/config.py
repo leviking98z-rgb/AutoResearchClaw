@@ -47,6 +47,7 @@ class QueueLimits:
     max_runs_per_budget: int = 2
     max_steps_per_idea: int = 10
     max_infra_retries: int = 1
+    max_prepare_repairs: int = 1
     duplicate_threshold: float = 0.78
 
 
@@ -71,6 +72,7 @@ class QueueExecution:
     backend: str = "local"
     python_executable: str = "python"
     simulation: bool = True
+    allowed_python_imports: tuple[str, ...] = ("numpy",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +159,7 @@ class ResearchQueueConfig:
             max_runs_per_budget=int(limits_raw.get("max_runs_per_budget", 2)),
             max_steps_per_idea=int(limits_raw.get("max_steps_per_idea", 10)),
             max_infra_retries=int(limits_raw.get("max_infra_retries", 1)),
+            max_prepare_repairs=int(limits_raw.get("max_prepare_repairs", 1)),
             duplicate_threshold=float(limits_raw.get("duplicate_threshold", 0.78)),
         )
         concurrency_raw = _mapping(
@@ -185,6 +188,20 @@ class ResearchQueueConfig:
             utility_role=str(models_raw.get("utility_role", "literature_researcher")),
         )
         execution_raw = _mapping(data.get("execution"), "execution")
+        allowed_imports_raw = execution_raw.get(
+            "allowed_python_imports",
+            ("numpy",),
+        )
+        if isinstance(allowed_imports_raw, str):
+            allowed_python_imports = tuple(
+                item.strip() for item in allowed_imports_raw.split(",") if item.strip()
+            )
+        else:
+            allowed_python_imports = tuple(
+                str(item).strip()
+                for item in (allowed_imports_raw or ())
+                if str(item).strip()
+            )
         execution = QueueExecution(
             backend=str(execution_raw.get("backend", "local") or "local")
             .strip()
@@ -193,6 +210,7 @@ class ResearchQueueConfig:
                 execution_raw.get("python_executable", "python") or "python"
             ),
             simulation=bool(execution_raw.get("simulation", True)),
+            allowed_python_imports=allowed_python_imports,
         )
         gpu_raw = _mapping(data.get("gpu"), "gpu")
         pass_env_raw = gpu_raw.get("pass_env", ())
@@ -296,6 +314,8 @@ class ResearchQueueConfig:
             raise ValueError("max_runs_per_budget must be positive")
         if self.limits.max_steps_per_idea < 1:
             raise ValueError("max_steps_per_idea must be positive")
+        if self.limits.max_prepare_repairs < 0:
+            raise ValueError("max_prepare_repairs cannot be negative")
         if self.concurrency.max_llm_jobs < 1:
             raise ValueError("max_llm_jobs must be positive")
         if self.concurrency.max_run_jobs < 1:

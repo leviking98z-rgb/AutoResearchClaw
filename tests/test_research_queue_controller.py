@@ -445,6 +445,7 @@ def test_preparation_tokens_are_accounted_before_validation_failure(
                     "max_active_ideas": 1,
                     "max_total_ideas": 1,
                     "max_steps_per_idea": 3,
+                    "max_prepare_repairs": 0,
                 },
                 "concurrency": {"poll_interval_sec": 0.005},
                 "execution": {"simulation": True},
@@ -842,3 +843,112 @@ def test_real_run_rejects_missing_budget_parameter_attestation(
     run = store.list_runs(idea_id=idea.idea_id)[0]
     assert run.status.value == "failed"
     assert "budget parameters" in run.error
+
+
+def test_prepare_repairs_disallowed_import_before_materialization(
+    tmp_path,
+) -> None:
+    class RepairingPreparationWorker:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.feedback: list[str] = []
+
+        def prepare(
+            self,
+            idea,
+            *,
+            revision,
+            budget,
+            previous_revision,
+            feedback,
+        ):
+            del idea, budget, previous_revision
+            self.calls += 1
+            self.feedback.append(feedback)
+            source = (
+                "from sklearn.linear_model import LogisticRegression\n"
+                "import os\n"
+                "print(os.environ['RESEARCH_QUEUE_BUDGET_JSON'])\n"
+                if self.calls == 1
+                else (
+                    "import json\n"
+                    "import os\n"
+                    "import pathlib\n"
+                    "import numpy as np\n"
+                    "budget = json.loads("
+                    "os.environ['RESEARCH_QUEUE_BUDGET_JSON'])\n"
+                    "out = pathlib.Path("
+                    "os.environ['RESEARCH_QUEUE_OUTPUT_DIR'])\n"
+                    "out.mkdir(parents=True, exist_ok=True)\n"
+                    "(out / 'result.json').write_text(json.dumps({"
+                    "'status':'ok','metrics':{"
+                    "'primary_value':float(np.mean([1])),"
+                    "'treatment_value':1.0,'control_value':0.0,"
+                    "'effect':1.0},'artifacts':[],"
+                    "'usage':{'budget_parameters':"
+                    "budget['parameters']}}))\n"
+                )
+            )
+            return PreparedRevision(
+                revision=revision,
+                command=(sys.executable, "experiment.py"),
+                requested_gpus=0,
+                timeout_sec=10,
+                plan={"source_files": {"experiment.py": source}},
+                usage={"total_tokens": 10},
+            )
+
+    config = ResearchQueueConfig.from_mapping(
+        {
+            "research_queue": {
+                "enabled": True,
+                "state_dir": str(tmp_path),
+                "limits": {"max_prepare_repairs": 1},
+                "execution": {
+                    "simulation": False,
+                    "allowed_python_imports": ["numpy"],
+                },
+                "gpu": {
+                    "max_total_gpus": 0,
+                    "max_gpus_per_run": 0,
+                },
+                "budgets": {
+                    "B0": {
+                        "gpus": 0,
+                        "timeout_sec": 10,
+                        "parameters": {"seeds": 1},
+                    }
+                },
+            }
+        }
+    )
+    store = ResearchQueueStore(tmp_path)
+    store.initialize()
+    idea = IdeaRecord.from_proposal(_proposal("Repair dependency", "positive"))
+    idea.status = IdeaStatus.ACTIVE
+    store.upsert_idea(idea)
+    preparer = RepairingPreparationWorker()
+    controller = ResearchQueueController(
+        config=config,
+        store=store,
+        producer=StaticIdeaProducer([]),
+        preparer=preparer,
+        reviewer=SimulatedReviewWorker(),
+        run_backend=LocalRunBackend(slot_pool=GPUSlotPool(0)),
+    )
+
+    asyncio.run(controller._prepare(idea))
+
+    saved = store.get_idea(idea.idea_id)
+    assert saved is not None
+    assert saved.current_revision == 1
+    assert saved.total_tokens == 20
+    assert preparer.calls == 2
+    assert "sklearn" in preparer.feedback[1]
+    source = (store.revision_dir(idea.idea_id, 1) / "experiment.py").read_text()
+    assert "sklearn" not in source
+    assert any(
+        event["event"] == "prepare_validation_failed"
+        for event in store.list_events(limit=20)
+    )
+    assert store.list_runs(idea_id=idea.idea_id) == []

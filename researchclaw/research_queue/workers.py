@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -216,10 +217,20 @@ class LLMPreparationWorker:
         client: Any,
         python_executable: str,
         max_gpus_per_run: int,
+        allowed_python_imports: Sequence[str] = ("numpy",),
         max_tokens: int = 8000,
     ) -> None:
         self.python_executable = python_executable
         self.max_gpus_per_run = max(0, int(max_gpus_per_run))
+        self.allowed_python_imports = tuple(
+            sorted(
+                {
+                    str(item).strip().split(".", 1)[0]
+                    for item in allowed_python_imports
+                    if str(item).strip()
+                }
+            )
+        )
         self.max_tokens = max(1000, int(max_tokens))
         self.role = StructuredRole(
             client=client,
@@ -227,7 +238,7 @@ class LLMPreparationWorker:
                 "You are a research engineer building a minimal executable "
                 "experiment. Return a complete JSON project, not a patch."
             ),
-            validator=_prepare_errors,
+            validator=self._validate_project,
             max_attempts=2,
         )
 
@@ -276,8 +287,11 @@ result.json must contain:
   }}
 }}
 
-Use only declared local dependencies. Do not download huge models or datasets
-inside the experiment unless the research brief explicitly requires them.
+Allowed third-party Python imports:
+{json.dumps(list(self.allowed_python_imports), ensure_ascii=False)}
+Python standard-library modules are also allowed. Do not import any other
+third-party package, dynamically import packages, invoke pip/conda, or download
+dependencies inside the experiment.
 Return:
 {{
   "method_summary": "...",
@@ -328,6 +342,74 @@ Return:
             plan=plan,
             usage=usage_from_result(result),
         )
+
+    def _validate_project(self, value: Mapping[str, Any]) -> list[str]:
+        errors = _prepare_errors(value)
+        source_files = value.get("source_files")
+        if isinstance(source_files, Mapping):
+            errors.extend(
+                validate_python_sources(
+                    source_files,
+                    allowed_imports=self.allowed_python_imports,
+                )
+            )
+        return errors
+
+
+def validate_python_sources(
+    source_files: Mapping[str, Any],
+    *,
+    allowed_imports: Sequence[str] = ("numpy",),
+) -> list[str]:
+    """Reject invalid Python and undeclared third-party imports before Run."""
+
+    allowed = {
+        str(item).strip().split(".", 1)[0]
+        for item in allowed_imports
+        if str(item).strip()
+    }
+    stdlib = set(getattr(sys, "stdlib_module_names", ()))
+    local_modules = {
+        str(path).replace("\\", "/").rsplit("/", 1)[-1].removesuffix(".py")
+        for path in source_files
+        if str(path).endswith(".py")
+    }
+    errors: list[str] = []
+    for path, content in source_files.items():
+        name = str(path)
+        if not name.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(str(content), filename=name)
+        except SyntaxError as exc:
+            errors.append(
+                f"{name}: invalid Python syntax at line {exc.lineno or '?'}: {exc.msg}"
+            )
+            continue
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                if node.module:
+                    imported.add(node.module.split(".", 1)[0])
+            elif isinstance(node, ast.Call):
+                target = node.func
+                if (isinstance(target, ast.Name) and target.id == "__import__") or (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "importlib"
+                    and target.attr == "import_module"
+                ):
+                    errors.append(f"{name}: dynamic imports are not allowed")
+        for module in sorted(imported):
+            if module in stdlib or module in allowed or module in local_modules:
+                continue
+            errors.append(
+                f"{name}: disallowed third-party import '{module}'; "
+                f"allowed third-party imports: {sorted(allowed)}"
+            )
+    return errors
 
 
 class LLMReviewWorker:
@@ -769,6 +851,7 @@ def build_workers(
             client=router.worker,
             python_executable=config.execution.python_executable,
             max_gpus_per_run=config.gpu.max_gpus_per_run,
+            allowed_python_imports=config.execution.allowed_python_imports,
         ),
         LLMReviewWorker(client=router.decision),
     )

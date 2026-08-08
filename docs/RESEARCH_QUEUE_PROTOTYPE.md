@@ -38,6 +38,11 @@ generate -> admit -> prepare -> run(B0/B1/B2) -> review -> conclude -> refill
   independent of how many proposals deterministic gates accept;
 - `concurrency.llm_call_timeout_sec` bounds each provider/CLI call so one
   hung model request cannot pin an Idea indefinitely;
+- generated Python is parsed with `ast` before materialization; standard
+  library modules plus `execution.allowed_python_imports` are permitted;
+- deterministic prepare failures receive up to
+  `limits.max_prepare_repairs` bounded full-project repairs before the Idea is
+  isolated, and no formal Run is consumed by those failures;
 - every concluded Idea writes a local `research_note.md`.
 
 It does not provide production restart adoption, long-lived leases, InfoHub,

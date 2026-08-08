@@ -31,6 +31,8 @@ research_queue:
     max_runs_per_budget: 2
     max_steps_per_idea: 10
     max_infra_retries: 1
+    # Number of code-generation repairs before an invalid project is isolated.
+    max_prepare_repairs: 1
     duplicate_threshold: 0.78
 
   concurrency:
@@ -52,6 +54,10 @@ research_queue:
     python_executable: python
     # true uses deterministic Idea/Prepare/Review workers and spends no tokens.
     simulation: true
+    # Standard-library imports are always allowed. List only permitted
+    # third-party top-level modules here.
+    allowed_python_imports:
+      - numpy
 
   gpu:
     # Logical maximum. local mode only simulates slots; clusterbridge mode

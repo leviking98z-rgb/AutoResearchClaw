@@ -9,7 +9,11 @@ from researchclaw.research_queue.models import (
     IdeaRecord,
     IdeaStatus,
 )
-from researchclaw.research_queue.workers import LLMPreparationWorker, StaticIdeaProducer
+from researchclaw.research_queue.workers import (
+    LLMPreparationWorker,
+    StaticIdeaProducer,
+    validate_python_sources,
+)
 
 
 def test_budget_levels_advance_in_one_direction() -> None:
@@ -275,3 +279,42 @@ def test_llm_preparer_rejects_hardcoded_budget_parameters() -> None:
         assert "RESEARCH_QUEUE_BUDGET_JSON" in str(exc)
     else:
         raise AssertionError("hardcoded budget parameters should fail")
+
+
+def test_python_source_gate_allows_stdlib_numpy_and_local_modules() -> None:
+    errors = validate_python_sources(
+        {
+            "helper.py": "VALUE = 1\n",
+            "experiment.py": (
+                "import json\n"
+                "import numpy as np\n"
+                "from helper import VALUE\n"
+                "print(json.dumps([np.mean([VALUE])]))\n"
+            ),
+        },
+        allowed_imports=("numpy",),
+    )
+
+    assert errors == []
+
+
+def test_python_source_gate_rejects_sklearn_before_run() -> None:
+    errors = validate_python_sources(
+        {"experiment.py": ("from sklearn.linear_model import LogisticRegression\n")},
+        allowed_imports=("numpy",),
+    )
+
+    assert any("sklearn" in error for error in errors)
+
+
+def test_python_source_gate_rejects_syntax_and_dynamic_imports() -> None:
+    errors = validate_python_sources(
+        {
+            "broken.py": "if True print('broken')\n",
+            "dynamic.py": "__import__('sklearn')\n",
+        },
+        allowed_imports=("numpy",),
+    )
+
+    assert any("invalid Python syntax" in error for error in errors)
+    assert any("dynamic imports" in error for error in errors)

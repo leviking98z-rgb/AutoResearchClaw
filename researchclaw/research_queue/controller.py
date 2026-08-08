@@ -35,6 +35,7 @@ from .workers import (
     materialize_revision,
     title_similarity,
     validate_proposal,
+    validate_python_sources,
 )
 
 
@@ -388,24 +389,56 @@ class ResearchQueueController:
             idea_id=idea.idea_id,
             revision=revision,
         )
-        prepared: PreparedRevision = await self._call_llm(
-            self.preparer.prepare,
-            idea,
-            revision=revision,
-            budget=self.config.budget(idea.current_budget),
-            previous_revision=previous,
-            feedback=idea.last_reason,
-        )
-        idea.total_tokens += int(prepared.usage.get("total_tokens", 0) or 0)
-        # Persist metered usage before deterministic validation/materialization.
-        # If either step rejects the model output, the generic task-failure path
-        # reloads the Idea from the store; without this checkpoint the tokens
-        # already spent by the real provider disappear from accounting.
-        self.store.upsert_idea(idea)
-        if prepared.revision != revision:
-            raise ValueError("preparer returned the wrong revision number")
-        if prepared.requested_gpus > self.config.gpu.max_gpus_per_run:
-            raise ValueError("revision exceeds max_gpus_per_run")
+        feedback = idea.last_reason
+        repairs = 0
+        total_usage: dict[str, Any] = {}
+        while True:
+            prepared = await self._call_llm(
+                self.preparer.prepare,
+                idea,
+                revision=revision,
+                budget=self.config.budget(idea.current_budget),
+                previous_revision=previous,
+                feedback=feedback,
+            )
+            usage_tokens = int(prepared.usage.get("total_tokens", 0) or 0)
+            idea.total_tokens += usage_tokens
+            total_usage["total_tokens"] = (
+                int(total_usage.get("total_tokens", 0) or 0) + usage_tokens
+            )
+            for name in ("prompt_tokens", "completion_tokens"):
+                total_usage[name] = int(total_usage.get(name, 0) or 0) + int(
+                    prepared.usage.get(name, 0) or 0
+                )
+            total_usage["model"] = prepared.usage.get(
+                "model",
+                total_usage.get("model", ""),
+            )
+            # Persist metered usage before deterministic validation.
+            self.store.upsert_idea(idea)
+            errors = self._prepared_revision_errors(prepared, revision)
+            if not errors:
+                break
+            self.store.event(
+                "prepare_validation_failed",
+                idea_id=idea.idea_id,
+                revision=revision,
+                repair_attempt=repairs,
+                errors=errors,
+                usage=prepared.usage,
+            )
+            if repairs >= self.config.limits.max_prepare_repairs:
+                raise ValueError(
+                    "prepared revision failed deterministic validation: "
+                    + "; ".join(errors)
+                )
+            repairs += 1
+            feedback = (
+                "Your generated project failed deterministic validation. "
+                "Return a complete corrected project, not a patch. "
+                "Do not add undeclared dependencies. Errors:\n- " + "\n- ".join(errors)
+            )
+        prepared.usage = total_usage
         revision_dir = self.store.revision_dir(idea.idea_id, revision)
         materialize_revision(revision_dir, prepared)
         idea.current_revision = revision
@@ -419,7 +452,30 @@ class ResearchQueueController:
             revision=revision,
             requested_gpus=prepared.requested_gpus,
             usage=prepared.usage,
+            repair_attempts=repairs,
         )
+
+    def _prepared_revision_errors(
+        self,
+        prepared: PreparedRevision,
+        expected_revision: int,
+    ) -> list[str]:
+        errors: list[str] = []
+        if prepared.revision != expected_revision:
+            errors.append("preparer returned the wrong revision number")
+        if prepared.requested_gpus > self.config.gpu.max_gpus_per_run:
+            errors.append("revision exceeds max_gpus_per_run")
+        source_files = prepared.plan.get("source_files", {})
+        if not isinstance(source_files, Mapping):
+            errors.append("revision source_files must be an object")
+        else:
+            errors.extend(
+                validate_python_sources(
+                    source_files,
+                    allowed_imports=(self.config.execution.allowed_python_imports),
+                )
+            )
+        return errors
 
     async def _run(self, idea: IdeaRecord) -> None:
         prepared = PreparedRevision.from_mapping(
