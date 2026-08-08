@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import shutil
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -358,7 +359,13 @@ class BenchmarkPromotionBridge:
             timeout_sec=timeout_sec,
             command=benchmark_command(
                 runtime_config,
-                python_executable=self.config.runtime_python,
+                # Zero-GPU cache evaluations run on the controller through
+                # LocalRunBackend, not in the node-only torch environment.
+                python_executable=(
+                    sys.executable
+                    if cache_ready
+                    else self.config.runtime_python
+                ),
                 logits_cache=logits_cache if cache_ready else None,
             ),
             output_dir=str(output_dir),

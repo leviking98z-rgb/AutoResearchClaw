@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 
 from researchclaw.research_queue.benchmark_profile import TREATMENT_API
 from researchclaw.research_queue.config import BenchmarkPromotionConfig
@@ -236,6 +237,30 @@ benchmark:
     assert (benchmark_root / "treatment.py").is_file()
     assert (benchmark_root / "research_spec.json").is_file()
     assert (benchmark_root / "final_review.json").is_file()
+
+    logits_cache = tmp_path / "trusted-logits.npz"
+    logits_cache.write_bytes(b"fixture")
+    cached_backend = RecordingBenchmarkBackend()
+    cached_bridge = BenchmarkPromotionBridge(
+        config=BenchmarkPromotionConfig(
+            enabled=True,
+            benchmark_config=str(template),
+            runtime_python="/node-only/python",
+            logits_cache=str(logits_cache),
+            prefer_logits_cache=True,
+            preflight_timeout_sec=5,
+        ),
+        store=store,
+        treatment_worker=StaticTreatmentWorker(),
+        run_backend=cached_backend,
+        max_gpus_per_run=1,
+    )
+
+    asyncio.run(cached_bridge.promote(idea, spec=spec))
+
+    assert cached_backend.runs[0].requested_gpus == 0
+    assert cached_backend.runs[0].command[0] == sys.executable
+    assert "--logits-cache" in cached_backend.runs[0].command
 
 
 def test_promotion_bridge_turns_treatment_generation_error_into_outcome(
